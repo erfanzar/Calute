@@ -22,6 +22,28 @@ const initialComposerState = (): ComposerState => ({
   slashIndex: 0,
 });
 
+const findPreviousWordStart = (value: string, cursor: number): number => {
+  let index = cursor;
+  while (index > 0 && /\s/.test(value[index - 1] ?? "")) {
+    index -= 1;
+  }
+  while (index > 0 && !/\s/.test(value[index - 1] ?? "")) {
+    index -= 1;
+  }
+  return index;
+};
+
+const findNextWordEnd = (value: string, cursor: number): number => {
+  let index = cursor;
+  while (index < value.length && /\s/.test(value[index] ?? "")) {
+    index += 1;
+  }
+  while (index < value.length && !/\s/.test(value[index] ?? "")) {
+    index += 1;
+  }
+  return index;
+};
+
 export const Composer: React.FC<ComposerProps> = ({
   disabled,
   placeholder = "Type a message, / for commands, Ctrl+C to exit",
@@ -106,16 +128,34 @@ export const Composer: React.FC<ComposerProps> = ({
         }
         return;
       }
-      if (key.backspace || key.delete) {
+      if (key.backspace) {
+        const deleteWord = key.ctrl || key.meta;
         setState((prev) => {
           if (prev.cursor === 0) return prev;
+          const nextCursor = deleteWord
+            ? findPreviousWordStart(prev.value, prev.cursor)
+            : prev.cursor - 1;
           return {
-            value: prev.value.slice(0, prev.cursor - 1) + prev.value.slice(prev.cursor),
-            cursor: prev.cursor - 1,
+            value: prev.value.slice(0, nextCursor) + prev.value.slice(prev.cursor),
+            cursor: nextCursor,
             slashIndex: 0,
           };
         });
-        // At cursor 0: nothing to delete; explicitly ignore rather than silently return.
+        return;
+      }
+      if (key.delete) {
+        const deleteWord = key.ctrl || key.meta;
+        setState((prev) => {
+          const nextCursor = deleteWord
+            ? findNextWordEnd(prev.value, prev.cursor)
+            : Math.min(prev.value.length, prev.cursor + 1);
+          if (nextCursor === prev.cursor) return prev;
+          return {
+            value: prev.value.slice(0, prev.cursor) + prev.value.slice(nextCursor),
+            cursor: prev.cursor,
+            slashIndex: 0,
+          };
+        });
         return;
       }
       if (key.leftArrow) {
@@ -157,11 +197,10 @@ export const Composer: React.FC<ComposerProps> = ({
       }
       if (key.ctrl && input === "w") {
         setState((prev) => {
-          const before = prev.value.slice(0, prev.cursor);
-          const stripped = before.replace(/\s*\S+\s*$/, "");
+          const nextCursor = findPreviousWordStart(prev.value, prev.cursor);
           return {
-            value: stripped + prev.value.slice(prev.cursor),
-            cursor: stripped.length,
+            value: prev.value.slice(0, nextCursor) + prev.value.slice(prev.cursor),
+            cursor: nextCursor,
             slashIndex: 0,
           };
         });
