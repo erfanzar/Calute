@@ -221,6 +221,41 @@ describe('clean terminal layout', () => {
     }
   )
 
+  it('hides completed live plan progress while keeping the durable F10 plan and unfinished tasks', async () => {
+    const p = props(120)
+    p.progress.showProgressArea = true
+    patchUiState({ busy: true, info: { cwd: '/repo', model: 'sonnet-4.6', goal: 'Old completed goal', goal_phase: 'active' } as never })
+    patchTurnState({ todos: [{ id: 'done', content: 'Finished task', status: 'completed' }] })
+    const s = await testRender(<AppLayout {...p} />, { width: 120, height: 30, kittyKeyboard: true })
+    try {
+      await s.flush()
+      expect(s.captureCharFrame()).toContain('Old completed goal')
+      expect(s.captureCharFrame()).toContain('Tasks 1/1')
+
+      act(() => patchUiState(state => ({ ...state, info: { ...state.info!, goal_phase: 'complete' } })))
+      await s.flush()
+      const liveFrame = s.captureCharFrame()
+      expect(liveFrame.split('\n').filter(line => line.includes('Old completed goal'))).toHaveLength(1)
+      expect(liveFrame).not.toContain('Tasks 1/1')
+
+      act(() => s.mockInput.pressKey('F10'))
+      await s.flush()
+      expect(s.captureCharFrame()).toContain('Goal & Todos')
+      expect(s.captureCharFrame()).toContain('Old completed goal')
+      act(() => s.mockInput.pressKey('F10'))
+      await s.flush()
+
+      act(() => patchTurnState({ todos: [
+        { id: 'done', content: 'Finished task', status: 'completed' },
+        { id: 'next', content: 'Next unfinished task', status: 'pending' }
+      ] }))
+      await s.flush()
+      expect(s.captureCharFrame()).toContain('Tasks 1/2')
+      expect(s.captureCharFrame()).toContain('Next unfinished task')
+      expect(s.captureCharFrame().split('\n').filter(line => line.includes('Old completed goal'))).toHaveLength(1)
+    } finally { act(() => s.renderer.destroy()) }
+  })
+
   it.each(['skillsHub', 'pluginsHub'] as const)('closes %s without erasing the draft', async kind => {
     patchOverlayState({[kind]: true})
     const s = await testRender(<AppLayout {...props(80)} />, {width:80,height:24,kittyKeyboard:true})

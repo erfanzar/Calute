@@ -2,6 +2,8 @@
 // Licensed under the Apache License, Version 2.0.
 
 import { createHash } from 'node:crypto'
+import { createBoundedMonitorSocket, type MonitorSocket } from './websocketMonitorSocket.js'
+import { WebSocketMonitorProtocolError } from './websocketMonitorFrames.js'
 
 const MAX_URL_CHARS = 4_096
 const MAX_FRAME_BYTES = 64 * 1024
@@ -28,7 +30,7 @@ const nativeWebSocketMonitorSource: WebSocketMonitorSource = {
   async open(url, onEvent, onStatus, onError, signal) {
     const address = validateUrl(url)
     if (signal?.aborted) throw signal.reason ?? new Error('WebSocket monitor was aborted before opening')
-    let socket: WebSocket | undefined
+    let socket: MonitorSocket | undefined
     let timer: ReturnType<typeof setTimeout> | undefined
     let closed = false
     let everOpened = false
@@ -81,7 +83,7 @@ const nativeWebSocketMonitorSource: WebSocketMonitorSource = {
         rejectInitial = undefined
       }
     }
-    const failAttempt = (error: unknown, opened: boolean, active: WebSocket | undefined, activeGeneration: number, done: { value: boolean }): void => {
+    const failAttempt = (error: unknown, opened: boolean, active: MonitorSocket | undefined, activeGeneration: number, done: { value: boolean }): void => {
       if (closed || done.value || activeGeneration !== generation) return
       done.value = true
       clearTimer()
@@ -124,8 +126,8 @@ const nativeWebSocketMonitorSource: WebSocketMonitorSource = {
       const activeGeneration = ++generation
       const done = { value: false }
       let opened = false
-      let active: WebSocket | undefined
-      try { active = new WebSocket(address) } catch (error) {
+      let active: MonitorSocket | undefined
+      try { active = createBoundedMonitorSocket(address) } catch (error) {
         failAttempt(error, false, undefined, activeGeneration, done)
         return
       }
@@ -148,9 +150,10 @@ const nativeWebSocketMonitorSource: WebSocketMonitorSource = {
         safeStatus('connected')
       }
       active.onmessage = event => handleMessage(event.data, activeGeneration)
-      active.onerror = () => {
+      active.onerror = error => {
         if (closed || done.value || activeGeneration !== generation) return
-        failAttempt(new Error(`WebSocket monitor failed on ${address}`), opened, active, activeGeneration, done)
+        if (error instanceof WebSocketMonitorProtocolError) { terminal(error); return }
+        failAttempt(error, opened, active, activeGeneration, done)
       }
       active.onclose = event => {
         if (closed || done.value || activeGeneration !== generation) return

@@ -97,6 +97,47 @@ afterEach(() => {
 })
 
 describe('steer submission acknowledgement', () => {
+  it('keeps rejected busy submissions paired with their images for retry', async () => {
+    const request = vi.fn().mockRejectedValueOnce(new Error('session busy')).mockResolvedValue({ ok: true })
+    patchUiState({ busy: false, sid: 'session-a' })
+    const fixture = await mountSubmission(request)
+    try {
+      addAttachment(attachment)
+      act(() => fixture.submission.dispatchSubmission('see'))
+      await fixture.rendered.flush()
+      expect(getAttachments()).toEqual([])
+      expect(fixture.queueRef.current[0]?.images).toEqual([attachment])
+      const id = fixture.queueRef.current[0]!.submissionId
+      patchUiState({ busy: false })
+      act(() => fixture.submission.sendQueued(fixture.queueRef.current.shift()!))
+      await fixture.rendered.flush()
+      expect(request).toHaveBeenLastCalledWith('prompt.submit', expect.objectContaining({ submission_id: id, text: 'see', images: [{ data: attachment.data, media_type: attachment.mediaType }] }))
+    } finally { act(() => fixture.rendered.renderer.destroy()) }
+  })
+
+  it('queues a busy image with its text and never lends it to another message', async () => {
+    const request = vi.fn(() => Promise.resolve({ ok: true }))
+    patchUiState({ busy: true, busyInputMode: 'steer', sid: 'session-a' })
+    const fixture = await mountSubmission(request)
+    try {
+      addAttachment(attachment)
+      act(() => fixture.submission.dispatchSubmission('see'))
+      expect(request).not.toHaveBeenCalled()
+      expect(getAttachments()).toEqual([])
+      expect(fixture.queueRef.current[0]).toMatchObject({ displayText: 'see', images: [attachment] })
+      expect(fixture.sys).toHaveBeenCalledWith(expect.stringContaining('Image and message queued together'))
+      const later = { ...attachment, name: 'later.png', path: '/tmp/later.png' }
+      addAttachment(later)
+      patchUiState({ busy: false })
+      act(() => fixture.submission.sendQueued(fixture.queueRef.current.shift()!))
+      await fixture.rendered.flush()
+      expect(request).toHaveBeenLastCalledWith('prompt.submit', expect.objectContaining({ text: 'see', images: [{ data: attachment.data, media_type: attachment.mediaType }] }))
+      expect(getAttachments()).toEqual([later])
+    } finally {
+      act(() => fixture.rendered.renderer.destroy())
+    }
+  })
+
   it('accepts the native daemon ok response produced when Enter sends a steer', () => {
     expect(steerWasAccepted({ ok: true })).toBe(true)
   })

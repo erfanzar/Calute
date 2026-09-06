@@ -80,7 +80,7 @@ test('websocket monitor rejects unsafe URLs and surfaces binary or oversized fra
   const monitor = await nativeWebSocketMonitorSource.open(url, () => undefined, () => undefined, error => errors.push(error))
   try {
     await waitFor(() => errors[0])
-    expect(String(errors[0])).toMatch(/binary/)
+    expect(String(errors[0])).toMatch(/binary/i)
   } finally { monitor.close(); server.stop(true) }
 
   const oversized = localServer(socket => {

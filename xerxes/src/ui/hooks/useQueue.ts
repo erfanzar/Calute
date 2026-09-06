@@ -86,7 +86,7 @@ export function useQueue() {
 
   const replaceQ = useCallback(
     (i: number, submitText: string, displayText = submitText) => {
-      queueRef.current[i] = queuedMessage(displayText, submitText)
+      queueRef.current[i] = { ...queuedMessage(displayText, submitText), images: queueRef.current[i]?.images }
       syncQueue()
     },
     [syncQueue]

@@ -355,8 +355,11 @@ function CompactLiveProgress({ show }: { show: boolean }) {
 
   const goal = ui.info?.goal
   const goalPhase = ui.info?.goal_phase
+  const unfinishedTodos = todos.filter(todo => todo.status !== 'completed' && todo.status !== 'cancelled')
+  const liveGoal = live && goalPhase === 'complete' ? null : goal
+  const showTodoCard = live ? Boolean(liveGoal) || unfinishedTodos.length > 0 : todos.length > 0 || Boolean(liveGoal)
 
-  if (!show || (!visibleRows.length && !goal && !compacting)) {
+  if (!show || (!visibleRows.length && !showTodoCard && !compacting)) {
     return null
   }
 
@@ -368,7 +371,7 @@ function CompactLiveProgress({ show }: { show: boolean }) {
           {'Compacting context…'}
         </Text>
       ) : null}
-      {goal || todos.length ? (
+      {showTodoCard && (liveGoal || todos.length) ? (
         <Box flexDirection="column" flexShrink={0} backgroundColor={t.color.statusBg}
           borderSides={['left']} borderColor={t.color.accent} paddingX={compact ? 1 : 2} paddingY={compact ? 0 : 1}
           marginBottom={compact ? 0 : 1} onClick={() => patchOverlayState({ goal: true })}>
@@ -376,14 +379,14 @@ function CompactLiveProgress({ show }: { show: boolean }) {
             <Text bold color={t.ds.title}>{'Tasks ' + todos.filter(todo => todo.status === 'completed').length + '/' + todos.length}</Text>
             <Text color={t.ds.secondary}>{compact ? 'F10' : 'F10 · View plan →'}</Text>
           </Box>
-          {goal && !compact ? <Text color={t.color.text} wrap="wrap">{goal}{goalPhase ? ' · ' + goalPhase : ''}</Text> : null}
-          {todos.filter(todo => todo.status !== 'completed' && todo.status !== 'cancelled').slice(0, compact ? 0 : 3).map(todo => (
+          {liveGoal && !compact ? <Text color={t.color.text} wrap="wrap">{liveGoal}{goalPhase ? ' · ' + goalPhase : ''}</Text> : null}
+          {unfinishedTodos.slice(0, compact ? 0 : 3).map(todo => (
             <Box key={todo.id} flexDirection="row" gap={1} marginTop={compact ? 0 : 1}>
               <Text color={todo.status === 'in_progress' ? t.color.accent : t.ds.secondary}>{todo.status === 'in_progress' ? '◌' : '○'}</Text>
               <Text color={t.color.text} wrap="wrap">{todo.content}</Text>
             </Box>
           ))}
-          {!compact && todos.filter(todo => todo.status !== 'completed' && todo.status !== 'cancelled').length > 3 ? <Text color={t.ds.secondary}>More tasks in F10 →</Text> : null}
+          {!compact && unfinishedTodos.length > 3 ? <Text color={t.ds.secondary}>More tasks in F10 →</Text> : null}
         </Box>
       ) : null}
       {visibleRows.filter(row => row.kind !== 'todo').map((row, index) => {

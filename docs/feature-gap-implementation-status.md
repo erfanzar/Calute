@@ -3205,3 +3205,33 @@ goal. Remaining work includes authenticated webhook monitoring, strict inbound
 WebSocket transport bounds and broader feed integrations, PR/CI watch-to-review,
 transactional plugin lifecycle, authenticated remote continuation, native
 terminal/live-provider acceptance and the full requirement-by-requirement audit.
+
+## Attachment ownership and bounded WebSocket checkpoint (2026-09-06)
+
+Submitting an image during a live turn no longer sends its accompanying text as
+an image-free steer. The complete message queues with its own attachments and an
+explicit explanation; queue previews show the attachment count. Busy retries,
+queue editing and interpolation preserve message attachment ownership, and older
+queued messages do not consume later draft attachments. Live image steering is
+still unsupported; an empty-composer Enter can interrupt and dispatch the queue.
+Completed goals no longer occupy the live plan card; F10 retains their durable
+record, and unfinished tasks remain visible.
+
+WebSocket monitoring now uses a bounded incremental frame decoder over Bun's
+supported TCP/TLS socket APIs. It validates advertised lengths before payload
+buffering, bounds fragmented text to 64 KiB and HTTP upgrade headers to 16 KiB,
+and handles masked control replies with bounded output buffering. Protocol
+violations fail the watch without reconnecting. Cancellation destroys pending
+connections, and TLS verification is explicitly enabled. This supersedes the
+previous checkpoint's post-assembly inbound-limit caveat. Tests use local servers
+and a documented public self-signed test certificate, not live feeds.
+
+This remains a checkpoint, not completion of the wider production-readiness
+roadmap. Authenticated webhooks, broader feed integrations, PR/CI workflows,
+plugin lifecycle, remote continuation and native/live-provider acceptance remain.
+
+Checkpoint validation completed on the frozen worktree: root check/test/build
+and `git diff --check` passed; 3,636 runtime tests passed, 3 skipped, and 1,240 UI
+tests passed. Build `26455ab11693b37f`. Logs:
+`/tmp/xerxes-image-checkpoint-{check,test,build}.log`. No live-provider or native
+interactive visual acceptance was performed in this checkpoint.

@@ -382,7 +382,7 @@ with `websocket_url` and `match`. Remote feeds require `wss://`; unencrypted
 or fragments. This adapter does not send authentication headers or application
 subscription messages; endpoints requiring them are unsupported.
 
-Only text messages up to 64 KiB are accepted. Matching is case-insensitive;
+Only text messages up to 64 KiB are accepted. The transport checks advertised frame lengths and cumulative fragmented-message lengths before buffering payloads; handshake headers are capped at 16 KiB. TLS certificate verification remains enabled even if the process environment disables Node TLS verification. Matching is case-insensitive;
 duplicate matching content within the most recent 256 matching identities does
 not trigger another action. Evidence over 8192 characters is visibly truncated.
 Disconnects record gap events and permit three lifetime reconnect attempts at
@@ -1572,3 +1572,12 @@ it in their tool configuration. Standalone discovery uses the native generic
 model endpoint or Codex catalog, preserves source metadata, and reports catalog
 failures explicitly. It reads existing routing notes and can request optional
 profile-bound usage. It does not change the active model/profile.
+
+### Images submitted during a running turn
+
+Pasted images belong to the message submitted with them. When busy input is set
+to steer, a message containing images queues as a complete text-and-image message
+for the next turn, because live steering currently supports text only. The queue
+shows an image count and the UI explains the delay. Press Enter on an empty
+composer to interrupt and send the queued message. A later paste stays with the
+new draft; it is not consumed by an older queued message.

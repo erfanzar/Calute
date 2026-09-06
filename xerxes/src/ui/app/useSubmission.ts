@@ -114,10 +114,9 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return sys('session not ready yet')
       }
 
-      // Pending /image attachments apply to exactly this submit: take them
-      // out of the store now, and only restore them when the daemon never
-      // accepted the turn (session-busy rollback re-queues the text).
-      const images = takeAttachments()
+      // Attachments belong to this message, including while queued. Never
+      // consume a newer composer draft when retrying an older submission.
+      const images = message.images ?? []
       const userMessage = queuedUserMessage(message)
 
       turnController.clearStatusTimer()
@@ -148,7 +147,6 @@ export function useSubmission(opts: UseSubmissionOptions) {
             // optimistic bubble and restore only the queue preview; the next
             // settle edge will dispatch it and append one fresh user bubble.
             removeMessage(userMessage)
-            restoreAttachments(images)
             composerRefs.queueRef.current.unshift(message)
             composerActions.syncQueue()
             patchUiState({ busy: true, status: 'queued for next turn' })
@@ -173,10 +171,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
     (text: string) => {
       const submitText = expandSnips(composerState.pasteSnips)(text)
 
-      // Native Bun accepts prompt text directly; pending /image attachments
-      // are taken from the attachments store inside submitPrompt and ride the
-      // same prompt.submit frame as `images`.
-      submitPrompt(queuedMessage(text, submitText))
+      // Bind the current draft attachments before submitting.
+      submitPrompt({ ...queuedMessage(text, submitText), images: takeAttachments() })
     },
     [composerState.pasteSnips, submitPrompt]
   )
@@ -281,7 +277,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
             return
           }
 
-          submitPrompt(queuedMessage(message.displayText, submitText))
+          submitPrompt({ ...message, submitText })
         })
       }
 
@@ -311,12 +307,15 @@ export function useSubmission(opts: UseSubmissionOptions) {
           composerRefs.queueRef.current.unshift(message)
           composerActions.syncQueue()
         } else {
-          composerActions.enqueue(message.submitText, message.displayText)
+          composerRefs.queueRef.current.push(message)
+          composerActions.syncQueue()
         }
       }
 
-      if (mode === 'queue') {
-        return composerActions.enqueue(message.submitText, message.displayText)
+      if (mode === 'queue' || (mode === 'steer' && message.images?.length)) {
+        enqueueText()
+        if (mode === 'steer') sys('Image and message queued together for the next turn — live steering supports text only. Press Enter on an empty composer to interrupt and send now.')
+        return
       }
 
       if (mode === 'steer' && live.sid) {
@@ -438,11 +437,12 @@ export function useSubmission(opts: UseSubmissionOptions) {
       }
 
       const live = getUiState()
-      const message = queuedMessage(full, expandSnips(composerState.pasteSnips)(full))
+      const message = { ...queuedMessage(full, expandSnips(composerState.pasteSnips)(full)), images: takeAttachments() }
 
       if (!live.sid) {
         composerActions.pushHistory(full)
-        composerActions.enqueue(message.submitText, message.displayText)
+        composerRefs.queueRef.current.push(message)
+        composerActions.syncQueue()
         composerActions.clearIn()
 
         return
@@ -452,7 +452,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
       composerActions.clearIn()
 
       if (editIdx !== null) {
-        composerActions.replaceQueue(editIdx, message.submitText, message.displayText)
+        const previous = composerRefs.queueRef.current[editIdx]
+        composerRefs.queueRef.current[editIdx] = { ...message, images: [...(previous?.images ?? []), ...message.images] }
         const picked = composerRefs.queueRef.current.splice(editIdx, 1)[0]
         composerActions.syncQueue()
         composerActions.setQueueEdit(null)

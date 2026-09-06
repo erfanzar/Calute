@@ -1,6 +1,7 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import type { PendingAttachment } from '../app/attachmentsStore.js'
 import type { Msg } from '../types.js'
 
 /**
@@ -11,6 +12,7 @@ import type { Msg } from '../types.js'
  */
 export interface QueuedMessage {
   displayText: string
+  images?: readonly PendingAttachment[]
   submissionId: string
   submitText: string
 }
@@ -22,7 +24,7 @@ export const queuedMessage = (displayText: string, submitText = displayText): Qu
 })
 
 export const queuedMessageDisplays = (queue: readonly QueuedMessage[]): string[] =>
-  queue.map(message => message.displayText)
+  queue.map(message => message.images?.length ? `${message.displayText} · ${message.images.length} image(s)` : message.displayText)
 
 export const appendQueuedMessage = (queue: readonly QueuedMessage[], message: QueuedMessage): QueuedMessage[] => [
   ...queue,

@@ -10,8 +10,9 @@ import { formatBytes, MAX_IMAGE_ATTACHMENTS_TOTAL_BYTES } from '../lib/imageAtta
  * A nanostores atom (not composer React state) so the `/image` slash command,
  * the composer indicator line, and the submit path can all reach the same
  * list without prop drilling through useInputHandlers. Attachments apply to
- * exactly one `prompt.submit`: the submit path takes them and clears the
- * list, restoring them only when the daemon rejects the submit as busy.
+ * exactly one authored message: submission takes them into that message,
+ * including while queued. A busy retry preserves them with the queued text;
+ * other submit failures return them to the draft.
  */
 export interface PendingAttachment {
   readonly data: string
