@@ -15,7 +15,7 @@ function reactionTokenLabel(health: Record<string, unknown>): string {
 export interface MonitorView {
   policy?: { revision: string; maxReactions: number; maxDurationMs: number; maxTotalTokens: number | null }
   id: string; terminalId: string; match: string; state: string; expiresAt: number
-  source?: { kind: 'terminal'; terminalId: string } | { kind: 'file'; path: string; workspace: string } | { kind: 'websocket'; url: string }
+  source?: { kind: 'terminal'; terminalId: string } | { kind: 'file'; path: string; workspace: string } | { kind: 'websocket'; url: string } | { kind: 'webhook'; name: string }
   trigger: 'output' | 'completion' | 'change'
   stopAction?: 'stop-watch' | 'cancel-reactions' | null
   sourceStatus?: string
@@ -35,8 +35,9 @@ function parse(value: unknown): MonitorView {
     if (candidate.kind === 'terminal' && typeof candidate.terminalId === 'string' && candidate.terminalId.trim()) source = { kind: 'terminal', terminalId: candidate.terminalId }
     else if (candidate.kind === 'file' && typeof candidate.path === 'string' && candidate.path.trim() && typeof candidate.workspace === 'string' && candidate.workspace.trim()) source = { kind: 'file', path: candidate.path, workspace: candidate.workspace }
     else if (candidate.kind === 'websocket' && typeof candidate.url === 'string' && candidate.url.trim()) source = { kind: 'websocket', url: candidate.url }
+    else if (candidate.kind === 'webhook' && typeof candidate.name === 'string' && candidate.name.trim()) source = { kind: 'webhook', name: candidate.name }
     else throw new Error('Invalid monitor source')
-    if ((source.kind === 'file' && trigger !== 'change') || (source.kind === 'websocket' && trigger !== 'output') || (source.kind === 'terminal' && trigger === 'change')) throw new Error('Invalid monitor source trigger')
+    if ((source.kind === 'file' && trigger !== 'change') || ((source.kind === 'websocket' || source.kind === 'webhook') && trigger !== 'output') || (source.kind === 'terminal' && trigger === 'change')) throw new Error('Invalid monitor source trigger')
   } else {
     if (trigger === 'change') throw new Error('File monitor source is required for change events')
     source = { kind: 'terminal', terminalId: row.terminalId }
@@ -71,9 +72,20 @@ export async function monitorAction(rpc: GatewayRpc, id: string, action: 'inspec
   return watch
 }
 
-export interface MonitorSettings { max_total_tokens?: number; terminal_id?: string; source_kind?: 'file' | 'websocket'; file_path?: string; websocket_url?: string; trigger?: 'output' | 'completion' | 'change'; match?: string; duration_seconds: number; react: boolean; max_reactions: number; reaction_timeout_seconds: number }
+export interface MonitorSettings { max_total_tokens?: number; terminal_id?: string; source_kind?: 'file' | 'websocket' | 'webhook'; file_path?: string; websocket_url?: string; webhook_name?: string; trigger?: 'output' | 'completion' | 'change'; match?: string; duration_seconds: number; react: boolean; max_reactions: number; reaction_timeout_seconds: number }
 export async function createMonitor(rpc: GatewayRpc, settings: MonitorSettings): Promise<MonitorView> {
   const response = await rpc<Response>('monitor.create', { ...settings })
   if (!response?.ok) throw new Error(response?.error || 'Could not create monitor')
   return parse(response.monitor)
+}
+
+export async function listMonitorWebhooks(rpc: GatewayRpc): Promise<string[]> {
+  const response = await rpc<{ ok?: boolean; error?: string; webhooks?: unknown }>('monitor.sources', {})
+  if (!response?.ok || !Array.isArray(response.webhooks)) throw new Error(response?.error || 'Webhook sources unavailable')
+  return response.webhooks.map(value => {
+    if (!value || typeof value !== 'object') throw new Error('Invalid webhook source response')
+    const candidate = value as Record<string, unknown>
+    if (typeof candidate.name !== 'string' || !candidate.name.trim()) throw new Error('Invalid webhook source response')
+    return candidate.name
+  })
 }

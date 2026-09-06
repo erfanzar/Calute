@@ -4,6 +4,7 @@ import type { ReactionMailbox, ReactionHealth, ReactionPolicyEdit } from './reac
 import type { RunHistory, MonitorConfiguration } from './runHistory.js'
 import type { FileMonitorSource } from './fileMonitorSource.js'
 import type { WebSocketMonitorSource, WebSocketMonitorEvent } from './websocketMonitorSource.js'
+import type { WebhookMonitorSource } from './webhookMonitorSource.js'
 import type { TerminalInspection, TerminalRegistry } from './terminalRegistry.js'
 
 export interface MonitorReaction { readonly maxTotalTokens?: number; readonly maxReactions: number; readonly maxDurationMs: number }
@@ -36,7 +37,68 @@ export class TerminalMonitors {
     private readonly onError: (error: unknown) => void = error => console.error('Monitor failed:', error),
     private readonly reactionMailbox?: ReactionMailbox,
     private readonly files?: { readonly source: FileMonitorSource; readonly resolveWorkspace: (owner: string) => string },
-    private readonly websockets?: { readonly source: WebSocketMonitorSource; readonly resolveWorkspace: (owner: string) => string }) {}
+    private readonly websockets?: { readonly source: WebSocketMonitorSource; readonly resolveWorkspace: (owner: string) => string },
+    private readonly webhooks?: { readonly source: WebhookMonitorSource; readonly resolveWorkspace: (owner: string) => string }) {}
+
+  webhookSources(owner: string): readonly { readonly name: string }[] {
+    if (!owner.trim()) throw new Error('Monitor requires a session owner')
+    return this.webhooks?.source.list() ?? []
+  }
+
+  async startWebhook(owner: string, options: { name: string; match: string; durationMs?: number; maxEvents?: number; reaction?: MonitorReaction; signal?: AbortSignal }): Promise<MonitorSummary> {
+    if (!this.webhooks) throw new Error('Webhook monitoring is unavailable on this host')
+    if (!owner.trim()) throw new Error('Monitor requires a session owner')
+    if (options.reaction && !this.reactionMailbox) throw new Error('Automatic monitor reactions are unavailable on this host')
+    const name = options.name
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) throw new Error('Webhook name must match [a-zA-Z0-9_-]{1,64}')
+    const match = options.match.trim(), duration = options.durationMs ?? 3_600_000, maxEvents = options.maxEvents ?? 50
+    if (!match || match.length > 1024) throw new Error('Monitor match must contain 1–1024 characters')
+    if (!Number.isSafeInteger(duration) || duration < 100 || duration > 86_400_000) throw new Error('Monitor duration must be 100–86400000ms')
+    if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 1000) throw new Error('Monitor maxEvents must be 1–1000')
+    this.assertCapacity(owner)
+    const pending = { owner, controller: new AbortController() }
+    this.opening.add(pending)
+    const abort = () => pending.controller.abort(options.signal?.reason)
+    options.signal?.addEventListener('abort', abort, { once: true })
+    if (options.signal?.aborted) abort()
+    let watch: Watch | undefined
+    let subscription: Awaited<ReturnType<WebhookMonitorSource['open']>> | undefined
+    const queued: Array<{ text: string; identity: string }> = []
+    let openingError: unknown
+    const consume = (event: { text: string; identity: string }) => {
+      if (!watch) { if (queued.length < 32) queued.push(event); else openingError = new Error('Webhook source exceeded attachment event capacity'); return }
+      if (watch.state !== 'watching' || !event.text.toLowerCase().includes(match.toLowerCase()) || watch.seen.has(event.identity)) return
+      try {
+        watch.seen.add(event.identity)
+        if (watch.seen.size > 256) watch.seen.delete(watch.seen.values().next().value!)
+        const text = `[Webhook message] ${event.text}`
+        this.recordEvent(watch, text.length > 8192 ? `${text.slice(0, 8160)} [message truncated]` : text)
+      } catch (error) { this.fail(watch, error) }
+    }
+    try {
+      const workspace = this.webhooks.resolveWorkspace(owner)
+      subscription = await this.webhooks.source.open(name, consume, error => {
+        if (watch) { if (watch.state === 'watching') this.fail(watch, error) } else openingError = error
+      }, pending.controller.signal)
+      pending.controller.signal.throwIfAborted()
+      if (openingError !== undefined) throw openingError
+      const source = { kind: 'webhook' as const, name: subscription.name }, expiresAt = Date.now() + duration
+      const run = this.history.startMonitor({ ownerSessionId: owner, workspace, kind: 'monitor', sourceId: source.name, title: `Watch Webhook ${source.name}` }, { trigger: 'output', match, expiresAt, source })
+      watch = { source, trigger: 'output', id: run.id, terminalId: '', owner, match, state: 'watching', events: [], expiresAt,
+        ...(options.reaction ? { reaction: { ...options.reaction } } : {}), droppedEvents: 0, sequence: 0, partial: '', prefixOmitted: false, suffixOmitted: false, seen: new Set(), maxEvents, unsubscribe: subscription.close, sourceStatus: 'Watching webhook messages' }
+      this.watches.set(watch.id, watch)
+      if (options.reaction) this.reactionMailbox!.configure({ owner, runId: watch.id, expiresAt, ...options.reaction })
+      const active = watch
+      watch.timer = setTimeout(() => this.finish(active, 'expired'), duration)
+      watch.timer.unref?.()
+      for (const event of queued) consume(event)
+      return this.snapshot(watch)
+    } catch (error) {
+      subscription?.close()
+      if (watch) this.fail(watch, error)
+      throw error
+    } finally { this.opening.delete(pending); options.signal?.removeEventListener('abort', abort) }
+  }
 
   async startWebSocket(owner: string, options: { url: string; match: string; durationMs?: number; maxEvents?: number; reaction?: MonitorReaction; signal?: AbortSignal }): Promise<MonitorSummary> {
     if (!this.websockets) throw new Error('WebSocket monitoring is unavailable on this host')
@@ -221,7 +283,7 @@ export class TerminalMonitors {
     const state = run.state === 'running' ? 'detached' : run.state === 'interrupted' ? 'interrupted' : 'archived'
     return { ...configuration, id, owner, terminalId: configuration.source && configuration.source.kind !== 'terminal' ? '' : run.sourceId, state, stopAction: stopAction(state, reactionHealth),
       events, droppedEvents: Math.max(0, last - events.length),
-      sourceStatus: run.state === 'running' ? 'Watch is not attached to this daemon. Its owning process may still be running.' : configuration.source?.kind === 'websocket' ? 'WebSocket watch is no longer attached. Messages during downtime were not observed; create a new watch.' : configuration.source?.kind === 'file' ? 'File watch is no longer attached. Changes during downtime were not observed; create a new watch to establish a new baseline.' : 'Stored watch outcome: ' + run.state + '. No live source is attached.',
+      sourceStatus: run.state === 'running' ? 'Watch is not attached to this daemon. Its owning process may still be running.' : configuration.source?.kind === 'websocket' ? 'WebSocket watch is no longer attached. Messages during downtime were not observed; create a new watch.' : configuration.source?.kind === 'file' ? 'File watch is no longer attached. Changes during downtime were not observed; create a new watch to establish a new baseline.' : configuration.source?.kind === 'webhook' ? 'Webhook watch is no longer attached. Deliveries during downtime were not observed; create a new watch.' : 'Stored watch outcome: ' + run.state + '. No live source is attached.',
       ...(run.error ? { error: run.error } : {}),
       ...(reactionHealth ? { reactionHealth } : {}),
     }
@@ -373,6 +435,7 @@ export class TerminalMonitors {
     delete watch.matchedLine
     if (state === 'interrupted' && watch.source?.kind === 'file') watch.sourceStatus = 'File watch interrupted. Changes during downtime were not observed; create a new watch.'
     if (state === 'interrupted' && watch.source?.kind === 'websocket') watch.sourceStatus = 'WebSocket watch interrupted. Messages during downtime were not observed; create a new watch.'
+    if (state === 'interrupted' && watch.source?.kind === 'webhook') watch.sourceStatus = 'Webhook watch interrupted. Deliveries during downtime were not observed; create a new watch.'
     try { this.history.finish(watch.owner, watch.id, state === 'stopped' ? 'cancelled' : state === 'interrupted' ? 'interrupted' : 'succeeded', {
       output: `${state} · ${watch.sequence} matches · ${watch.droppedEvents} older events omitted\n${this.output(watch)}`,
       outputTruncated: watch.droppedEvents > 0, notify: watch.sequence > 0,

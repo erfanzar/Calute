@@ -181,3 +181,74 @@ it('keeps websocket match required after switching from terminal completion and 
     expect(screen.captureCharFrame()).toContain('Source: Terminal output')
   } finally { act(() => screen.renderer.destroy()) }
 })
+
+it('discovers a configured webhook and submits its name without secrets', async () => {
+  const created = vi.fn()
+  const rpc = vi.fn(async (method: string) => method === 'terminal.list'
+    ? { ok: true, terminals: [] }
+    : method === 'monitor.sources'
+      ? { ok: true, webhooks: [{ name: 'deploy-events' }] }
+      : { ok: true, monitor: { id: 'webhook-watch', terminalId: '', source: { kind: 'webhook', name: 'deploy-events' }, trigger: 'output', match: 'failure', state: 'watching', expiresAt: 1000 } })
+  const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><MonitorCreate t={DARK_THEME} onCreated={created} onClose={() => {}} /></GatewayProvider>, { width: 120, height: 40 })
+  try {
+    await screen.flush()
+    for (let i = 0; i < 3; i++) { act(() => screen.mockInput.pressKey('ARROW_RIGHT')); await screen.flush() }
+    await vi.waitFor(() => expect(screen.captureCharFrame()).toContain('Webhook name: deploy-events'))
+    act(() => screen.mockInput.pressKey('TAB')); await screen.flush()
+    act(() => screen.mockInput.pressKey('TAB')); await screen.flush()
+    await act(async () => screen.mockInput.typeText('failure')); await screen.flush()
+    act(() => screen.mockInput.pressKey('RETURN')); await screen.flush()
+    await vi.waitFor(() => expect(created).toHaveBeenCalledWith('webhook-watch'))
+    expect(rpc).toHaveBeenCalledWith('monitor.create', { source_kind: 'webhook', webhook_name: 'deploy-events', trigger: 'output', match: 'failure', duration_seconds: 3600, react: false, max_reactions: 3, reaction_timeout_seconds: 60 })
+  } finally { act(() => screen.renderer.destroy()) }
+})
+
+it('reports missing webhook configuration without sending a create request', async () => {
+  const rpc = vi.fn(async (method: string) => method === 'terminal.list'
+    ? { ok: true, terminals: [] }
+    : method === 'monitor.sources' ? { ok: true, webhooks: [] } : { ok: true })
+  const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><MonitorCreate t={DARK_THEME} onCreated={() => {}} onClose={() => {}} /></GatewayProvider>, { width: 110, height: 35 })
+  try {
+    await screen.flush()
+    for (let i = 0; i < 3; i++) { act(() => screen.mockInput.pressKey('ARROW_RIGHT')); await screen.flush() }
+    await vi.waitFor(() => expect(screen.captureCharFrame()).toContain('(no configured webhooks)'))
+    act(() => screen.mockInput.pressKey('RETURN')); await screen.flush()
+    expect(screen.captureCharFrame()).toContain('No configured webhook sources are available')
+    expect(rpc).not.toHaveBeenCalledWith('monitor.create', expect.anything())
+  } finally { act(() => screen.renderer.destroy()) }
+})
+
+it('keeps the webhook form usable after source discovery fails', async () => {
+  const rpc = vi.fn(async (method: string) => method === 'terminal.list'
+    ? { ok: true, terminals: [] }
+    : method === 'monitor.sources' ? { ok: false, error: 'Webhook host unavailable' } : { ok: true })
+  const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><MonitorCreate t={DARK_THEME} onCreated={() => {}} onClose={() => {}} /></GatewayProvider>, { width: 110, height: 35 })
+  try {
+    await screen.flush()
+    for (let i = 0; i < 3; i++) { act(() => screen.mockInput.pressKey('ARROW_RIGHT')); await screen.flush() }
+    await vi.waitFor(() => expect(screen.captureCharFrame()).toContain('Webhook host unavailable'))
+    act(() => screen.mockInput.pressKey('TAB')); await screen.flush()
+    act(() => screen.mockInput.pressKey('TAB')); await screen.flush()
+    await act(async () => screen.mockInput.typeText('failure')); await screen.flush()
+    expect(screen.captureCharFrame()).toContain('Match: failure')
+    expect(screen.captureCharFrame()).toContain('Webhook host unavailable')
+  } finally { act(() => screen.renderer.destroy()) }
+})
+
+it('ignores a late webhook discovery response after leaving the source form', async () => {
+  let resolveSources!: (value: unknown) => void
+  const sources = new Promise(resolve => { resolveSources = resolve })
+  const rpc = vi.fn((method: string) => method === 'terminal.list'
+    ? Promise.resolve({ ok: true, terminals: [{ id: 'build', label: 'Build', running: true, kind: 'background' }] })
+    : method === 'monitor.sources' ? sources : Promise.resolve({ ok: true }))
+  const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><MonitorCreate t={DARK_THEME} onCreated={() => {}} onClose={() => {}} /></GatewayProvider>, { width: 110, height: 35 })
+  try {
+    await screen.flush()
+    for (let i = 0; i < 3; i++) { act(() => screen.mockInput.pressKey('ARROW_RIGHT')); await screen.flush() }
+    act(() => screen.mockInput.pressKey('ARROW_LEFT')); await screen.flush()
+    await act(async () => { resolveSources({ ok: true, webhooks: [{ name: 'late-secret-looking-name' }] }); await sources })
+    await screen.flush()
+    expect(screen.captureCharFrame()).toContain('Source: Websocket server push')
+    expect(screen.captureCharFrame()).not.toContain('late-secret-looking-name')
+  } finally { act(() => screen.renderer.destroy()) }
+})

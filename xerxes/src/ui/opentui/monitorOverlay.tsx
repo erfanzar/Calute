@@ -97,16 +97,17 @@ export function MonitorOverlay({ t }: { t: Theme }) {
       <Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0}>
         <Box width={wide ? '35%' : '100%'} height={wide ? '100%' : Math.min(6, rows.length * 2 + 1)} flexDirection="column" paddingRight={1}>
           {rows.length ? rows.slice(start, start + count).map(row => <Box key={row.id} height={2} flexDirection="column" backgroundColor={row.id === selected ? t.ds.selected : undefined} onMouseDown={() => setSelected(row.id)}>
-            <Text color={t.color.text} wrap="truncate-end">{row.source?.kind === 'file' ? `File changes · ${row.source.path}` : row.source?.kind === 'websocket' ? `Websocket · ${row.source.url}` : row.match}</Text>
-            <Text color={t.ds.secondary} wrap="truncate-end">{row.state} · {row.source?.kind === 'file' ? row.source.workspace : row.source?.kind === 'websocket' ? 'server push' : row.terminalId}</Text>
+            <Text color={t.color.text} wrap="truncate-end">{row.source?.kind === 'file' ? `File changes · ${row.source.path}` : row.source?.kind === 'websocket' ? `Websocket · ${row.source.url}` : row.source?.kind === 'webhook' ? `Webhook · ${row.source.name}` : row.match}</Text>
+            <Text color={t.ds.secondary} wrap="truncate-end">{row.state} · {row.source?.kind === 'file' ? row.source.workspace : row.source?.kind === 'websocket' ? 'server push' : row.source?.kind === 'webhook' ? 'configured source' : row.terminalId}</Text>
           </Box>) : <Text color={t.ds.secondary}>No watches in this session.</Text>}
         </Box>
         <scrollbox ref={scroll} style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
           {detail ? <Box flexDirection="column" flexShrink={0}>
-            <Text bold color={t.color.text} wrap="wrap">{detail.source?.kind === 'file' ? `File changes: ${detail.source.path}` : detail.source?.kind === 'websocket' ? `Websocket: ${detail.source.url}` : `Match: ${detail.match}`}</Text>
+            <Text bold color={t.color.text} wrap="wrap">{detail.source?.kind === 'file' ? `File changes: ${detail.source.path}` : detail.source?.kind === 'websocket' ? `Websocket: ${detail.source.url}` : detail.source?.kind === 'webhook' ? `Webhook: ${detail.source.name}` : `Match: ${detail.match}`}</Text>
             <Text color={t.ds.secondary} wrap="wrap">{detail.state} · {detail.reaction}</Text>
             {detail.source?.kind === 'file' ? <Text color={t.ds.secondary} wrap="wrap">Workspace: {detail.source.workspace} · metadata changes only</Text> : null}
             {detail.source?.kind === 'websocket' ? <Text color={t.ds.secondary} wrap="wrap">Text-only server push · duplicates suppressed · reconnect gaps possible</Text> : null}
+            {detail.source?.kind === 'webhook' ? <Text color={t.ds.secondary} wrap="wrap">Configured webhook · text-only payloads · delivery gaps possible</Text> : null}
             <Text color={t.ds.secondary} wrap="wrap">Expires: {new Date(detail.expiresAt).toLocaleString()}</Text>
             {detail.sourceStatus ? <Text color={t.ds.secondary} wrap="wrap">{detail.sourceStatus}</Text> : null}
             {detail.error ? <Text color={t.color.warn} wrap="wrap">{detail.error}</Text> : null}

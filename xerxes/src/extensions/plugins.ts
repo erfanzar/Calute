@@ -108,6 +108,12 @@ export class PluginConflictError extends Error {
   }
 }
 
+/**
+ * Registration uses an isolated capability view and publishes only after success.
+ * Await all capability registrations before resolving. Retained read methods see
+ * the live registry after commit; later mutations of this view are rejected.
+ * Arbitrary module side effects outside the registry are not transactional.
+ */
 export interface XerxesPluginModule {
   readonly register?: (registry: PluginRegistry) => void | Promise<void>
 }
@@ -141,15 +147,19 @@ export class PluginRegistry {
   private readonly failures: string[] = []
   private readonly loadedModules = new Set<string>()
   private discoveryQueue: Promise<void> = Promise.resolve()
+  private registrationClosed = false
+  private committedRegistry: PluginRegistry | undefined
   /** Module path currently executing register(), plus the plugin names it has registered. */
   private activeDiscovery: { readonly names: Set<string>; readonly path: string } | undefined
 
   get pluginNames(): string[] {
+    if (this.committedRegistry) return this.committedRegistry.pluginNames
     return [...this.plugins.keys()]
   }
 
   /** Describe current registrations without invoking any plugin capability. */
   inventory(): PluginInventoryEntry[] {
+    if (this.committedRegistry) return this.committedRegistry.inventory()
     return [...this.plugins.values()].map(plugin => ({
       name: plugin.meta.name, description: plugin.meta.description, version: plugin.meta.version,
       source: plugin.sourcePath ? { kind: 'module' as const, path: plugin.sourcePath } : { kind: 'host-registration' as const },
@@ -161,10 +171,13 @@ export class PluginRegistry {
 
   /** Formatted per-module errors captured during discovery, in discovery order. */
   get loadErrors(): readonly string[] {
+    if (this.committedRegistry) return this.committedRegistry.loadErrors
     return [...this.failures]
   }
 
   async discover(directory: string, options: PluginDiscoveryOptions = {}): Promise<string[]> {
+    this.assertRegistrationOpen()
+    if (this.activeDiscovery) throw new Error("Nested plugin discovery during registration is unsupported")
     const operation = this.discoveryQueue.then(
       () => this.discoverPass(directory, options),
       () => this.discoverPass(directory, options),
@@ -204,20 +217,21 @@ export class PluginRegistry {
       const href = pathToFileURL(path).href
       // An already-loaded module must not re-execute; its registrations would conflict with themselves.
       if (this.loadedModules.has(href)) continue
-      const snapshot = this.registrationSnapshot()
+      let staged: PluginRegistry | undefined
       try {
         const module = await import(href) as XerxesPluginModule
-        this.activeDiscovery = { names: new Set(), path }
-        try {
-          await module.register?.(this)
-        } finally {
-          this.activeDiscovery = undefined
-        }
+        staged = this.registrationStage(path)
+        const snapshot = staged.registrationSnapshot()
+        await module.register?.(staged)
+        staged.registrationClosed = true
+        const added = this.commitRegistration(staged, snapshot)
+        staged.committedRegistry = this
+        staged.activeDiscovery = undefined
+        staged.releaseRegistrationStage()
         this.loadedModules.add(href)
-        for (const name of this.plugins.keys()) if (!snapshot.plugins.has(name)) discovered.push(name)
+        discovered.push(...added)
       } catch (error) {
-        this.activeDiscovery = undefined
-        this.rollbackRegistrations(snapshot)
+        if (staged) { staged.registrationClosed = true; staged.activeDiscovery = undefined; staged.releaseRegistrationStage() }
         const message = `${path}: ${errorMessage(error)}`
         this.failures.push(message)
         console.error(`Plugin discovery failed: ${message}`)
@@ -227,22 +241,27 @@ export class PluginRegistry {
   }
 
   getAllChannels(): Record<string, unknown> {
+    if (this.committedRegistry) return this.committedRegistry.getAllChannels()
     return Object.fromEntries([...this.channels].map(([name, entry]) => [name, entry.value]))
   }
 
   getAllTools(): Record<string, PluginTool> {
+    if (this.committedRegistry) return this.committedRegistry.getAllTools()
     return Object.fromEntries([...this.tools].map(([name, entry]) => [name, entry.value]))
   }
 
   getChannel(name: string): unknown | undefined {
+    if (this.committedRegistry) return this.committedRegistry.getChannel(name)
     return this.channels.get(name)?.value
   }
 
   getHooks(name: string): HookCallback[] {
+    if (this.committedRegistry) return this.committedRegistry.getHooks(name)
     return (this.hooks.get(name) ?? []).map(entry => entry.callback)
   }
 
   getLoadOrder(): string[] {
+    if (this.committedRegistry) return this.committedRegistry.getLoadOrder()
     const graph: Record<string, string[]> = {}
     for (const [name, plugin] of this.plugins) {
       const dependencies = plugin.meta.dependencies.map(parseDependency).map(spec => spec.name)
@@ -253,24 +272,29 @@ export class PluginRegistry {
   }
 
   getPlugin(name: string): RegisteredPlugin | undefined {
+    if (this.committedRegistry) return this.committedRegistry.getPlugin(name)
     return this.plugins.get(name)
   }
 
   getProvider(name: string): PluginLlmProviderFactory | undefined {
+    if (this.committedRegistry) return this.committedRegistry.getProvider(name)
     return this.providers.get(name)?.value
   }
 
   getTool(name: string): PluginTool | undefined {
+    if (this.committedRegistry) return this.committedRegistry.getTool(name)
     return this.tools.get(name)?.value
   }
 
   registerChannel(name: string, channel: unknown, meta?: PluginMeta, pluginName?: string): void {
+    this.assertRegistrationOpen()
     const owner = this.resolveOwner(meta, pluginName)
     this.registerUnique(this.channels, `channel:${name}`, name, channel, owner)
     this.plugins.get(owner)?.channels.set(name, channel)
   }
 
   registerHook(name: HookPoint | string, callback: HookCallback, meta?: PluginMeta, pluginName?: string): void {
+    this.assertRegistrationOpen()
     const owner = this.resolveOwner(meta, pluginName)
     const values = this.hooks.get(name) ?? []
     values.push({ callback, owner })
@@ -279,6 +303,7 @@ export class PluginRegistry {
   }
 
   registerPlugin(meta: PluginMeta): RegisteredPlugin {
+    this.assertRegistrationOpen()
     if (this.plugins.has(meta.name)) throw new PluginConflictError(meta.name, meta.name)
     this.activeDiscovery?.names.add(meta.name)
     const plugin: RegisteredPlugin = {
@@ -290,6 +315,7 @@ export class PluginRegistry {
   }
 
   registerProvider(name: string, provider: PluginLlmProviderFactory, meta?: PluginMeta, pluginName?: string): void {
+    this.assertRegistrationOpen()
     if (!isPluginLlmProviderFactory(provider)) {
       throw new TypeError(`Provider '${name}' must expose createClient(request)`)
     }
@@ -300,12 +326,14 @@ export class PluginRegistry {
   }
 
   registerTool(name: string, tool: PluginTool, meta?: PluginMeta, pluginName?: string): void {
+    this.assertRegistrationOpen()
     const owner = this.resolveOwner(meta, pluginName)
     this.registerUnique(this.tools, `tool:${name}`, name, tool, owner)
     this.plugins.get(owner)?.tools.set(name, tool)
   }
 
   unregisterPlugin(name: string): void {
+    this.assertRegistrationOpen()
     const discovery = this.activeDiscovery
     if (discovery && this.plugins.has(name) && !discovery.names.has(name)) {
       throw new Error(`Plugin module ${discovery.path} cannot unregister existing plugin '${name}' during registration`)
@@ -322,6 +350,7 @@ export class PluginRegistry {
   }
 
   validateDependencies(): string[] {
+    if (this.committedRegistry) return this.committedRegistry.validateDependencies()
     const available = Object.fromEntries([...this.plugins].map(([name, plugin]) => [name, plugin.meta.version]))
     const resolver = new DependencyResolver()
     const errors: string[] = []
@@ -338,6 +367,7 @@ export class PluginRegistry {
   }
 
   versionConflicts(name: string, version: string): string[] {
+    if (this.committedRegistry) return this.committedRegistry.versionConflicts(name, version)
     const conflicts: string[] = []
     for (const [pluginName, plugin] of this.plugins) {
       const constraints = [
@@ -376,33 +406,52 @@ export class PluginRegistry {
     }
   }
 
-  /** Remove every capability a failed plugin module added, including standalone and foreign-owned entries. */
-  private rollbackRegistrations(snapshot: PluginRegistrationSnapshot): void {
-    for (const name of [...this.plugins.keys()]) {
-      if (!snapshot.plugins.has(name)) this.unregisterPlugin(name)
+  private releaseRegistrationStage(): void {
+    this.plugins.clear()
+    this.tools.clear()
+    this.providers.clear()
+    this.channels.clear()
+    this.hooks.clear()
+  }
+
+  private assertRegistrationOpen(): void {
+    if (this.registrationClosed) throw new Error('Plugin registration is closed; capabilities must be registered before register() settles')
+  }
+
+  /** A module receives an isolated registry; live consumers never see partial registration. */
+  private registrationStage(path: string): PluginRegistry {
+    const stage = new PluginRegistry()
+    for (const [name, plugin] of this.plugins) stage.plugins.set(name, {
+      ...plugin, meta: normalizeMeta(plugin.meta), tools: new Map(plugin.tools),
+      hooks: new Map(plugin.hooks), channels: new Map(plugin.channels),
+    })
+    for (const [name, entry] of this.tools) stage.tools.set(name, entry)
+    for (const [name, entry] of this.providers) stage.providers.set(name, entry)
+    for (const [name, entry] of this.channels) stage.channels.set(name, entry)
+    for (const [name, entries] of this.hooks) stage.hooks.set(name, [...entries])
+    stage.activeDiscovery = { names: new Set(), path }
+    return stage
+  }
+
+  /** Recheck live conflicts after awaits, then publish all deltas synchronously. */
+  private commitRegistration(stage: PluginRegistry, before: PluginRegistrationSnapshot): string[] {
+    const plugins = [...stage.plugins].filter(([name]) => !before.plugins.has(name))
+    const tools = [...stage.tools].filter(([name]) => !before.tools.has(name))
+    const providers = [...stage.providers].filter(([name]) => !before.providers.has(name))
+    const channels = [...stage.channels].filter(([name]) => !before.channels.has(name))
+    for (const [name] of plugins) if (this.plugins.has(name)) throw new PluginConflictError(name, name)
+    for (const [name] of tools) { const existing = this.tools.get(name); if (existing) throw new PluginConflictError('tool:' + name, existing.owner) }
+    for (const [name] of providers) { const existing = this.providers.get(name); if (existing) throw new PluginConflictError('provider:' + name, existing.owner) }
+    for (const [name] of channels) { const existing = this.channels.get(name); if (existing) throw new PluginConflictError('channel:' + name, existing.owner) }
+    for (const [name, plugin] of plugins) this.plugins.set(name, plugin)
+    for (const [name, entry] of tools) this.tools.set(name, entry)
+    for (const [name, entry] of providers) this.providers.set(name, entry)
+    for (const [name, entry] of channels) this.channels.set(name, entry)
+    for (const [name, entries] of stage.hooks) {
+      const added = entries.slice(before.hooks.get(name) ?? 0)
+      if (added.length) this.hooks.set(name, [...(this.hooks.get(name) ?? []), ...added])
     }
-    for (const [name, entry] of [...this.tools]) {
-      if (snapshot.tools.has(name)) continue
-      this.tools.delete(name)
-      this.plugins.get(entry.owner)?.tools.delete(name)
-    }
-    for (const [name, entry] of [...this.providers]) {
-      if (snapshot.providers.has(name)) continue
-      this.providers.delete(name)
-      const plugin = this.plugins.get(entry.owner)
-      if (plugin?.provider === entry.value) plugin.provider = undefined
-    }
-    for (const [name, entry] of [...this.channels]) {
-      if (snapshot.channels.has(name)) continue
-      this.channels.delete(name)
-      this.plugins.get(entry.owner)?.channels.delete(name)
-    }
-    for (const [name, entries] of [...this.hooks]) {
-      const retained = snapshot.hooks.get(name) ?? 0
-      const removed = entries.splice(retained)
-      if (!entries.length) this.hooks.delete(name)
-      for (const entry of removed) this.plugins.get(entry.owner)?.hooks.delete(name)
-    }
+    return plugins.map(([name]) => name)
   }
 
   private resolveOwner(meta: PluginMeta | undefined, explicitOwner: string | undefined): string {

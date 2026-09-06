@@ -50,6 +50,7 @@ export type MonitorSource =
   | { readonly kind: 'terminal'; readonly terminalId: string }
   | { readonly kind: 'file'; readonly path: string; readonly workspace: string }
   | { readonly kind: 'websocket'; readonly url: string }
+  | { readonly kind: 'webhook'; readonly name: string }
 export interface RunStart {
   readonly ownerSessionId: string
   readonly workspace: string
@@ -81,6 +82,8 @@ function validateMonitorConfiguration(configuration: MonitorConfiguration): void
       if (!validMonitorSourceText(configuration.source.path) || !validMonitorSourceText(configuration.source.workspace) || configuration.trigger !== 'change') throw new Error('Invalid file monitor source')
     } else if (configuration.source.kind === 'websocket') {
       if (!validWebsocketUrl(configuration.source.url) || configuration.trigger !== 'output') throw new Error('Invalid websocket monitor source')
+    } else if (configuration.source.kind === 'webhook') {
+      if (!validWebhookName(configuration.source.name) || configuration.trigger !== 'output') throw new Error('Invalid webhook monitor source')
     } else throw new Error('Invalid monitor source')
   } else if (configuration.trigger === 'change') throw new Error('File change monitors require a source')
 }
@@ -95,7 +98,12 @@ function parseMonitorSource(value: unknown): MonitorSource {
   if (source.kind === 'terminal' && validMonitorSourceText(source.terminalId)) return { kind: 'terminal', terminalId: source.terminalId }
   if (source.kind === 'file' && validMonitorSourceText(source.path) && validMonitorSourceText(source.workspace)) return { kind: 'file', path: source.path, workspace: source.workspace }
   if (source.kind === 'websocket' && validWebsocketUrl(source.url)) return { kind: 'websocket', url: source.url }
+  if (source.kind === 'webhook' && validWebhookName(source.name)) return { kind: 'webhook', name: source.name }
   throw new Error('invalid source')
+}
+
+function validWebhookName(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(value)
 }
 
 function validWebsocketUrl(value: unknown): value is string {

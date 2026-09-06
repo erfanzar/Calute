@@ -3235,3 +3235,98 @@ and `git diff --check` passed; 3,636 runtime tests passed, 3 skipped, and 1,240 
 tests passed. Build `26455ab11693b37f`. Logs:
 `/tmp/xerxes-image-checkpoint-{check,test,build}.log`. No live-provider or native
 interactive visual acceptance was performed in this checkpoint.
+
+## Authenticated webhook monitors (2026-09-06)
+
+Named webhook monitoring is wired through production daemon startup/shutdown,
+`runtime.monitor_webhooks` host configuration, environment-resolved secrets,
+`monitor.sources` discovery, `monitor.create`, model tools `list_monitor_sources`
+and `monitor_webhook`, Runs history and `/monitors` creation/inspection. No HTTP
+listener starts without explicit configuration. Source names, not secrets, are
+exposed to clients. Existing matching, expiry, ownership, event retention and
+reaction budgets are reused. Source data is explicitly untrusted evidence in
+reaction prompts. Stop detaches; shutdown interrupts; restart does not invent
+recovered deliveries.
+
+The generic receiver authenticates timestamp/delivery-ID/raw-body HMAC-SHA256,
+checks timestamp freshness before and after reading, caps bodies at 64 KiB,
+concurrent reads at 32 and body duration at five seconds. Replay IDs are retained
+for the signing window with a bounded 4096-entry cache per source; capacity
+refuses new admission instead of forgetting valid IDs. Secrets remain in host
+memory/environment. Cache persistence across process restart, native third-party
+signature protocols, public hosting and external exactly-once effects are not
+claimed. The configuration guide documents the sender contract and limitations.
+
+Luna agents implemented source, domain/persistence and TUI work in parallel.
+Root integrated configuration, CLI lifecycle, RPC, model registration, docs and
+real signed HTTP-to-daemon event tests; review corrected streaming-reader timer
+and abort cleanup, partial-body timeout admission, callback failure visibility,
+removed-watcher delivery, constructor bounds and initial cancellation behavior.
+Tests include 4096 admitted IDs with overflow/replay rejection, 32 stalled readers
+and shutdown cancellation, a real body deadline, concurrent duplicates, unsigned
+rejection, source isolation, cross-session denial, interrupted persistence,
+secret-free discovery and wide/narrow TUI form behavior/error preservation.
+
+Final root check/test/build, docs:build and diff checks passed on the worktree:
+3,654 runtime tests passed, 3 skipped; 1,244 UI tests passed. Build
+`dd4c61ccbaa49f44`. Logs `/tmp/xerxes-webhook-final-{check,test,build}.log` and
+`/tmp/xerxes-webhook-docs.log`. Native interactive and live-provider acceptance
+were not performed. This slice is local/uncommitted after checkpoint 9a57ab12.
+
+Remaining production-readiness work includes broader feed/PR/CI integrations,
+transactional plugin lifecycle, authenticated remote continuation, native
+terminal/live-provider acceptance and the full requirement-by-requirement audit.
+The overall goal remains incomplete.
+
+## Plugin registration isolation and production-wiring audit (2026-09-06)
+
+Async native plugin discovery previously registered into the live indexes before
+`register()` settled. Partial tools/hooks/providers/channels were observable, and
+rollback based on old keys could delete unrelated host registrations made during
+the await. Discovery now gives each module an isolated registration view, checks
+live name conflicts again at commit, and publishes all added indexes without an
+await. Failure discards only that view. Retained readers forward to the committed
+live registry; late mutations are rejected. Staging copies are released after
+settlement so retained plugin closures do not retain every preceding registry
+snapshot. Module side effects outside capability registration are not rolled back.
+
+Focused regression tests cover pending visibility, concurrent host changes on
+failure, commit-time conflicts, late mutations, provider/channel/hook publication,
+reader freshness and duplicate discovery. Existing extension hardening and native
+provider tests remain applicable.
+
+A fresh production-wiring audit found a larger gap than a settings toggle:
+`runtime/features.ts` composes PluginRegistry discovery/hooks for embedding hosts,
+but normal CLI startup does not invoke that composition or provide a native
+plugin registry to the daemon. `/plugins` correctly reports an unconfigured host.
+Plugin providers have a client-factory port but production client creation does
+not supply it; PluginTool has no schema/capability definition for the production
+tool executor; plugin channel objects have no validated adapter lifecycle there.
+Slash plugins are a separate registry. Thus module registration tests do not prove
+production plugin execution or installation.
+
+Remaining plugin work must include one host-owned registry generation shared by
+inventory and execution, explicit persisted trust/enablement, typed tool/channel
+contracts with existing permission and cancellation boundaries, all provider
+creation paths, actual turn-hook composition, dependency-checked generation
+replacement, persisted install/update recovery, and daemon/TUI management with
+real CLI integration tests. This registration repair is a prerequisite, not a
+claim that the plugin lifecycle requirement is complete.
+
+### Daemon startup and shutdown repair
+
+Reproduced a failed Unix socket bind followed by `stop()` replacing the original
+startup error with `ERR_SERVER_NOT_RUNNING`. Socket binding now participates in
+startup cleanup. Shutdown shares one completion promise, tolerates an unbound
+listener, and attempts the remaining resource cleanup after a component fails.
+The CLI retains the original startup exception while reporting cleanup failures.
+Regression cases cover failed binding, concurrent/repeated shutdown, and a later
+startup failure combined with failing cleanup; the latter also checks socket
+removal and runtime shutdown.
+
+Verification for this worktree: root `bun run check`, `bun run test`, and
+`bun run build` passed, with 3,660 runtime tests passing (3 skipped) and 1,244 UI
+tests passing. The rebuilt `dist/cli.js` accepted an isolated socket connection
+and exited cleanly on SIGTERM; an overlong socket path retained its original
+bind error without `ERR_SERVER_NOT_RUNNING`. Logs are under
+`/tmp/xerxes-startup-{check,test,build}.log`.

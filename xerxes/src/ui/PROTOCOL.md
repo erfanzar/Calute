@@ -1310,3 +1310,20 @@ and the last observed `revision`. It atomically saves and increments the revisio
 stale revisions fail. Empty notes retain a revision tombstone. Notes are global
 user preferences shared across sessions, editable through `/config` F6, and read
 by the model inventory host. They never modify provider credentials or quotas.
+
+### Authenticated webhook monitor extension
+
+`monitor.sources` resolves the current authenticated session owner and returns
+`{ok:true,webhooks:[{name}]}`. Names refer only to explicitly host-configured
+sources; secrets and environment values are never returned. An unconfigured host
+returns an empty list. `monitor.create` additionally accepts
+`source_kind:"webhook"`, `webhook_name`, `trigger:"output"`, `match` and the existing
+expiry/reaction settings. Other source selectors (`terminal_id`, `file_path`,
+`websocket_url`) are rejected for webhook creation. Summary `source` is
+`{kind:"webhook",name}` and `terminalId` is empty. Existing owner scoping,
+inspection, policy editing, event retention and stopping semantics are preserved.
+
+The daemon's explicit monitor HTTP host receives signed UTF-8 deliveries as
+documented in the configuration guide. Delivery data is untrusted evidence, not
+new authorization. Shutdown interrupts the watch and closes its subscription;
+restart requires a new watch and does not claim recovery of missed deliveries.

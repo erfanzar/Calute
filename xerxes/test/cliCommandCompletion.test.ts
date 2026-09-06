@@ -21,7 +21,7 @@ test('normal daemon wakes the owner after exec_command completion without a sepa
     const lastUser = body.messages?.findLast(message => message.role === 'user')
     const prompt = typeof lastUser?.content === 'string' ? lastUser.content : JSON.stringify(lastUser?.content)
     let chunk
-    if (prompt?.includes('A terminal watch produced new evidence')) {
+    if (prompt?.includes('A monitor produced new evidence')) {
       reactions++; evidence = prompt
       chunk = { choices: [{ delta: { content: 'Background command completed.' }, finish_reason: 'stop' }] }
     } else if (!spawned) {
@@ -68,7 +68,7 @@ test('normal daemon wakes the owner after exec_command completion without a sepa
     await bounded(completion)
     expect(reactions).toBe(1)
     expect(evidence).toContain('completion-proof')
-    expect(evidence).toContain('untrusted process output')
+    expect(evidence).toContain('untrusted source data')
     const inspected = await rpc('context.inspect', { section: 'instructions' })
     expect(inspected.result?.entries).toEqual(expect.arrayContaining([expect.objectContaining({ title: 'bootstrap' })]))
     await rpc('shutdown')

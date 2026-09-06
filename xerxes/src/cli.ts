@@ -103,6 +103,7 @@ import { inheritedSelectionValidator, profileInventoryHost, profileSelectionVali
 import { addModelInventoryToBuiltinAgents, type ModelInventoryHost } from './tools/modelInventoryTools.js';
 import { registerMonitorTools } from "./tools/monitorTools.js";
 import { nativeFileMonitorSource } from "./runtime/fileMonitorSource.js";
+import { daemonMonitorWebhookHub } from "./daemon/monitorWebhooks.js";
 import { nativeWebSocketMonitorSource } from "./runtime/websocketMonitorSource.js";
 import { addMcpToolsToBuiltinAgents, registerMcpTools } from "./tools/mcpTools.js";
 import { MCPManager } from "./mcp/manager.js";
@@ -1020,6 +1021,7 @@ async function runDaemon(
   const goalTokenLedger = new GoalTokenLedger(join(xerxesHome(), 'runs', 'goal-tokens.sqlite'));
   const goalTokenOwner = crypto.randomUUID();
   const reactionMailbox = new ReactionMailbox(join(xerxesHome(), "runs", "reactions.sqlite"));
+  const monitorWebhookHub = daemonMonitorWebhookHub(config, process.env);
   const terminals = new TerminalRegistry({ runHistory });
   let announceMonitorEvent: ConstructorParameters<typeof TerminalMonitors>[2];
   const monitors = new TerminalMonitors(terminals, runHistory, (monitor, event) => announceMonitorEvent?.(monitor, event), undefined, reactionMailbox, {
@@ -1036,7 +1038,14 @@ async function runDaemon(
       if (!session) throw new Error('WebSocket monitor owner session is unavailable');
       return session.cwd;
     },
-  });
+  }, monitorWebhookHub ? {
+    source: monitorWebhookHub,
+    resolveWorkspace: owner => {
+      const session = runtime.listSessions().find(candidate => candidate.id === owner);
+      if (!session) throw new Error('Webhook monitor owner session is unavailable');
+      return session.cwd;
+    },
+  } : undefined);
   const buildId = await daemonBuildIdForEntry(
     import.meta.dir,
     fileURLToPath(import.meta.url),
@@ -1105,6 +1114,7 @@ async function runDaemon(
     goalTokenLedger,
     goalTokenOwner,
     monitors,
+    ...(monitorWebhookHub ? { monitorWebhookServer: monitorWebhookHub } : {}),
     profileStore,
     autoDiscoverModelCapabilities: true,
     skillRegistry,
@@ -1132,9 +1142,18 @@ async function runDaemon(
     await channelManager.startConfigured();
   } catch (error) {
     stopping = true;
-    await channelManager.stopAll();
-    await daemon.stop();
-    await mcpManager.disconnectAll();
+    // Cleanup must not replace the startup error or skip the remaining owners.
+    for (const cleanup of [
+      () => channelManager.stopAll(),
+      () => daemon.stop(),
+      () => mcpManager.disconnectAll(),
+      () => reactionMailbox.close(),
+      () => runHistory.close(),
+      () => goalTokenLedger.close(),
+    ]) {
+      try { await cleanup(); }
+      catch (cleanupError) { console.error("Daemon startup cleanup failed:", cleanupError); }
+    }
     throw error;
   }
   console.error("Xerxes Bun daemon listening on " + socketPath);

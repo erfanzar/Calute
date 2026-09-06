@@ -32,7 +32,14 @@ export function registerMonitorTools(registry: ToolRegistry, monitors: TerminalM
       react: { type: 'boolean', default: false }, max_reactions: { type: 'integer', minimum: 1, maximum: 10, default: 3 },
       reaction_timeout_seconds: { type: 'integer', minimum: 1, maximum: 120, default: 60 }, max_total_tokens: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
     }, required: ['websocket_url', 'match'] } } },
-    { type: 'function', function: { name: 'list_monitors', description: 'Inspect this session’s terminal, file and WebSocket watches and retained events. Do not poll this in a loop: monitors react to source events automatically.', parameters: { type: 'object', additionalProperties: false, properties: {} } } },
+    { type: 'function', function: { name: 'list_monitor_sources', description: 'List named webhook sources configured by this host. Returns names only, never authentication secrets. Use a configured name with monitor_webhook.', parameters: { type: 'object', additionalProperties: false, properties: {} } } },
+    { type: 'function', function: { name: 'monitor_webhook', description: 'Watch a named, host-configured authenticated webhook source for a case-insensitive literal match. Call list_monitor_sources first to discover names. Only signed deliveries are accepted; matching events are recorded without polling the model. Deliveries while detached or offline are not recovered. Secrets are configured through host environment variables, never tool arguments. Set react=true only for user-requested automatic investigation; notification-only is the default.', parameters: { type: 'object', additionalProperties: false, properties: {
+      webhook_name: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,64}$' }, match: { type: 'string', minLength: 1, maxLength: 1024 },
+      duration_seconds: { type: 'integer', minimum: 1, maximum: 86400, default: 3600 }, max_events: { type: 'integer', minimum: 1, maximum: 1000, default: 50 },
+      react: { type: 'boolean', default: false }, max_reactions: { type: 'integer', minimum: 1, maximum: 10, default: 3 },
+      reaction_timeout_seconds: { type: 'integer', minimum: 1, maximum: 120, default: 60 }, max_total_tokens: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+    }, required: ['webhook_name', 'match'] } } },
+    { type: 'function', function: { name: 'list_monitors', description: 'Inspect this session’s terminal, file, WebSocket and webhook watches and retained events. Do not poll this in a loop: monitors react to source events automatically.', parameters: { type: 'object', additionalProperties: false, properties: {} } } },
     { type: 'function', function: { name: 'stop_monitor', description: 'Stop one watch owned by this session without stopping its source process.', parameters: { type: 'object', additionalProperties: false, properties: { monitor_id: { type: 'string' } }, required: ['monitor_id'] } } },
   ]
   for (const definition of definitions) registry.register(definition, async (args, context) => {
@@ -42,6 +49,10 @@ export function registerMonitorTools(registry: ToolRegistry, monitors: TerminalM
     const trigger = (optionalString(args, 'trigger') ?? 'output')
     if (trigger !== 'output' && trigger !== 'completion') throw new Error('Invalid monitor trigger')
     switch (definition.function.name) {
+      case 'list_monitor_sources': return JSON.stringify({ webhooks: monitors.webhookSources(session) })
+      case 'monitor_webhook': return JSON.stringify(await monitors.startWebhook(session, { name: requiredString(args, 'webhook_name'), match: requiredString(args, 'match'),
+        durationMs: optionalInteger(args, 'duration_seconds', 3600) * 1000, maxEvents: optionalInteger(args, 'max_events', 50),
+        ...(args.react === true ? { reaction: { ...(args.max_total_tokens === undefined ? {} : { maxTotalTokens: optionalInteger(args, 'max_total_tokens', 1) }), maxReactions: optionalInteger(args, 'max_reactions', 3), maxDurationMs: optionalInteger(args, 'reaction_timeout_seconds', 60) * 1000 } } : {}) }))
       case 'list_monitors': return JSON.stringify(monitors.list(session))
       case 'stop_monitor': return JSON.stringify(monitors.stop(session, requiredString(args, 'monitor_id')))
       case 'monitor_websocket': return JSON.stringify(await monitors.startWebSocket(session, { url: requiredString(args, 'websocket_url'), match: requiredString(args, 'match'),
@@ -54,5 +65,5 @@ export function registerMonitorTools(registry: ToolRegistry, monitors: TerminalM
         durationMs: optionalInteger(args, 'duration_seconds', 3600) * 1000, maxEvents: optionalInteger(args, 'max_events', 50),
         ...(args.react === true ? { reaction: { ...(args.max_total_tokens === undefined ? {} : { maxTotalTokens: optionalInteger(args, 'max_total_tokens', 1) }), maxReactions: optionalInteger(args, 'max_reactions', 3), maxDurationMs: optionalInteger(args, 'reaction_timeout_seconds', 60) * 1000 } } : {}) }))
     }
-  }, 'default', { concurrencySafe: true, destructive: false, openWorld: definition.function.name === 'monitor_websocket', readOnly: definition.function.name === 'list_monitors', maxResultBytes: 64_000 })
+  }, 'default', { concurrencySafe: true, destructive: false, openWorld: ['monitor_websocket', 'monitor_webhook'].includes(definition.function.name), readOnly: ['list_monitors', 'list_monitor_sources'].includes(definition.function.name), maxResultBytes: 64_000 })
 }

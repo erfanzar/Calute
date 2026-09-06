@@ -1581,3 +1581,54 @@ for the next turn, because live steering currently supports text only. The queue
 shows an image count and the UI explains the delay. Press Enter on an empty
 composer to interrupt and send the queued message. A later paste stays with the
 new draft; it is not consumed by an older queued message.
+
+### Authenticated webhook monitors
+
+Configure a named source in `~/.xerxes/daemon/config.json` (or the active
+`XERXES_HOME`), then restart its owning daemon. No listener is created by default.
+Secrets come from environment variables available to that daemon, with at least
+32 bytes per secret; they are never returned to the model or written into monitor
+history. The endpoint names are shared by sessions on that host.
+
+```json
+{
+  "runtime": {
+    "monitor_webhooks": {
+      "host": "127.0.0.1",
+      "port": 11998,
+      "sources": [{ "name": "build", "secret_env": "BUILD_WEBHOOK_SECRET" }]
+    }
+  }
+}
+```
+
+Open `/monitors`, create a watch, choose **Configured webhook**, select its name,
+and enter a literal match. The model can call `list_monitor_sources` and then
+`monitor_webhook`. Notification-only is the default; automatic investigation
+requires a direct user request and shares existing reaction budgets. Multiple
+sessions can subscribe to the same source; their watches and controls remain
+session-owned. Port conflicts fail startup visibly rather than silently disabling
+the receiver. When running multiple project daemons, configure a distinct port
+for each receiving daemon.
+
+Send `POST /monitors/build` with UTF-8 text (JSON is also treated as text) and:
+
+- `x-xerxes-timestamp`: Unix seconds.
+- `x-xerxes-delivery-id`: unique sender ID, 1–128 letters, digits, underscores or hyphens.
+- `x-xerxes-signature`: `sha256=` followed by hex HMAC-SHA256, using the configured
+  secret over `timestamp + "." + delivery_id + "." + raw_body_bytes`.
+
+Timestamps must be within five minutes of the receiver clock. Bodies are limited
+to 64 KiB, body reads to five seconds, and concurrent body reads to 32. Compressed
+bodies are unsupported. The receiver records an admitted delivery ID before
+notifying watchers. Duplicate deliveries return 200 without redelivery; new ones
+return 202. A full replay cache returns 429 instead of evicting a still-valid ID.
+The cache is process-local and bounded to 4096 IDs per source. After restart,
+old watches are interrupted; creating a new watch does not recover missed events.
+This is not an exactly-once external-action guarantee.
+
+A source without a live watcher returns 410. Authentication failures, invalid
+bodies and oversized requests are rejected. Keep the default loopback bind or
+explicitly configure a TLS reverse proxy for a remote sender; Xerxes does not
+create a public tunnel. Native GitHub/Stripe/etc. signature formats are not
+accepted by this generic protocol—use a sender that implements the contract.
