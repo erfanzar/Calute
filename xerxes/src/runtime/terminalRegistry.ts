@@ -17,10 +17,14 @@
 // therefore keeps its own tail mirror, written to as output flows past and
 // never drained by anyone.
 
+import { terminalOutputPage, type TerminalOutputCursor, type TerminalOutputPage } from './terminalOutput.js'
+import type { RunHistory, RunRecord } from './runHistory.js'
+
 /** Where a terminal entry came from. */
 export type TerminalKind = 'background' | 'foreground' | 'pty'
 
 export type TerminalSignal = 'SIGKILL' | 'SIGTERM'
+export interface TerminalObservation { readonly text: string; readonly closed: boolean; readonly exitCode: number | null }
 
 /**
  * Optional control surface published by whoever owns the process.
@@ -92,6 +96,9 @@ export interface TerminalInspection extends TerminalSummary {
 }
 
 export interface TerminalRegistryOptions {
+  readonly runHistory?: RunHistory
+  readonly onRunComplete?: (run: RunRecord) => void
+  readonly onPersistenceError?: (error: unknown) => void
   /** Closed entries retained for inspection before the oldest is forgotten. */
   readonly historyLimit?: number
   /** Characters mirrored per terminal. */
@@ -105,6 +112,8 @@ const DEFAULT_MIRROR_CAPACITY = 200_000
 const DEFAULT_INSPECT_CHARS = 20_000
 
 interface TerminalEntry {
+  readonly streamId: string
+  readonly observers: Set<(event: TerminalObservation) => void>
   readonly command: string
   readonly control: TerminalControl
   readonly cwd: string
@@ -133,11 +142,17 @@ export class TerminalRegistry {
   private readonly historyLimit: number
   private readonly mirrorCapacity: number
   private readonly now: () => number
+  private readonly runHistory: RunHistory | undefined
+  private readonly onRunComplete: ((run: RunRecord) => void) | undefined
+  private readonly onPersistenceError: (error: unknown) => void
 
   constructor(options: TerminalRegistryOptions = {}) {
     this.historyLimit = positiveInteger(options.historyLimit ?? DEFAULT_HISTORY_LIMIT, 'historyLimit')
     this.mirrorCapacity = positiveInteger(options.mirrorCapacity ?? DEFAULT_MIRROR_CAPACITY, 'mirrorCapacity')
     this.now = options.now ?? (() => Date.now())
+    this.runHistory = options.runHistory
+    this.onRunComplete = options.onRunComplete
+    this.onPersistenceError = options.onPersistenceError ?? (error => console.error('Terminal run history failed:', error))
   }
 
   /**
@@ -152,7 +167,10 @@ export class TerminalRegistry {
     if (!id) throw new TypeError('terminal id must be a non-empty string')
     const ownerSessionId = options.ownerSessionId.trim()
     if (!ownerSessionId) throw new TypeError('terminal ownerSessionId must be a non-empty string')
+    const run = this.runHistory?.start({ ownerSessionId, workspace: options.cwd, kind: 'terminal', sourceId: id, title: options.command, terminalKind: options.kind })
     const entry: TerminalEntry = {
+      streamId: run?.id ?? crypto.randomUUID(),
+      observers: new Set(),
       id,
       kind: options.kind,
       command: options.command,
@@ -170,16 +188,56 @@ export class TerminalRegistry {
     this.entries.delete(id)
     this.entries.set(id, entry)
     this.trim()
+    if (run) {
+      try { this.runHistory?.checkpointTerminalOutput(ownerSessionId, run.id, '', 0) }
+      catch (error) { this.onPersistenceError(error) }
+    }
+    let checkpoint: ReturnType<typeof setTimeout> | undefined
+    const persist = (): void => {
+      checkpoint = undefined
+      if (!run || !entry.running) return
+      const tail = entry.mirror.tail(this.mirrorCapacity)
+      try { this.runHistory?.checkpointTerminalOutput(ownerSessionId, run.id, tail.text, entry.mirror.observed) }
+      catch (error) { this.onPersistenceError(error) }
+    }
     return {
       id,
       append: text => {
-        if (text) entry.mirror.append(text)
+        if (text) {
+          entry.mirror.append(text)
+          this.observe(entry, { text, closed: false, exitCode: null })
+          // Batch disk snapshots; neither UI inspection nor persistence drains
+          // the process manager's independent model-facing output buffers.
+          if (run && entry.running && checkpoint === undefined) {
+            checkpoint = setTimeout(persist, 250)
+            checkpoint.unref?.()
+          }
+        }
       },
       close: exitCode => {
         if (!entry.running) return
         entry.running = false
         entry.exitCode = normalizedExit(exitCode)
         entry.endedAt = this.now()
+        this.observe(entry, { text: '', closed: true, exitCode: entry.exitCode })
+        entry.observers.clear()
+        if (checkpoint !== undefined) clearTimeout(checkpoint)
+        checkpoint = undefined
+        if (run) {
+          const tail = entry.mirror.tail(this.mirrorCapacity)
+          try {
+            this.runHistory?.checkpointTerminalOutput(ownerSessionId, run.id, tail.text, entry.mirror.observed)
+            const completed = this.runHistory?.finish(ownerSessionId, run.id,
+              entry.exitCode === 0 ? 'succeeded' : entry.exitCode === null ? 'interrupted' : 'failed', {
+                output: tail.text,
+                exitCode: entry.exitCode,
+                outputTruncated: tail.truncated || entry.mirror.dropped,
+                ...(entry.exitCode === 0 ? {} : { error: entry.exitCode === null ? 'Process ended without an exit code' : `Process exited with code ${entry.exitCode}` }),
+                notify: options.kind !== 'foreground' || entry.exitCode !== 0,
+              })
+            if (completed) this.onRunComplete?.(completed)
+          } catch (error) { this.onPersistenceError(error) }
+        }
         this.trim()
       },
     }
@@ -202,21 +260,65 @@ export class TerminalRegistry {
 
   /** Every tracked terminal owned by one session, oldest first. */
   list(ownerSessionId: string): TerminalSummary[] {
-    return [...this.entries.values()]
+    const live = [...this.entries.values()]
       .filter(entry => entry.ownerSessionId === ownerSessionId)
       .map(entry => summarize(entry))
+    const sources = new Set(live.map(entry => entry.id))
+    const archived = this.runHistory?.list(ownerSessionId).filter(run => run.kind === 'terminal' && !sources.has(run.sourceId)) ?? []
+    return [...archived.map(archivedTerminal), ...live]
+  }
+
+  /** Observe future output without consuming the model's or inspector's buffer. */
+  subscribe(ownerSessionId: string, id: string, observer: (event: TerminalObservation) => void): () => void {
+    const entry = this.entries.get(id)
+    if (!entry || entry.ownerSessionId !== ownerSessionId) throw new Error('Unknown terminal')
+    if (!entry.running) throw new Error('Terminal already exited')
+    entry.observers.add(observer)
+    return () => { entry.observers.delete(observer) }
+  }
+
+  private observe(entry: TerminalEntry, event: TerminalObservation): void {
+    for (const observer of entry.observers) {
+      try { observer(event) }
+      catch (error) { console.error('Terminal observer failed:', error) }
+    }
   }
 
   /** One terminal with the retained tail of its output, only for its owner. */
   inspect(ownerSessionId: string, id: string, maxChars: number = DEFAULT_INSPECT_CHARS): TerminalInspection | undefined {
     const entry = this.entries.get(id)
-    if (entry === undefined || entry.ownerSessionId !== ownerSessionId) return undefined
+    if (entry === undefined) {
+      const run = id.startsWith('run:') ? this.runHistory?.inspect(ownerSessionId, id.slice(4)) : undefined
+      if (!run || run.kind !== 'terminal') return undefined
+      const limit = positiveInteger(maxChars, 'maxChars')
+      return { ...archivedTerminal(run), output: run.output.slice(-limit), outputTruncated: run.outputTruncated || run.output.length > limit }
+    }
+    if (entry.ownerSessionId !== ownerSessionId) return undefined
     const tail = entry.mirror.tail(positiveInteger(maxChars, 'maxChars'))
     return Object.freeze({
       ...summarize(entry),
       output: tail.text,
       outputTruncated: tail.truncated || entry.mirror.dropped,
     })
+  }
+
+  /** Independent, non-consuming readers can reconnect with their own cursor. */
+  readOutput(ownerSessionId: string, id: string, cursor?: TerminalOutputCursor, limit?: number): TerminalOutputPage {
+    const entry = this.entries.get(id)
+    if (entry) {
+      if (entry.ownerSessionId !== ownerSessionId) throw new Error('Unknown terminal')
+      const tail = entry.mirror.tail(this.mirrorCapacity).text
+      const page = terminalOutputPage(entry.streamId, tail, entry.mirror.observed, entry.running, cursor, limit)
+      if (this.runHistory) {
+        // Returning a cursor acknowledges observation. Commit its offset before
+        // replying, rather than relying on the next periodic checkpoint.
+        if (entry.running) this.runHistory.checkpointTerminalOutput(ownerSessionId, entry.streamId, tail, entry.mirror.observed)
+        else this.runHistory.terminalOutput(ownerSessionId, entry.streamId, { streamId: entry.streamId, offset: entry.mirror.observed }, 1)
+      }
+      return page
+    }
+    if (!id.startsWith('run:') || !this.runHistory) throw new Error('Unknown terminal')
+    return this.runHistory.terminalOutput(ownerSessionId, id.slice(4), cursor, limit)
   }
 
   /** Write to a live interactive terminal. Rejects when it cannot be written to. */
@@ -276,6 +378,16 @@ export class TerminalRegistry {
       this.entries.delete(id)
       excess -= 1
     }
+  }
+}
+
+function archivedTerminal(run: RunRecord): TerminalSummary {
+  return {
+    id: `run:${run.id}`, kind: run.terminalKind ?? 'background', command: run.title, label: run.title,
+    cwd: run.workspace, startedAt: run.startedAt,
+    ...(run.endedAt === null ? {} : { endedAt: run.endedAt }),
+    running: run.state === 'running', exitCode: run.exitCode,
+    outputChars: run.output.length, canInterrupt: false, canKill: false, canWrite: false,
   }
 }
 

@@ -366,3 +366,67 @@ export function register(registry) {
     expect(registry.pluginNames).toEqual(['alpha-plugin', 'midway-plugin', 'zeta-plugin'])
   })
 })
+
+test('failed plugin registration cannot unregister previously working capabilities', async () => {
+  await inTemporaryDirectory(async directory => {
+    const registry = new PluginRegistry()
+    const tool = () => 'working'
+    const hook = () => {}
+    registry.registerPlugin({ name: 'working' })
+    registry.registerTool('working-tool', tool, undefined, 'working')
+    registry.registerHook('before_turn', hook, undefined, 'working')
+    await writeFile(join(directory, 'broken.mjs'), `
+export function register(registry) {
+  registry.registerPlugin({ name: 'broken' })
+  registry.registerTool('partial-tool', () => 'partial', undefined, 'broken')
+  registry.unregisterPlugin('working')
+  throw new Error('failed after removal')
+}`)
+    const errors = spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      expect(await registry.discover(directory)).toEqual([])
+    } finally { errors.mockRestore() }
+    expect(registry.getTool('working-tool')).toBe(tool)
+    expect(registry.getHooks('before_turn')).toEqual([hook])
+    expect(registry.getTool('partial-tool')).toBeUndefined()
+    expect(registry.pluginNames).toEqual(['working'])
+    expect(registry.loadErrors[0]).toContain("cannot unregister existing plugin 'working'")
+    registry.unregisterPlugin('working')
+    expect(registry.getTool('working-tool')).toBeUndefined()
+  })
+})
+
+test('plugin registration may clean up its own temporary registration', async () => {
+  await inTemporaryDirectory(async directory => {
+    await writeFile(join(directory, 'own.mjs'), `
+export function register(registry) {
+  registry.registerPlugin({ name: 'temporary' })
+  registry.registerTool('temporary-tool', () => null, undefined, 'temporary')
+  registry.unregisterPlugin('temporary')
+  registry.registerPlugin({ name: 'final' })
+}`)
+    const registry = new PluginRegistry()
+    expect(await registry.discover(directory)).toEqual(['final'])
+    expect(registry.getTool('temporary-tool')).toBeUndefined()
+    expect(registry.loadErrors).toEqual([])
+  })
+})
+
+test('plugin inventory identifies module and host provenance without executing tools', async () => {
+  await inTemporaryDirectory(async directory => {
+    const path = join(directory, 'source.mjs')
+    await writeFile(path, `export function register(registry) {
+      registry.registerPlugin({ name: 'module-fixture', version: '1.2.3' })
+      registry.registerTool('module-tool', () => { throw new Error('must not execute') }, undefined, 'module-fixture')
+    }`)
+    const registry = new PluginRegistry()
+    registry.registerPlugin({ name: 'host-fixture' })
+    await registry.discover(directory)
+    expect(registry.inventory()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'module-fixture', version: '1.2.3', source: { kind: 'module', path }, tools: ['module-tool'] }),
+      expect.objectContaining({ name: 'host-fixture', source: { kind: 'host-registration' } }),
+    ]))
+    registry.unregisterPlugin('module-fixture')
+    expect(registry.inventory().map(plugin => plugin.name)).toEqual(['host-fixture'])
+  })
+})

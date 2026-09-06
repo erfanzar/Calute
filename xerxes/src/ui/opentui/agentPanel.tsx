@@ -2,12 +2,14 @@
 // Licensed under the Apache License, Version 2.0.
 /** @jsxImportSource @opentui/react */
 
+import { useStore } from '@nanostores/react'
 import type { KeyEvent, ScrollBoxRenderable } from '@opentui/core'
 import { useKeyboard, useTerminalDimensions } from '@opentui/react'
 import { type MutableRefObject, memo, useEffect, useMemo, useRef, useState } from 'react'
 
 import { useOptionalGateway } from '../app/gatewayContext.js'
-import { adjustPanelWidth, PANEL_WIDTH_STEP, withPanelWidthDelta } from '../app/panelSizeStore.js'
+import { $panelWidthDelta, toggleAgentRail, adjustPanelWidth, PANEL_WIDTH_STEP, withPanelWidthDelta } from '../app/panelSizeStore.js'
+import { patchOverlayState } from '../app/overlayStore.js'
 import { useTurnSelector } from '../app/turnStore.js'
 
 import {
@@ -425,6 +427,8 @@ function AgentCardView({
         <Text color={t.ds.caption} wrap="truncate-end">
           {GLYPH.wrap} {record.creatorTitle} · {role}
           {model ? ` · ${model}` : ''}
+          {item.providerProfile ? ` · profile ${item.providerProfile}` : ''}
+          {item.reasoningEffort ? ` · effort ${item.reasoningEffort}` : ''}
           {record.childCount ? ` · ${record.childCount} child${record.childCount === 1 ? '' : 'ren'}` : ''}
           {record.archived && record.snapshotLabel ? ` · ${record.snapshotLabel}` : ''}
         </Text>
@@ -543,6 +547,9 @@ function AgentDetailView({
             {`${agentToolCount(item)} tools`}
           </Span>
         </Text>
+        {item.providerProfile || item.reasoningEffort ? <Text color={t.ds.meta} wrap="wrap">
+          {[item.providerProfile ? `profile ${item.providerProfile}` : '', item.reasoningEffort ? `effort ${item.reasoningEffort}` : ''].filter(Boolean).join(' · ')}
+        </Text> : null}
       </Box>
       <scrollbox ref={scrollRef} style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }} viewportCulling>
         <Box flexDirection="column" flexShrink={0}>
@@ -698,6 +705,8 @@ function AgentDetailView({
 
 function AgentPanelBody({
   compactHeader,
+  availableWidth,
+  detailScrollRef,
   history,
   liveAgents,
   now,
@@ -712,6 +721,8 @@ function AgentPanelBody({
   variant
 }: AgentPanelProps & {
   now?: number
+  availableWidth?: number
+  detailScrollRef?: MutableRefObject<ScrollBoxRenderable | null>
   onOpen?: (agentId: string) => void
   openRecord?: AgentPanelRecord | undefined
   scrollRef?: MutableRefObject<ScrollBoxRenderable | null>
@@ -725,7 +736,7 @@ function AgentPanelBody({
   const { width: terminalWidth } = useTerminalDimensions()
   const panelWidth = Math.max(
     24,
-    (variant === 'sidebar' ? agentSidebarWidth(terminalWidth) : overlayPanelWidth(terminalWidth, OVERLAY_PANEL_SPECS.agents)) - 6
+    (availableWidth ?? (variant === 'sidebar' ? agentSidebarWidth(terminalWidth) : overlayPanelWidth(terminalWidth, OVERLAY_PANEL_SPECS.agents))) - 6
   )
   // Density is measured against the PANEL, not the terminal: a 200-column
   // terminal showing a 40-column overlay must degrade the overlay, not decide
@@ -742,7 +753,7 @@ function AgentPanelBody({
   // The threshold matches the agent view's: the inspector needs ~40 columns
   // of its own, and taking those from a 100-column overlay leaves a list too
   // narrow to read the titles it exists to show.
-  const twoPane = variant === 'overlay' && terminalWidth >= 120
+  const twoPane = variant === 'overlay' && panelWidth >= 108
   const inspectorWidth = twoPane ? Math.max(34, Math.min(56, Math.floor(panelWidth * 0.42))) : 0
   const listWidth = twoPane ? Math.max(24, panelWidth - inspectorWidth - 1) : panelWidth
   // The inspector follows the SELECTION, so it is never empty and never
@@ -755,11 +766,11 @@ function AgentPanelBody({
     record => record.item.status === 'running' || record.item.status === 'queued'
   ).length
   const tick = now ?? Date.now()
-  const footer = openRecord
+  const footer = !records.length ? 'F6 / Esc close' : openRecord
     ? retryEnabled
       // Mockup 05 inspector foot: peek/cancel join retry. `space` stays
       // unadvertised until a transcript-peek surface exists for agents.
-      ? '↑↓ scroll · r retry · c cancel · Esc back to the list'
+      ? `↑↓ scroll · ${subagentRetryable(openRecord.item.status) ? 'r retry' : 'c cancel'} · Esc back to the list`
       : `↑↓ scroll · ${PAGE_KEY_HINT} · Esc back to the list`
     : variant === 'overlay'
       ? retryEnabled
@@ -811,9 +822,9 @@ function AgentPanelBody({
             <Span color={t.color.accent}>✦ </Span>
             {openRecord ? 'Agent' : 'Agent View'}
           </Text>
-          {openRecord || compactHeader ? null : (
+          {openRecord || compactHeader || !records.length ? null : (
             <Text color={t.color.muted} wrap="truncate-end">
-              {`  ${records.length} chat${records.length === 1 ? '' : 's'} · ${activeCount} working`}
+              {`  ${records.length} agent${records.length === 1 ? '' : 's'} · ${activeCount} working`}
             </Text>
           )}
         </Box>
@@ -834,7 +845,8 @@ function AgentPanelBody({
           now={tick}
           record={openRecord}
           {...(retryNotes?.get(openRecord.item.id) ? { retryNote: retryNotes.get(openRecord.item.id) } : {})}
-          scrollRef={scrollRef}
+          scrollRef={detailScrollRef}
+          paneWidth={panelWidth}
           t={t}
         />
       ) : records.length ? (
@@ -890,6 +902,7 @@ function AgentPanelBody({
             <AgentDetailView
               now={tick}
               paneWidth={inspectorWidth}
+              scrollRef={detailScrollRef}
               record={inspectRecord}
               {...(retryNotes?.get(inspectRecord.item.id) ? { retryNote: retryNotes.get(inspectRecord.item.id) } : {})}
               t={t}
@@ -899,12 +912,10 @@ function AgentPanelBody({
       ) : null}
       </Box>
       ) : (
-        // The panel keeps its full size when empty, so the placeholder
-        // centers inside it — a tiny box shrink-wrapped around two lines
-        // was the rejected look.
+        // The empty panel has a compact frame and only the close action.
         <Box alignItems="center" flexDirection="column" flexGrow={1} flexShrink={1} justifyContent="center" minHeight={0}>
-          <Text color={t.color.muted}>No agents yet</Text>
-          <Text color={t.color.muted} dimColor>
+          <Text bold color={t.ds.title}>No agents yet</Text>
+          <Text color={t.ds.secondary}>
             Delegated work appears here.
           </Text>
         </Box>
@@ -921,46 +932,96 @@ function AgentPanelBody({
           {footer}
         </Text>
       </box>
-      <TodoPanel t={t} />
+      {records.length ? <TodoPanel t={t} /> : null}
     </Box>
   )
 }
 
 /** The session's todo checklist, pinned to the bottom of the agent panel. */
 function TodoPanel({ t }: { t: Theme }) {
+  const compact = useTerminalDimensions().height < 32
   const todos = useTurnSelector(state => state.todos)
   if (!todos.length) return null
   const done = todos.filter(todo => todo.status === 'completed').length
   return (
-    <Box flexDirection="column" flexShrink={0} marginTop={1} paddingTop={1}>
-      <Text color={t.color.muted} wrap="truncate-end">
-        <Span color={t.color.accent}>{'◇ '}</Span>
-        {`${done}/${todos.length} todos`}
-      </Text>
-      {todos.slice(0, 6).map(todo => (
-        <Text color={todo.status === 'completed' ? t.color.muted : t.color.text} dimColor={todo.status === 'completed'} key={todo.id} wrap="truncate-end">
-          {todo.status === 'completed' ? '✓' : todo.status === 'in_progress' ? '◌' : '◇'} {todo.content}
-        </Text>
-      ))}
-      {todos.length > 6 ? (
-        <Text color={t.color.muted} dimColor>
-          {`… +${todos.length - 6} more`}
-        </Text>
-      ) : null}
+    <Box flexDirection="column" flexShrink={0} paddingY={compact ? 0 : 1} onClick={() => patchOverlayState({ goal: true })}>
+      <Text bold color={t.ds.title}>{done}/{todos.length} todos</Text>
+      {!compact ? <Text color={t.ds.secondary}>F10 · Open task plan →</Text> : null}
     </Box>
   )
 }
 
+/** Quiet rail; the full F6 inspector retains every archived record and action. */
 export function AgentPanel({
   onInspect,
   ...props
 }: Omit<AgentPanelProps, 'variant'> & {
-  /** Clicking a rail card opens the overlay straight into that agent. */
   onInspect?: (agentId: string) => void
 }) {
-  if (!collectAgentPanelRecords(props.liveAgents, props.history).length) return null
-
-  return <AgentPanelBody {...props} {...(onInspect ? { onOpen: onInspect } : {})} variant="sidebar" />
+  const records = collectAgentPanelRecords(props.liveAgents, props.history)
+  const [showCompleted, setShowCompleted] = useState(false)
+  const completed = records.filter((record) => agentGroup(record.item.status) === 'review')
+  const visible = records.filter((record) => showCompleted || agentGroup(record.item.status) !== 'review')
+  if (!records.length) return null
+  return (
+    <Box
+      flexDirection="column"
+      height="100%"
+      minHeight={0}
+      paddingLeft={2}
+      borderSides={['left']}
+      borderColor={props.t.ds.hairline}
+    >
+      <Box flexShrink={0} marginBottom={1} justifyContent="space-between">
+        <Text color={props.t.ds.caption}>
+          AGENTS · {records.filter((record) => agentGroup(record.item.status) === 'working').length} working
+        </Text>
+        <Box onClick={toggleAgentRail}>
+          <Text color={props.t.ds.meta}>hide</Text>
+        </Box>
+      </Box>
+      <scrollbox style={{ flexGrow: 1, minHeight: 0 }} viewportCulling>
+        <Box flexDirection="column">
+          {visible.map((record) => {
+            const { item } = record
+            const voice = agentCardVoice(item, props.t)
+            return (
+              <Box key={item.id} flexDirection="column" paddingY={1} paddingRight={1} borderSides={['bottom']} borderColor={props.t.ds.hairline} onClick={() => onInspect?.(item.id)}>
+                <Text color={props.t.ds.title} wrap="wrap">
+                  <Span color={voice.color}>{GLYPH.state + ' '}</Span>
+                  {record.title}
+                </Text>
+                <Text
+                  color={
+                    voice.group === 'failed'
+                      ? props.t.color.error
+                      : voice.group === 'input'
+                        ? props.t.color.warn
+                        : props.t.ds.meta
+                  }
+                  wrap="truncate-end"
+                >
+                  {TERMINAL_STATUSES.has(item.status) && item.summary?.trim() ? item.summary.trim() : item.status === 'queued' ? 'Queued · waiting to start' : item.status}
+                </Text>
+                <Text color={props.t.ds.meta} wrap="truncate-end">
+                  {String(item.toolCount) + ' tools · ' + cardBudget(item, Date.now())}
+                </Text>
+              </Box>
+            )
+          })}
+          {completed.length ? (
+            <Box onClick={() => setShowCompleted((value) => !value)}>
+              <Text color={props.t.ds.meta}>{(showCompleted ? '▾' : '▸') + ' Completed · ' + completed.length}</Text>
+            </Box>
+          ) : null}
+        </Box>
+      </scrollbox>
+      <Text color={props.t.ds.caption} wrap="wrap">
+        F6 inspect · Ctrl+F6 hide
+      </Text>
+      <TodoPanel t={props.t} />
+    </Box>
+  )
 }
 
 const consumeKey = (event: KeyEvent) => {
@@ -981,11 +1042,13 @@ export function AgentPanelHotkey({
   disabled,
   open,
   onToggle,
+  onToggleRail,
   resizeEnabled = false
 }: {
   disabled: boolean
   open: boolean
   onToggle: (open: boolean) => void
+  onToggleRail?: () => void
   /** Allow Shift+Cmd/Ctrl/Option+←/→ panel-width chords (sidebar or overlay visible). */
   resizeEnabled?: boolean
 }) {
@@ -996,7 +1059,8 @@ export function AgentPanelHotkey({
       return
     }
     if (disabled || !isAgentsToggleKey(event)) return
-    onToggle(!open)
+    if (event.ctrl && onToggleRail && !open) onToggleRail()
+    else onToggle(!open)
     consumeKey(event)
   })
 
@@ -1010,20 +1074,20 @@ export function AgentPanelOverlay({
   onClose,
   t
 }: AgentPanelOverlayProps) {
+  useStore($panelWidthDelta)
   const scrollRef = useRef<ScrollBoxRenderable | null>(null)
+  const detailScrollRef = useRef<ScrollBoxRenderable | null>(null)
   const { height, width } = useTerminalDimensions()
   const gateway = useOptionalGateway()
   const records = useMemo(() => collectAgentPanelRecords(liveAgents, history), [history, liveAgents])
-  // Shared with F7/F8 so the three overlays stop diverging. Mockup 04 sizes
-  // the agent view as a LARGE bounded panel — full height minus the standard
-  // gutter, diff-width — even when it is empty: the empty state centers
-  // inside the frame instead of collapsing the frame around itself.
   const { height: panelHeight, width: fittedWidth } = overlayPanelSize(
     { height, width },
-    OVERLAY_PANEL_SPECS.agents
+    records.length
+      ? { ...OVERLAY_PANEL_SPECS.agents, maxHeight: 48 }
+      : { maxWidth: 64, minWidth: 36, desiredHeight: 11, minHeight: 9 }
   )
   const page = Math.max(4, panelHeight - 8)
-  const panelWidth = withPanelWidthDelta(fittedWidth, width)
+  const panelWidth = records.length ? withPanelWidthDelta(fittedWidth, width) : fittedWidth
   const [selectedId, setSelectedId] = useState<null | string>(null)
   const [openId, setOpenId] = useState<null | string>(initialInspectId ?? null)
   const [retryNotes, setRetryNotes] = useState<ReadonlyMap<string, string>>(new Map())
@@ -1156,9 +1220,11 @@ export function AgentPanelOverlay({
   }
 
   useKeyboard(event => {
+    const activeScroll = openId ? detailScrollRef.current : scrollRef.current
     const isEnter = event.name === 'return' || event.name === 'enter' || event.name === 'kpenter'
 
     if (isPanelResizeKey(event)) {
+      if (!records.length) return
       adjustPanelWidth(event.name === 'right' ? PANEL_WIDTH_STEP : -PANEL_WIDTH_STEP)
     } else if (event.name === 'escape' || isAgentsToggleKey(event) || event.sequence === 'q') {
       // Esc steps back to the list before it closes the panel: the inspector is
@@ -1181,19 +1247,19 @@ export function AgentPanelOverlay({
       if (openId) cancelSelected()
       else return
     } else if (event.name === 'up') {
-      if (openId) scrollRef.current?.scrollBy(-1)
+      if (openId) activeScroll?.scrollBy(-1)
       else moveSelection(-1)
     } else if (event.name === 'down') {
-      if (openId) scrollRef.current?.scrollBy(1)
+      if (openId) activeScroll?.scrollBy(1)
       else moveSelection(1)
     } else if (isPageUpKey(event)) {
-      scrollRef.current?.scrollBy(-page)
+      activeScroll?.scrollBy(-page)
     } else if (isPageDownKey(event)) {
-      scrollRef.current?.scrollBy(page)
+      activeScroll?.scrollBy(page)
     } else if (event.name === 'home') {
-      scrollRef.current?.scrollTo(0)
+      activeScroll?.scrollTo(0)
     } else if (event.name === 'end') {
-      scrollRef.current?.scrollTo(Number.MAX_SAFE_INTEGER)
+      activeScroll?.scrollTo(Number.MAX_SAFE_INTEGER)
     } else {
       return
     }
@@ -1219,6 +1285,8 @@ export function AgentPanelOverlay({
           over max-width, so the cap never applied once a user widened. */}
       <Box flexDirection="column" flexShrink={0} height={panelHeight} width={panelWidth}>
         <AgentPanelBody
+          availableWidth={panelWidth}
+          detailScrollRef={detailScrollRef}
           compactHeader={panelWidth < 56}
           history={history}
           liveAgents={liveAgents}
@@ -1232,7 +1300,7 @@ export function AgentPanelOverlay({
           // Below a dozen rows the hairlines and vertical padding cost more
           // than the content they frame; a degenerate terminal keeps the
           // list, the empty state, and the footer keys instead.
-          shortFrame={panelHeight < 12}
+          shortFrame={panelHeight <= 16}
           t={t}
           variant="overlay"
         />

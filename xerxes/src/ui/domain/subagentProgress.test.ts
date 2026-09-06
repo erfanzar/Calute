@@ -13,7 +13,14 @@ import {
 import type { Msg, SubagentProgress } from '../types.js'
 
 import { agentContentWidth } from './agentPanelLayout.js'
-import { reconcileArchivedSubagent } from './subagentProgress.js'
+import { reconcileArchivedSubagent, mergeSubagentProgress, subagentProgressFromSnapshot } from './subagentProgress.js'
+
+it('retains assigned provider and effort through restored snapshots and partial live updates', () => {
+  const restored = subagentProgressFromSnapshot({ id: 'child', status: 'running', model: 'chosen-model', provider_profile: 'work', reasoning_effort: 'high' }, 0)
+  expect(restored).toMatchObject({ model: 'chosen-model', providerProfile: 'work', reasoningEffort: 'high' })
+  const updated = mergeSubagentProgress(restored, { goal: '', task_index: 0, reasoning_effort: 'medium' }, () => ({}))
+  expect(updated).toMatchObject({ model: 'chosen-model', providerProfile: 'work', reasoningEffort: 'medium' })
+})
 
 const archivedAgent: SubagentProgress = {
   agentType: 'researcher',
@@ -116,7 +123,7 @@ describe('reconcileArchivedSubagent', () => {
         .reduce((count, snapshot) => count + snapshot.subagents.length, 0)
 
     // The chat that ran the fan-out gives up columns to the rail…
-    expect(agentContentWidth(120, railAgents('session-a'))).toBe(82)
+    expect(agentContentWidth(120, railAgents('session-a'))).toBe(90)
     // …and a chat that never spawned anything keeps the whole terminal.
     // Counting the global cache here reserved ~40 columns for a rail that
     // appLayout then declined to mount, leaving a blank strip on the right.

@@ -307,6 +307,7 @@ function TerminalDetailView({
   draft,
   now,
   outputRef,
+  query,
   typing,
   t
 }: {
@@ -315,6 +316,7 @@ function TerminalDetailView({
   draft: string
   now: number
   outputRef: React.MutableRefObject<ScrollBoxRenderable | null>
+  query: string
   typing: boolean
   t: Theme
 }) {
@@ -322,7 +324,8 @@ function TerminalDetailView({
     return <Text color={t.color.muted}>loading output…</Text>
   }
 
-  const lines = detail.output.replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n')
+  const allLines = detail.output.replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n')
+  const lines = allLines.map((text, index) => ({ text, number: index + 1 })).filter(line => !query || line.text.toLowerCase().includes(query.toLowerCase()))
 
   return (
     <Box flexDirection="column" flexGrow={1} flexShrink={1} minHeight={0}>
@@ -358,7 +361,7 @@ function TerminalDetailView({
         </Text>
       ) : null}
       <Text color={t.color.muted} dimColor wrap="truncate-end">
-        {`OUTPUT — ${detail.label} (mirror)`}
+        {query ? `OUTPUT — ${lines.length} matching lines in retained output` : `OUTPUT — ${detail.label} (mirror)`}
       </Text>
       <scrollbox ref={outputRef} style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }} viewportCulling>
         <Box flexDirection="column" flexShrink={0}>
@@ -367,9 +370,10 @@ function TerminalDetailView({
               …earlier output dropped from the viewer's buffer…
             </Text>
           ) : null}
+          {query && !lines.length ? <Text color={t.color.muted}>No matching lines in retained output</Text> : null}
           {lines.map((line, index) => (
             <Text key={index} color={t.color.text} wrap="truncate-end">
-              {line || ' '}
+              {query ? `${line.number}: ${line.text}` : line.text || ' '}
             </Text>
           ))}
         </Box>
@@ -391,9 +395,13 @@ export function TerminalPanelOverlay({ onClose, t }: { onClose: () => void; t: T
   const outputRef = useRef<ScrollBoxRenderable | null>(null)
   const { height, width } = useTerminalDimensions()
   useStore($panelWidthDelta)
-  const [entries, setEntries] = useState<readonly TerminalSummary[]>([])
+  const [allEntries, setEntries] = useState<readonly TerminalSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [selectedIndex, setSelectedIndex] = useState(0)
+  const [filter, setFilter] = useState<'all' | 'running' | 'finished'>('all')
+  const [query, setQuery] = useState('')
+  const [searching, setSearching] = useState(false)
+  const entries = allEntries.filter(entry => filter === 'all' || (filter === 'running' ? entry.running : !entry.running))
   const [openId, setOpenId] = useState<null | string>(null)
   const [detail, setDetail] = useState<null | TerminalInspection>(null)
   const [notice, setNotice] = useState<null | string>(null)
@@ -405,7 +413,7 @@ export function TerminalPanelOverlay({ onClose, t }: { onClose: () => void; t: T
   // allowance so the output pane and footer hints have room.
   const { height: panelHeight, width: fittedWidth } = overlayPanelSize(
     { height, width },
-    entries.length
+    allEntries.length
       ? OVERLAY_PANEL_SPECS.terminals
       : { ...OVERLAY_PANEL_SPECS.terminals, desiredHeight: 0 }
   )
@@ -527,6 +535,26 @@ export function TerminalPanelOverlay({ onClose, t }: { onClose: () => void; t: T
     const name = event.name?.toLowerCase() ?? ''
     const sequence = event.sequence ?? ''
 
+    if (event.eventType === 'release') return
+    if (searching) {
+      consumeKey(event)
+      if (name === 'escape') { setSearching(false); setQuery(''); followOutput.current = true }
+      else if (name === 'return' || name === 'enter') setSearching(false)
+      else if (name === 'backspace') setQuery(value => value.slice(0, -1))
+      else if (sequence && !event.ctrl && !event.meta && sequence.length === 1 && sequence >= ' ') setQuery(value => (value + sequence).slice(0, 256))
+      return
+    }
+    if (!typing && openId && sequence === '/') {
+      consumeKey(event); setSearching(true); setArmedKill(null); setNotice(null)
+      followOutput.current = false; outputRef.current?.scrollTo(0)
+      return
+    }
+    if (!typing && !openId && sequence === 'f' && !event.ctrl && !event.meta) {
+      consumeKey(event); setFilter(value => value === 'all' ? 'running' : value === 'running' ? 'finished' : 'all')
+      setSelectedIndex(0); setArmedKill(null); setNotice(null)
+      return
+    }
+
     // Typing into a live shell owns the keyboard: every printable key is input,
     // and only Esc and Enter mean anything to the panel.
     if (typing) {
@@ -561,6 +589,7 @@ export function TerminalPanelOverlay({ onClose, t }: { onClose: () => void; t: T
       }
       // Esc backs out one level before it closes: the detail view is a place
       // you can be, not a modal on top of the panel.
+      if (openId && query) { setQuery(''); followOutput.current = true; return }
       if (openId) {
         setOpenId(null)
         setNotice(null)
@@ -575,6 +604,7 @@ export function TerminalPanelOverlay({ onClose, t }: { onClose: () => void; t: T
       consumeKey(event)
       if (!openId && selected) {
         setOpenId(selected.id)
+        setQuery('')
         setDetail(null)
         setNotice(null)
         setArmedKill(null)
@@ -697,6 +727,11 @@ export function TerminalPanelOverlay({ onClose, t }: { onClose: () => void; t: T
   })
 
   usePaste(event => {
+    if (searching) {
+      event.preventDefault(); event.stopPropagation()
+      setQuery(value => (value + new TextDecoder().decode(event.bytes).replace(/[\r\n]/g, ' ')).slice(0, 256))
+      return
+    }
     if (!typing) {
       return
     }
@@ -706,13 +741,13 @@ export function TerminalPanelOverlay({ onClose, t }: { onClose: () => void; t: T
     setDraft(current => current + new TextDecoder().decode(event.bytes))
   })
 
-  const liveCount = entries.filter(entry => entry.running).length
+  const liveCount = allEntries.filter(entry => entry.running).length
   const title = openId ? 'Terminal' : 'Terminals'
-  const footer = typing
+  const footer = searching ? 'Type search · Enter apply · Esc clear' : typing
     ? 'type to send · Enter submit · Esc cancel'
     : openId
-      ? '↑↓ scroll · i input · c interrupt · k kill ×2 · K force ×2 · Esc back'
-      : '↑↓ select · Enter open · k kill ×2 · K force ×2 · r refresh · Esc close'
+      ? '/ search · ↑↓ scroll · i input · c interrupt · k kill ×2 · K force ×2 · Esc back'
+      : 'f filter · ↑↓ select · Enter open · k kill ×2 · K force ×2 · r refresh · Esc close'
 
   return (
     <box
@@ -747,13 +782,13 @@ export function TerminalPanelOverlay({ onClose, t }: { onClose: () => void; t: T
             </Text>
             {openId ? null : (
               <Text color={t.color.muted} wrap="truncate-end">
-                {`  ${entries.length} tracked · ${liveCount} running`}
+                {`  ${allEntries.length} tracked · ${liveCount} running`}
               </Text>
             )}
           </Box>
           <Box flexShrink={0}>
             {openId ? (
-              <Text color={liveCount ? t.color.accent : t.color.muted}>{liveCount ? 'running' : 'ended'}</Text>
+              <Text color={detail?.running ? t.color.accent : t.color.muted}>{detail?.running ? 'running' : 'ended'}</Text>
             ) : (
               <Text color={t.color.muted} dimColor>
                 read-only mirror
@@ -764,6 +799,8 @@ export function TerminalPanelOverlay({ onClose, t }: { onClose: () => void; t: T
         {gateway ? null : (
           <Text color={t.color.warn}>not connected to a daemon — nothing to inspect</Text>
         )}
+        {!openId ? <Text color={t.color.muted} wrap="wrap">Filter: {filter} · {entries.length} shown</Text> : null}
+        {openId && (searching || query) ? <Text color={t.color.accent} wrap="wrap">Search: {query}{searching ? '▏' : ' · Esc clear'}</Text> : null}
         {openId ? (
           <TerminalDetailView
             arm={activeKillArm(armedKill, detail?.id, now)}
@@ -771,9 +808,12 @@ export function TerminalPanelOverlay({ onClose, t }: { onClose: () => void; t: T
             draft={draft}
             now={now}
             outputRef={outputRef}
+            query={query}
             t={t}
             typing={typing}
           />
+        ) : !entries.length && allEntries.length > 0 ? (
+          <Text color={t.color.muted}>No {filter} terminals</Text>
         ) : (
           <TerminalListView
             armedKill={armedKill}

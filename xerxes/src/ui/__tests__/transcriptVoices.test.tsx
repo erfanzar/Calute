@@ -96,7 +96,7 @@ describe('transcript voices', () => {
     // is what the canvas removed. (The band's ground is a Box background, not
     // a span attribute, so it is not observable here; the glyph is.)
     expect(findText(spans, '❯')?.fg).toBe(VOICE.user(theme).bar)
-    expect(findText(spans, 'refactor the gateway')?.fg).toBe('#d7dce3')
+    expect(findText(spans, 'refactor the gateway')?.fg).toBe('#dce1e8')
   })
 
   it('opens a quiet read-only call with a faint ⏺, lapis name, green tick', async () => {
@@ -110,7 +110,7 @@ describe('transcript voices', () => {
     // Outcome glyph FIRST (anatomy element ④): dim for read-only calls…
     expect(findText(spans, '⏺')?.fg).toBe(theme.color.muted)
     // …the VERB sits on the ramp's secondary step…
-    expect(findText(spans, 'Read File')?.fg).toBe('#8b949e')
+    expect(findText(spans, 'Read File')?.fg).toBe('#aeb8c6')
     // …the verdict rides right after the summary, ok-green on success…
     expect(findText(spans, '✓')?.fg).toBe('#57ca85')
     // …and the TARGET is the one thing on the row you are actually reading,
@@ -127,7 +127,7 @@ describe('transcript voices', () => {
     })
 
     expect(findText(spans, '⏺')?.fg).toBe('#57ca85')
-    expect(findText(spans, 'Bash')?.fg).toBe('#8b949e')
+    expect(findText(spans, 'Bash')?.fg).toBe('#aeb8c6')
     expect(findText(spans, '✓')?.fg).toBe('#57ca85')
   })
 
@@ -142,7 +142,7 @@ describe('transcript voices', () => {
     expect(findText(spans, '⏺')?.fg).toBe('#f47067')
     expect(findText(spans, '✗')?.fg).toBe('#f47067')
     // The name still reads as a name — only the outcome carries red.
-    expect(findText(spans, 'Bash')?.fg).toBe('#8b949e')
+    expect(findText(spans, 'Bash')?.fg).toBe('#aeb8c6')
   })
 
   it('paints the system voice violet, glyph included', async () => {
@@ -165,7 +165,7 @@ describe('transcript voices', () => {
 
     const spans = await spansOf({ role: 'assistant', text: 'Release gate — three commands in order.' })
 
-    expect(findText(spans, '✦')?.fg).toBe('#b1b8c1')
+    expect(findText(spans, '✦')?.fg).toBe('#c5cdd7')
   })
 
   it('keeps every voice visually distinct in code mode', async () => {

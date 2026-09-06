@@ -18,7 +18,7 @@ import {
   recoverSubagentSnapshots,
 } from '../src/daemon/subagentCoordinator.js'
 import { DaemonSubagentEventBus } from '../src/daemon/subagentEvents.js'
-import { createNativeSubagentHost } from '../src/daemon/subagentHost.js'
+import { createNativeSubagentHost, subagentRetryWirePayload } from '../src/daemon/subagentHost.js'
 import {
   type SubagentConversationContext,
   SubagentConversationPersistence,
@@ -30,6 +30,7 @@ import {
 } from '../src/session/daemonTranscript.js'
 import { AgentTurnRunner, formatSubagentResults } from '../src/daemon/turnRunner.js'
 import { ToolRegistry } from '../src/executors/toolRegistry.js'
+import { RunHistory } from '../src/runtime/runHistory.js'
 import { SkillRegistry } from '../src/extensions/skills.js'
 import { messagesToAnthropic } from '../src/llms/anthropic.js'
 import type { CompletionRequest, LlmClient, LlmDelta } from '../src/llms/client.js'
@@ -3221,7 +3222,7 @@ test('persisted assistant tool calls drop malformed entries instead of casting t
   }
 })
 
-test('a reset falls back to the current generation once its original generation is pruned', async () => {
+test('a reset retains its original execution generation after later reconfigurations', async () => {
   const oldClient = new ReloadGenerationChildClient('pruned-old', true)
   const midClient = new ReloadGenerationChildClient('pruned-mid', true)
   const newClient = new ReloadGenerationChildClient('pruned-new')
@@ -3276,10 +3277,10 @@ test('a reset falls back to the current generation once its original generation 
       message: 'follow up after pruning',
     })
     const continuedResult = await host.managerPort.wait([continuedTask.id], 1_000)
-    expect(continuedResult.completed[0]?.lastOutput).toBe('pruned-new:old-model:follow up after pruning')
-    expect(oldClient.models).toEqual(['old-model'])
+    expect(continuedResult.completed[0]?.lastOutput).toBe('pruned-old:old-model:follow up after pruning')
+    expect(oldClient.models).toEqual(['old-model', 'old-model'])
     expect(midClient.models).toEqual([])
-    expect(newClient.models).toEqual(['old-model'])
+    expect(newClient.models).toEqual([])
   } finally {
     oldClient.release()
     midClient.release()
@@ -3541,6 +3542,7 @@ test('a retried child compacts and persists its conversation before the turn sta
 
     const persisted = await transcripts.load(historySessionId, { currentProjectDirectory: directory })
     expect(JSON.stringify(persisted?.messages ?? [])).toContain('CHILD SUMMARY')
+    expect(persisted?.metadata.compaction_history).toEqual([persisted?.metadata.last_compaction])
 
     // The replaced history survives beside the child's own transcript.
     const archive = await Bun.file(
@@ -3555,4 +3557,234 @@ test('a retried child compacts and persists its conversation before the turn sta
     await host.manager.shutdown()
     await rm(directory, { force: true, recursive: true })
   }
+})
+
+test('configured intelligence reaches the child provider and survives retry', async () => {
+  const client = new ReloadGenerationChildClient('tier-provider')
+  const registry = new ToolRegistry()
+  const host = createNativeSubagentHost({
+    agentDefinitions: new Map([
+      ['default', creatorDefinition('plain')],
+      ['plain', agentDefinition('plain')],
+    ]),
+    cwd: process.cwd(), eventBus: new DaemonSubagentEventBus(), llm: client,
+    model: 'connection-model', permissionMode: 'accept-all',
+    toolExecutor: registry, tools: registry.definitions(),
+  })
+  const definitions = registerClaudeAgentTools(registry, {
+    manager: host.managerPort,
+    intelligence: { default: 'balanced', balanced: 'fixture-normal', smart: 'fixture-deep' },
+  })
+  expect(definitions.find(tool => tool.function.name === 'SpawnAgents')?.function.description)
+    .toContain('smart=fixture-deep')
+  try {
+    const metadata = { model: 'parent-model' }
+    const result = await registry.execute(toolCall('AgentTool', {
+      intelligence: 'smart', subagent_type: 'plain', title: 'Deep review', prompt: 'Review the race',
+    }), { agentId: 'default', sessionId: 'tier-parent', metadata })
+    expect(result).toContain('fixture-deep')
+    expect(client.models).toEqual(['fixture-deep'])
+    const snapshot = host.managerPort.listHandles()[0]!
+    expect(snapshot.model).toBe('fixture-deep')
+    expect(persistedSubagentSnapshotValues(metadata)[0]?.model).toBe('fixture-deep')
+    await host.retry(snapshot.id)
+    await host.managerPort.wait([snapshot.id], 2_000)
+    expect(client.models).toEqual(['fixture-deep', 'fixture-deep'])
+  } finally {
+    await host.manager.shutdown()
+  }
+})
+
+test('agent run history preserves separate attempts and scopes results to the parent', async () => {
+  const history = new RunHistory(':memory:')
+  const registry = new ToolRegistry()
+  const host = createNativeSubagentHost({
+    agentDefinitions: new Map([['coder', agentDefinition('coder')]]),
+    cwd: process.cwd(), eventBus: new DaemonSubagentEventBus(), runHistory: history,
+    llm: { async *stream() { yield { content: 'Verified the requested behavior.' } } },
+    model: 'fixture-model', permissionMode: 'accept-all', toolExecutor: registry, tools: [],
+  })
+  try {
+    const task = await host.managerPort.spawn({ message: 'review cancellation', promptProfile: 'coder', sourceAgentId: 'parent-run-history', title: 'Review cancellation' })
+    await host.managerPort.wait([task.id], 2_000)
+    const first = history.list('parent-run-history')[0]!
+    expect(first).toMatchObject({ kind: 'agent', state: 'succeeded', sourceId: task.id, unread: true })
+    expect(first.output).toContain('Verified the requested behavior')
+    expect(history.list('other-parent')).toEqual([])
+    await host.retry(task.id)
+    await host.managerPort.wait([task.id], 2_000)
+    const attempts = history.list('parent-run-history')
+    expect(attempts).toHaveLength(2)
+    expect(new Set(attempts.map(run => run.id)).size).toBe(2)
+    expect(new Set(attempts.map(run => run.title)).size).toBe(2)
+    expect(history.inspect('parent-run-history', first.id)?.state).toBe('succeeded')
+  } finally { await host.manager.shutdown(); history.close() }
+})
+
+test('cancelled child execution is persisted as cancelled in its parent inbox', async () => {
+  const history = new RunHistory(':memory:')
+  const registry = new ToolRegistry()
+  const client = new CancelledHistoryChildClient()
+  const host = createNativeSubagentHost({
+    agentDefinitions: new Map([['coder', agentDefinition('coder')]]), cwd: process.cwd(),
+    eventBus: new DaemonSubagentEventBus(), runHistory: history, llm: client,
+    model: 'fixture-model', permissionMode: 'accept-all', toolExecutor: registry, tools: [],
+  })
+  try {
+    const task = await host.managerPort.spawn({ message: 'wait for cancellation', promptProfile: 'coder', sourceAgentId: 'cancel-parent' })
+    await client.started.promise
+    expect(host.interruptSource('cancel-parent')).toBe(1)
+    await host.managerPort.wait([task.id], 2_000)
+    await waitFor(() => history.list('cancel-parent')[0]?.state === 'cancelled')
+    expect(history.list('cancel-parent', { unreadOnly: true })).toHaveLength(1)
+  } finally { await host.manager.shutdown(); history.close() }
+})
+
+test('configured child provider and reasoning reach the selected transport', async () => {
+  const parent = new ToolCapturingParentClient()
+  const child = new ToolCapturingParentClient()
+  const registry = new ToolRegistry()
+  const routed: string[] = []
+  const eventBus = new DaemonSubagentEventBus()
+  const events: DaemonEvent[] = []
+  const unsubscribe = eventBus.subscribe('profile-parent', event => events.push(event))
+  const host = createNativeSubagentHost({ agentDefinitions: BUILTIN_AGENTS, cwd: process.cwd(), eventBus, llm: parent,
+    resolveProviderProfile: (profile, model) => { routed.push(profile + ':' + model); return { llm: child } }, model: 'parent-model', permissionMode: 'accept-all', toolExecutor: registry, tools: [] })
+  try {
+    const agent = await host.managerPort.spawn({ agent: { id: 'coder', model: 'child-model', providerProfile: 'test-profile', reasoningEffort: 'high' }, promptProfile: 'coder', message: 'Say ready', title: 'Provider test', sourceAgentId: 'profile-parent' })
+    await host.managerPort.wait([agent.id], 5000)
+    expect(parent.requests).toHaveLength(0)
+    expect(routed).toEqual(['test-profile:child-model'])
+    expect(child.requests[0]?.model).toBe('child-model')
+    expect(child.requests[0]?.thinking?.effort).toBe('high')
+    expect(host.managerPort.listHandles()[0]).toMatchObject({ providerProfile: 'test-profile', reasoningEffort: 'high' })
+    expect(JSON.stringify(events)).toContain('"provider_profile":"test-profile"')
+    expect(JSON.stringify(events)).toContain('"reasoning_effort":"high"')
+  } finally { unsubscribe(); await host.manager.shutdown() }
+})
+
+test('restart reset/send preserves provider and effort after rejected empty input', async () => {
+  const parent = new ToolCapturingParentClient()
+  const child = new ToolCapturingParentClient()
+  const registry = new ToolRegistry()
+  const routed: string[] = []
+  const host = createNativeSubagentHost({ agentDefinitions: BUILTIN_AGENTS, cwd: process.cwd(), eventBus: new DaemonSubagentEventBus(), llm: parent,
+    resolveProviderProfile: (profile, model) => { routed.push(profile + ':' + model); return { llm: child } }, model: 'parent-model', permissionMode: 'accept-all', toolExecutor: registry, tools: [] })
+  try {
+    const task = await host.managerPort.spawn({ agent: { id: 'coder', model: 'child-model', providerProfile: 'saved-profile', reasoningEffort: 'high' }, promptProfile: 'coder', message: 'Review', sourceAgentId: 'recovery-parent' })
+    await host.managerPort.wait([task.id], 5000)
+    const metadata: Record<string, unknown> = {}
+    replacePersistedSubagentSnapshots(metadata, host.managerPort.listHandles())
+    const restored = recoverSubagentSnapshots([], 'recovery-parent', persistedSubagentSnapshotValues(metadata)).map(snapshot => ({ ...snapshot, id: 'restored-task', name: 'restored-child' }))
+    expect(host.turnCoordinator.restore?.('recovery-parent', restored)).toBe(1)
+    host.managerPort.resume('restored-task')
+    await expect(host.managerPort.sendInput('restored-task', { message: ' ' })).rejects.toThrow('input is required')
+    const replacement = await host.managerPort.sendInput('restored-task', { message: 'Continue review' })
+    expect(subagentRetryWirePayload(replacement)).toMatchObject({ provider_profile: 'saved-profile', reasoning_effort: 'high', model: 'child-model' })
+    await host.managerPort.wait([replacement.id], 5000)
+    expect(parent.requests).toHaveLength(0)
+    expect(routed).toEqual(['saved-profile:child-model', 'saved-profile:child-model'])
+    expect(child.requests.at(-1)?.thinking?.effort).toBe('high')
+    expect(host.managerPort.listHandles().find(snapshot => snapshot.id === replacement.id)).toMatchObject({ providerProfile: 'saved-profile', reasoningEffort: 'high' })
+  } finally { await host.manager.shutdown() }
+})
+
+test.each(['output_limit', 'unconfigured_tools'] as const)('children stopped by %s remain failed despite partial text', async reason => {
+  const history = new RunHistory(':memory:')
+  const registry = new ToolRegistry()
+  let calls = 0
+  const host = createNativeSubagentHost({
+    agentDefinitions: BUILTIN_AGENTS, cwd: process.cwd(), eventBus: new DaemonSubagentEventBus(), runHistory: history,
+    llm: { async *stream() {
+      calls++
+      yield reason === 'output_limit'
+        ? { content: 'Incomplete answer ', finishReason: 'length' as const }
+        : { content: 'Need an unavailable tool', toolCalls: [toolCall('MissingTool', {})] }
+    } },
+    model: 'fixture-model', permissionMode: 'accept-all', toolExecutor: registry, tools: [],
+  })
+  try {
+    const task = await host.managerPort.spawn({ message: 'Finish the analysis', promptProfile: 'coder', sourceAgentId: 'limited-parent' })
+    await host.managerPort.wait([task.id], 5000)
+    const snapshot = host.managerPort.listHandles().find(item => item.id === task.id)
+    expect(snapshot?.status).toBe('error')
+    expect(snapshot?.error).toContain(reason)
+    const run = history.list('limited-parent')[0]!
+    expect(run.state).toBe('failed')
+    expect(run.error).toContain(reason)
+    expect(run.output).toContain(reason === 'output_limit' ? 'Incomplete answer' : 'Need an unavailable tool')
+    expect(calls).toBeGreaterThan(1)
+    expect(calls).toBeLessThan(10)
+  } finally { await host.manager.shutdown(); history.close() }
+})
+
+for (const explicit of [true, false]) test(`${explicit ? 'explicit' : 'inherited'} child selection is checked before allocation and again before provider execution`, async () => {
+  const registry = new ToolRegistry()
+  const client = new ToolCapturingParentClient()
+  let reject = true, validations = 0
+  const host = createNativeSubagentHost({ agentDefinitions: BUILTIN_AGENTS, cwd: process.cwd(), eventBus: new DaemonSubagentEventBus(), llm: client, model: 'test-model', permissionMode: 'accept-all', toolExecutor: registry, tools: [],
+    validateProviderSelection: async (profile, model, effort) => {
+      validations++
+      expect([profile, model, effort]).toEqual(['child', 'test-model', 'high'])
+      if (reject || validations > 2) throw new Error('Selection unavailable')
+    },
+    validateInheritedSelection: async (model, effort) => {
+      expect(explicit).toBe(false)
+      validations++
+      expect([model, effort]).toEqual(['test-model', 'high'])
+      if (reject || validations > 2) throw new Error('Selection unavailable')
+    },
+    resolveProviderProfile: () => ({ llm: client }),
+  })
+  try {
+    const request = { message: 'Review', agent: { id: 'coder', model: 'test-model', ...(explicit ? { providerProfile: 'child' } : {}), reasoningEffort: 'high', systemPrompt: 'Review' } }
+    await expect(host.managerPort.spawn(request)).rejects.toThrow('Selection unavailable')
+    expect(host.manager.listTasks()).toHaveLength(0)
+    reject = false
+    const task = await host.managerPort.spawn(request)
+    await host.managerPort.wait([task.id], 1000)
+    expect(validations).toBe(3)
+    expect(client.requests).toHaveLength(0)
+    expect(host.managerPort.listHandles()[0]?.status).toBe('error')
+  } finally { await host.manager.shutdown() }
+})
+
+test('cancelling a child during provider validation prevents a later model call', async () => {
+  const registry = new ToolRegistry(), client = new ToolCapturingParentClient()
+  let enter!: () => void, release!: () => void
+  const entered = new Promise<void>(resolve => { enter = resolve })
+  const held = new Promise<void>(resolve => { release = resolve })
+  let calls = 0
+  const host = createNativeSubagentHost({ agentDefinitions: BUILTIN_AGENTS, cwd: process.cwd(), eventBus: new DaemonSubagentEventBus(), llm: client, model: 'test-model', permissionMode: 'accept-all', toolExecutor: registry, tools: [],
+    validateProviderSelection: async () => { if (++calls === 2) { enter(); await held } },
+    resolveProviderProfile: () => ({ llm: client }),
+  })
+  try {
+    const task = await host.managerPort.spawn({ message: 'Review', agent: { id: 'coder', model: 'test-model', providerProfile: 'child', systemPrompt: 'Review' } })
+    await entered
+    host.managerPort.close(task.id)
+    release()
+    await host.managerPort.wait([task.id], 1000)
+    expect(client.requests).toHaveLength(0)
+  } finally { release(); await host.manager.shutdown() }
+})
+
+test('cancellation during selection preflight allocates no child and reaches the validation host', async () => {
+  const registry = new ToolRegistry(), client = new ToolCapturingParentClient()
+  const controller = new AbortController()
+  let enter!: () => void, release!: () => void
+  const entered = new Promise<void>(resolve => { enter = resolve })
+  const held = new Promise<void>(resolve => { release = resolve })
+  const host = createNativeSubagentHost({ agentDefinitions: BUILTIN_AGENTS, cwd: process.cwd(), eventBus: new DaemonSubagentEventBus(), llm: client, model: 'test-model', permissionMode: 'accept-all', toolExecutor: registry, tools: [],
+    validateProviderSelection: async (_profile, _model, _effort, signal) => { expect(signal).toBe(controller.signal); enter(); await held },
+    resolveProviderProfile: () => ({ llm: client }),
+  })
+  try {
+    const pending = host.managerPort.spawn({ signal: controller.signal, message: 'Review', agent: { id: 'coder', model: 'test-model', providerProfile: 'child', systemPrompt: 'Review' } })
+    await entered
+    controller.abort(new Error('cancelled preflight')); release()
+    await expect(pending).rejects.toThrow('cancelled preflight')
+    expect(host.manager.listTasks()).toHaveLength(0)
+    expect(client.requests).toHaveLength(0)
+  } finally { release(); await host.manager.shutdown() }
 })

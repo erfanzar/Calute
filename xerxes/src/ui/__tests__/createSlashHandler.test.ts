@@ -91,6 +91,63 @@ function makeContext(request: ReturnType<typeof vi.fn>, catalog: null | SlashCat
 }
 
 describe('createSlashHandler', () => {
+  it('routes milestone commands without replacing history or sending a model message', async () => {
+    patchUiState({ sid: 's1' })
+    const request = vi.fn(async () => ({ ok: true, text: 'Current milestone: Verify recovery' }))
+    const { context, page, send } = makeContext(request)
+    createSlashHandler(context)('/goal milestone Verify recovery')
+    await flush()
+    expect(request).toHaveBeenCalledWith('session.goal', { input: 'milestone Verify recovery', session_id: 's1' })
+    expect(page).toEqual(['Current milestone: Verify recovery'])
+    expect(send).toEqual([])
+    expect(context.session.resetVisibleHistory).not.toHaveBeenCalled()
+    expect(context.transcript.setHistoryItems).not.toHaveBeenCalled()
+  })
+  it('branches through the native command and loads the branch while preserving the source', async () => {
+    const request = vi.fn(async () => ({ ok: true, session: { id: 'branch-id' } }))
+    const { context } = makeContext(request)
+    createSlashHandler(context)('/branch --through-turn 2 Review alternative')
+    await flush()
+    expect(request).toHaveBeenCalledWith('slash', { command: '/branch --through-turn 2 Review alternative' })
+    expect(context.session.resumeById).toHaveBeenCalledWith('branch-id', { keepCurrent: true })
+    expect(context.session.closeSession).not.toHaveBeenCalled()
+  })
+  it('leaves the current session alone when branching fails', async () => {
+    const { context, sys } = makeContext(vi.fn(async () => ({ ok: false, error: 'turn is running' })))
+    createSlashHandler(context)('/branch')
+    await flush(); await flush()
+    expect(context.session.resumeById).not.toHaveBeenCalled()
+    expect(context.session.closeSession).not.toHaveBeenCalled()
+    expect(sys.join(' ')).toContain('turn is running')
+  })
+  it('opens conversation loops without sending a model message', () => {
+    const { context, send, sys } = makeContext(vi.fn());
+    createSlashHandler(context)('/loop');
+    expect(getOverlayState().loops).toBe(true);
+    expect(getOverlayState().schedules).toBe(false);
+    expect(send).toEqual([]); expect(sys).toEqual([]);
+  });
+  it('opens context inspection without a model turn', () => {
+    const { context, send, sys } = makeContext(vi.fn());
+    createSlashHandler(context)('/context');
+    expect(getOverlayState().contextInspector).toBe(true);
+    expect(send).toEqual([]); expect(sys).toEqual([]);
+  });
+  it('opens LSP settings without dispatching a model message', () => {
+    const { context, send, sys } = makeContext(vi.fn());
+    createSlashHandler(context)('/config lsp');
+    expect(getOverlayState().lspSettings).toBe(true);
+    expect(send).toEqual([]);
+    expect(sys).toEqual([]);
+  });
+  it('opens MCP settings without dispatching a model message', () => {
+    const request = vi.fn();
+    const { context, send, sys } = makeContext(request);
+    createSlashHandler(context)('/config mcp');
+    expect(getOverlayState().mcpSettings).toBe(true);
+    expect(send).toEqual([]);
+    expect(sys).toEqual([]);
+  });
   afterEach(() => {
     resetOverlayState()
     resetUiState()
@@ -100,11 +157,18 @@ describe('createSlashHandler', () => {
     ['/stop', 'stop'],
     ['/reload', 'reload'],
     ['/reload-mcp', 'reload-mcp'],
+    ['/mcp status', 'mcp status'],
+    ['/mcp reconnect fixture', 'mcp reconnect fixture'],
     ['/rollback list', 'snapshots'],
+    [`/rollback apply target ${'a'.repeat(64)}`, `rollback apply target ${'a'.repeat(64)}`],
+    ['/rollback diff snapshot-id', 'rollback diff snapshot-id'],
     ['/reload-skills', 'reload'],
     ['/skills', 'skills'],
     ['/skills list', 'skills'],
+    ['/skills inspect review', 'skills inspect review'],
+    ['/skills diagnostics', 'skills diagnostics'],
     ['/plugins', 'plugins'],
+    ['/plugins inspect fixture', 'plugins inspect fixture'],
     ['/tools list', 'tools'],
     ['/image a native sunset', 'image a native sunset'],
     ['/voice status', 'voice status']

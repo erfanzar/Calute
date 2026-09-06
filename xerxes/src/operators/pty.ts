@@ -43,6 +43,7 @@ export interface PtySessionManagerOptions {
   readonly terminals?: TerminalRegistry
   /** Restrict `workdir` to this root, including existing symlinks. */
   readonly workspaceRoot?: string
+  readonly activeWorkspaceRoot?: () => string | undefined
 }
 
 export interface CreatePtySessionOptions {
@@ -96,7 +97,7 @@ export class PtySessionManager {
       options.maxPendingOutputChars ?? DEFAULT_MAX_PENDING_OUTPUT_CHARS,
       'maxPendingOutputChars',
     )
-    this.paths = options.workspaceRoot === undefined ? undefined : new WorkspacePathResolver(options.workspaceRoot)
+    this.paths = options.workspaceRoot === undefined ? undefined : new WorkspacePathResolver(options.workspaceRoot, options.activeWorkspaceRoot)
     this.terminals = options.terminals
   }
 

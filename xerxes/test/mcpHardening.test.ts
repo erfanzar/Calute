@@ -171,14 +171,12 @@ test('MCPManager reconnect keeps a concurrent registration that claimed the slot
   const registered = manager.getServer('alpha')
 
   releaseSleep()
-  await expect(reconnecting).resolves.toBeTrue()
+  await expect(reconnecting).resolves.toBeFalse()
 
-  // The superseded reconnect candidate is torn down, not swapped over the
-  // newer registration.
+  // The superseded retry stops creating clients and leaves the new registration.
   expect(manager.getServer('alpha')).toBe(registered)
-  const superseded = clients.at(-1)
-  expect(superseded).not.toBe(registered)
-  expect(superseded?.disconnects).toBe(1)
+  expect(clients).toHaveLength(3)
+  expect(clients[1]?.disconnects).toBe(1)
   await manager.disconnectAll()
 })
 

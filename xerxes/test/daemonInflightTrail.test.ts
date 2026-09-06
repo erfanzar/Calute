@@ -59,6 +59,7 @@ test("session.open mid-turn exposes the in-flight thinking and tool trail", asyn
       id: "call-1",
       name: "ReadFile",
       arguments: '{"path":"a.ts"}',
+      context: "a.ts",
     });
     expect(inflightTools[1]).toMatchObject({
       id: "call-2",
@@ -81,6 +82,7 @@ test("session.open mid-turn exposes the in-flight thinking and tool trail", asyn
         id: "call-1",
         name: "ReadFile",
         arguments: '{"path":"a.ts"}',
+        context: "a.ts",
         duration_ms: 42,
         ok: true,
       },

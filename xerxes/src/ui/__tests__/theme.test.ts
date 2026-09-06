@@ -92,7 +92,7 @@ describe('interaction mode palettes', () => {
 
     // Between the ramp's title and secondary steps: present enough to mark a
     // chip, colourless enough that the default mode adds no hue to a screen.
-    expect(code.color.accent).toBe('#b1b8c1')
+    expect(code.color.accent).toBe('#c5cdd7')
     expect(code.color.statusBg).toBe(NOCTURNE_DARK.screen)
     expect(code.color.completionBg).toBe(NOCTURNE_DARK.chrome)
     expect(code.color.completionCurrentBg).toBe(NOCTURNE_DARK.selected)

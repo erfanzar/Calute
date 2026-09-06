@@ -115,13 +115,14 @@ const picker = async ({
     activateLiveSession: vi.fn(),
     resumeById: vi.fn()
   }
+  const onCancel = vi.fn()
   const services = {
     gw: { request } as unknown as GatewayClient,
     rpc: vi.fn()
   } as unknown as GatewayServices
   const setup = await testRender(
     <GatewayProvider value={services}>
-      <SessionPicker actions={actions} currentSessionId={currentSessionId} t={DEFAULT_THEME} />
+      <SessionPicker actions={actions} currentSessionId={currentSessionId} onCancel={onCancel} t={DEFAULT_THEME} />
     </GatewayProvider>,
     { height, width }
   )
@@ -131,8 +132,27 @@ const picker = async ({
   })
   await setup.flush()
 
-  return { actions, request, setup }
+  return { actions, request, setup, onCancel }
 }
+
+it('bounds and centers the session manager on a large terminal without joining header fields', async () => {
+  const { setup } = await picker({ height: 80, width: 280 })
+  try {
+    const lines = setup.captureCharFrame().split('\n')
+    const header = lines.findIndex(line => line.includes('Agent View'))
+    const footer = lines.findIndex(line => line.includes('Esc exit'))
+    expect(header).toBeGreaterThan(15)
+    expect(footer - header).toBeLessThan(44)
+    expect(lines[header]).toContain('Current implementation · live')
+    expect(lines[header]!.indexOf('Agent View')).toBeGreaterThan(55)
+    expect(lines[footer]).toContain('Enter dispatch')
+    expect(lines.find(line => line.includes('Authentication audit'))).not.toMatch(/·{3,}/)
+    const activeRow = lines.findIndex(line => line.includes('Current implementation') && line.includes('attached'))
+    expect(lines[activeRow + 2]?.trim()).toBe('')
+  } finally {
+    act(() => setup.renderer.destroy())
+  }
+})
 
 describe('OpenTUI Agent View', () => {
   it('renders a full-screen grouped manager for independent chats and keeps subagents in their parent', async () => {
@@ -250,7 +270,11 @@ describe('OpenTUI Agent View', () => {
 
     try {
       await act(async () => closed.setup.mockInput.typeText(' '))
+      await vi.waitFor(() => expect(closed.request).toHaveBeenCalledWith('session.peek', { session_id: 'live-main' }))
       await act(async () => closed.setup.mockInput.pressEscape())
+      // Standalone Escape is decoded asynchronously. Resolve only after the
+      // close boundary we are testing, rather than racing the terminal parser.
+      await vi.waitFor(() => expect(closed.onCancel).toHaveBeenCalledTimes(1))
       await act(async () => {
         closePeek.resolve(peek)
         await Bun.sleep(0)

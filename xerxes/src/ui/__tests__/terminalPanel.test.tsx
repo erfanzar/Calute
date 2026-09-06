@@ -360,3 +360,33 @@ describe('OpenTUI terminal panel', () => {
     }
   })
 })
+
+it.each([[220, 65], [60, 24]])('filters terminals and searches retained output at %ix%i', async (width, height) => {
+  const onClose = vi.fn()
+  const live = wireTerminal({ label: 'Active build', command: 'compile' })
+  const done = wireTerminal({ id: 'done', label: 'Finished tests', command: 'tests', running: false, exitCode: 0 })
+  const rpc = vi.fn(async (method: string) => method === 'terminal.list'
+    ? { ok: true, terminals: [live, done] }
+    : { ok: true, terminal: { ...done, output: 'healthy line\nERROR missing file\nhealthy tail', outputTruncated: false } })
+  const setup = await testRender(<GatewayProvider value={servicesWith(rpc as unknown as GatewayServices['rpc'])}><TerminalPanelOverlay onClose={onClose} t={DEFAULT_THEME} /></GatewayProvider>, { width, height })
+  try {
+    await settle(setup)
+    act(() => setup.mockInput.pressKey('f')); await settle(setup)
+    expect(setup.captureCharFrame()).toContain('Active build')
+    expect(setup.captureCharFrame()).not.toContain('Finished tests')
+    act(() => setup.mockInput.pressKey('f')); await settle(setup)
+    expect(setup.captureCharFrame()).toContain('Finished tests')
+    expect(setup.captureCharFrame()).not.toContain('Active build')
+    act(() => setup.mockInput.pressEnter()); await settle(setup)
+    expect(setup.captureCharFrame()).toContain('ended')
+    act(() => setup.mockInput.pressKey('/')); await settle(setup)
+    await act(async () => setup.mockInput.typeText('error')); await settle(setup)
+    act(() => setup.mockInput.pressEnter()); await settle(setup)
+    expect(setup.captureCharFrame()).toContain('2: ERROR missing file')
+    expect(setup.captureCharFrame()).not.toContain('healthy line')
+    expect(rpc.mock.calls.some(call => call[0] === 'terminal.control')).toBe(false)
+    act(() => setup.mockInput.pressEscape()); await act(async () => { await Bun.sleep(60) }); await settle(setup)
+    expect(setup.captureCharFrame()).toContain('healthy line')
+    expect(onClose).not.toHaveBeenCalled()
+  } finally { act(() => setup.renderer.destroy()) }
+})

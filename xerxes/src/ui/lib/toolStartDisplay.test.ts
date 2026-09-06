@@ -146,3 +146,10 @@ describe('summarizeToolStartDisplay', () => {
     expect(summarizeToolStartDisplay('read_file', '', args)).toEqual({ context: 'src/one.ts' })
   })
 })
+
+it('summarizes legacy JSON contexts and recovers bounded argument prefixes', () => {
+  expect(summarizeToolStartDisplay('Exec Command', '{"cmd":"ssh","args":["host","uptime"]}').context).toBe('ssh host uptime')
+  expect(summarizeToolStartDisplay('File Edit Tool', '{"file_path":"work.py","old_string":"SECRET","new_string":"NEW"}').context).toBe('work.py')
+  expect(summarizeToolStartDisplay('Exec Command', '{"cmd":"scp","args":["very long…').context).toBe('scp')
+  expect(summarizeToolStartDisplay('Write File', '{"content":"truncated secret').context).toBe('arguments truncated')
+})

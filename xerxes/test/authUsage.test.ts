@@ -186,3 +186,43 @@ describe('subscription usage fetchers', () => {
     expect(line).toBe('Codex (pro) — 5-hour 63% (resets in 15m), weekly 20%')
   })
 })
+
+test('usage HTTP boundary rejects redirects, bounds streamed bytes and omits error bodies', async () => {
+  let cancelled = 0
+  await expect(fetchKimiUsage('secret', { fetchImplementation: async (_url, init) => {
+    expect(init?.redirect).toBe('error')
+    return new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(262145)) }, cancel() { cancelled++ } }))
+  } })).rejects.toThrow('size limit')
+  expect(cancelled).toBe(1)
+  await expect(fetchKimiUsage('secret', { fetchImplementation: async () => new Response('credential secret', { status: 403 }) })).rejects.toThrow('failed (403)')
+  try { await fetchKimiUsage('secret', { fetchImplementation: async () => new Response('credential secret', { status: 403 }) }) }
+  catch (error) { expect(String(error)).not.toContain('credential secret') }
+})
+
+test('cancelling a stalled usage response cancels its reader and preserves the abort reason', async () => {
+  const controller = new AbortController()
+  let started!: () => void, cancelled = 0
+  const ready = new Promise<void>(resolve => { started = resolve })
+  const result = fetchKimiUsage('fixture', { signal: controller.signal, fetchImplementation: async () => new Response(new ReadableStream({ pull() { started() }, cancel() { cancelled++ } })) })
+  await ready
+  controller.abort(new Error('stop usage'))
+  await expect(result).rejects.toThrow('stop usage')
+  expect(cancelled).toBe(1)
+})
+
+test('real usage fetch refuses redirects before a second endpoint receives credentials', async () => {
+  let targetRequests = 0
+  const target = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => { targetRequests++; return Response.json({ usages: [] }) } })
+  const source = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.redirect(target.url, 302) })
+  try {
+    await expect(fetchKimiUsage('fixture-secret', { environment: { XERXES_KIMI_USAGE_URL: String(source.url) } })).rejects.toThrow()
+    expect(targetRequests).toBe(0)
+  } finally { source.stop(true); target.stop(true) }
+})
+
+test('usage rejects oversized content length and invalid UTF-8 without parsing partial data', async () => {
+  let cancelled = 0
+  await expect(fetchKimiUsage('fixture', { fetchImplementation: async () => new Response(new ReadableStream({ cancel() { cancelled++ } }), { headers: { 'content-length': '262145' } }) })).rejects.toThrow('size limit')
+  expect(cancelled).toBe(1)
+  await expect(fetchKimiUsage('fixture', { fetchImplementation: async () => new Response(new Uint8Array([0xff])) })).rejects.toThrow()
+})

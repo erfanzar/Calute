@@ -1,6 +1,7 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { chargeModelCall, ModelCallBudgetError, ModelTokenBudgetError, ModelUsageCheckpointError } from '../llms/callBudget.js'
 import {
   isScreenshotToolResult,
   supersedeScreenshotToolResults,
@@ -497,7 +498,11 @@ export async function* runTurn(
         finishReason = undefined
         textDeduper = new ToolRoundTextDeduper(latestToolRoundText)
         const attemptSignal = linkAttemptSignal(signal)
+        let recordUsage: ReturnType<typeof chargeModelCall>
+        let attemptCompleted = false
         try {
+          attemptSignal.controller.signal.throwIfAborted()
+          recordUsage = chargeModelCall()
           apiCallsCount += 1
           roundStartedAt = now()
           roundFirstOutputAt = undefined
@@ -569,6 +574,7 @@ export async function* runTurn(
           }
           roundCompletedAt = now()
           streamCompleted = true
+          attemptCompleted = true
           break
         } catch (error) {
           // A failed provider attempt may have consumed tokens without returning
@@ -614,6 +620,9 @@ export async function* runTurn(
           // Only transient failures earn another attempt. Auth, validation,
           // configuration, and other terminal errors fail the round at once.
           const final = attempt === retryDelays.length
+            || error instanceof ModelCallBudgetError
+            || error instanceof ModelTokenBudgetError
+            || error instanceof ModelUsageCheckpointError
             || !classified.retryable
             || signal?.aborted === true
           const suggestedDelay = classified.suggestedBackoffSeconds === undefined
@@ -658,7 +667,8 @@ export async function* runTurn(
           }
           await (dependencies.delay ?? defaultDelay)(delay, signal)
         } finally {
-          attemptSignal.release()
+          try { recordUsage?.(lastUsage, attemptCompleted) }
+          finally { attemptSignal.release() }
         }
       }
 
@@ -1042,9 +1052,26 @@ export async function* runTurn(
           // record handed to every handler, safe until now only because
           // execution was serial. A lone call keeps the shared object so a
           // single-tool round behaves exactly as it always has.
-          const memberContext = group.length === 1
+          let memberContext = group.length === 1
             ? toolContext
             : { ...toolContext, metadata: { ...toolContext.metadata } }
+          const metadataWrites = new Set<PropertyKey>()
+          if (group.length > 1) {
+            memberContext = { ...memberContext, metadata: new Proxy(memberContext.metadata, {
+              set(target, key, value) {
+                metadataWrites.add(key)
+                return Reflect.set(target, key, value)
+              },
+              deleteProperty(target, key) {
+                metadataWrites.add(key)
+                return Reflect.deleteProperty(target, key)
+              },
+              defineProperty(target, key, descriptor) {
+                metadataWrites.add(key)
+                return Reflect.defineProperty(target, key, descriptor)
+              },
+            }) }
+          }
           const memberSignal = capabilitiesFor(dependencies, request, effectiveCall)
             .interruptBehavior === 'block'
             ? undefined
@@ -1054,16 +1081,24 @@ export async function* runTurn(
             const output = dependencies.toolExecutor
               ? await dependencies.toolExecutor.execute(effectiveCall, memberContext, memberSignal)
               : `Tool ${effectiveCall.function.name} is unavailable.`
-            return { context: memberContext, member, output, startedAt }
+            return { kind: 'success' as const, context: memberContext, metadataWrites, member, output, startedAt }
           } catch (error) {
-            return { context: memberContext, error, member, startedAt }
+            return { kind: 'failure' as const, context: memberContext, metadataWrites, error, member, startedAt }
           }
         }))
         if (group.length > 1) {
-          // Ordered merge, so two members writing the same key resolve the way
-          // a serial round would have: the later block wins.
+          // Replay actual top-level mutations, including deletion and writing
+          // the original value. Copying the whole snapshot would undo earlier
+          // siblings' writes to keys a later member never touched.
           for (const outcome of outcomes) {
-            if (outcome) Object.assign(toolContext.metadata, outcome.context.metadata)
+            if (!outcome) continue
+            for (const key of outcome.metadataWrites) {
+              if (Object.hasOwn(outcome.context.metadata, key)) {
+                Reflect.set(toolContext.metadata, key, Reflect.get(outcome.context.metadata, key))
+              } else {
+                Reflect.deleteProperty(toolContext.metadata, key)
+              }
+            }
           }
         }
         for (const [member, decision] of group.entries()) {
@@ -1087,7 +1122,7 @@ export async function* runTurn(
           }
           const effectiveCall = decision.effectiveCall
           const outcome = outcomes[member]
-          if (!outcome || outcome.error !== undefined) {
+          if (!outcome || outcome.kind === 'failure') {
             const result = await recordToolResult(
               failedToolResult(effectiveCall, outcome?.error, performance.now() - (outcome?.startedAt ?? 0)),
               effectiveCall,
@@ -1732,16 +1767,13 @@ function linkAttemptSignal(signal: AbortSignal | undefined): AttemptSignal {
  * Wrap provider iteration with an inactivity watchdog. The timer only exists
  * while waiting for the next chunk, so it cannot fire during tool execution,
  * and it is cleared on completion, error, and consumer-close paths.
+ * Disabling the timer does not disable cancellation of an unresponsive stream.
  */
 async function* watchProviderStream(
   stream: AsyncIterable<LlmDelta>,
   timeoutMs: number,
   attempt: AttemptSignal,
 ): AsyncGenerator<LlmDelta> {
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    yield* stream
-    return
-  }
   const iterator = stream[Symbol.asyncIterator]()
   try {
     while (true) {
@@ -1771,6 +1803,7 @@ async function nextDeltaWithTimeout(
     return await Promise.race([
       pending,
       new Promise<never>((_, reject) => {
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return
         timer = setTimeout(() => {
           const error = new StreamInactivityError(timeoutMs)
           attempt.controller.abort(error)

@@ -158,7 +158,7 @@ describe('DiffPanelOverlay', () => {
       const frame = setup.captureCharFrame()
       // The header names the base and what it points at — "12 files changed"
       // means nothing until you know changed against what.
-      expect(frame).toContain('working tree')
+      expect(frame).toContain('Working changes')
       expect(frame).toContain('vs HEAD')
       expect(frame).toContain('+1')
       expect(frame).toContain('−1')
@@ -176,6 +176,25 @@ describe('DiffPanelOverlay', () => {
     } finally {
       act(() => setup.renderer.destroy())
     }
+  })
+
+  it('reveals long code with horizontal scrolling without clipping its contents', async () => {
+    activeDiffResult = { ...DIFF_RESULT, diff: { ...DIFF_RESULT.diff, lines: [
+      { kind: 'file', text: 'src/long.ts' },
+      { kind: 'add', newLine: 1, text: '+' + 'x'.repeat(110) + 'END_OF_CODE' }
+    ] } }
+    const setup = await testRender(<DiffPanelOverlay onClose={() => {}} t={DEFAULT_THEME} />, { width: 80, height: 24 })
+    try {
+      await act(async () => { await Bun.sleep(10) })
+      await setup.flush()
+      expect(setup.captureCharFrame()).not.toContain('END_OF_CODE')
+      await act(async () => { for (let i = 0; i < 12; i++) setup.mockInput.pressArrow('right') })
+      await setup.flush()
+      expect(setup.captureCharFrame()).toContain('END_OF_CODE')
+      await act(async () => { for (let i = 0; i < 12; i++) setup.mockInput.pressArrow('left') })
+      await setup.flush()
+      expect(setup.captureCharFrame()).toContain('src/long.ts')
+    } finally { act(() => setup.renderer.destroy()) }
   })
 
   it('resizes the shared panel width with Shift+Ctrl+Left/Right', async () => {

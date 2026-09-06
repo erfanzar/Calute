@@ -108,6 +108,9 @@ export function permissionDisposition(
   if (ALWAYS_APPROVAL_TOOLS.has(name) && options?.bypassAlwaysApprove !== true) {
     return 'prompt'
   }
+  if (name === 'manage_schedule'
+    && ['create', 'update', 'resume', 'run'].includes(stringInput(call.function.arguments, 'action') ?? '')
+    && options?.bypassAlwaysApprove !== true) return 'prompt'
   // Creator mode mutates a durable, version-immutable package catalog. Reads
   // and pure template runs stay lightweight, but define/undefine must cross an
   // explicit approval boundary even when the session otherwise runs in YOLO.

@@ -23,7 +23,7 @@ document records the remaining unsupported control surfaces for that path.
 - `spawn_tree.save`, `spawn_tree.list`, `spawn_tree.load`: needs persisted spawn-tree endpoints.
 - `process.stop`: needs targeted long-running process control endpoint.
 - `reload.mcp`, `reload.env`: needs explicit MCP/env reload endpoints.
-- `rollback.list`, `rollback.diff`, `rollback.restore`: needs rollback/snapshot RPCs.
+- `rollback.list`, `rollback.diff`, `rollback.restore`: legacy RPC names remain unsupported; native slash supports /snapshots, /rollback diff <id>, and /rollback <id>.
 - `tools.configure`: needs runtime tool allow/deny configuration RPCs.
 - `model.disconnect`, `model.save_key`: needs provider credential management RPCs.
 

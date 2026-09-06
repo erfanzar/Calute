@@ -108,3 +108,24 @@ test('daemon interaction board can use an explicit persistent approval store wit
   expect(repeated).toBe('approve')
   expect(board.pendingPermissionIds()).toEqual([])
 })
+
+test('attention summaries are session scoped, omit arguments and disappear after cancellation or response', async () => {
+  const board = new DaemonInteractionBoard()
+  const controller = new AbortController()
+  const release = board.bind('owner', () => {})
+  try {
+    const permission = board.permissionBroker('owner').request({ requestId: 'approval', description: 'Write report', inputs: { secret: 'not-for-summary' },
+      toolCall: { id: 'call', type: 'function', function: { name: 'WriteFile', arguments: { secret: 'not-for-summary' } } } }, controller.signal)
+    const answer = board.ask('owner', { question: 'Which report?' })
+    expect(board.pendingAttention('other')).toEqual([])
+    const summary = board.pendingAttention('owner')
+    expect(summary.map(row => row.kind)).toEqual(['approval', 'question'])
+    expect(JSON.stringify(summary)).not.toContain('not-for-summary')
+    controller.abort()
+    await permission
+    expect(board.pendingAttention('owner')).toHaveLength(1)
+    board.respondQuestion(summary[1]!.id, { answer: 'Daily' })
+    await expect(answer).resolves.toBe('Daily')
+    expect(board.pendingAttention('owner')).toEqual([])
+  } finally { release() }
+})

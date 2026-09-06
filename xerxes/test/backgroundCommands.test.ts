@@ -9,7 +9,8 @@ import { join } from 'node:path'
 import { BackgroundCommandManager } from '../src/tools/backgroundCommands.js'
 import { BoundedOutputBuffer } from '../src/tools/processOutput.js'
 import { ProcessRegistry } from '../src/runtime/processRegistry.js'
-import type { TerminalRegistry } from '../src/runtime/terminalRegistry.js'
+import { TerminalRegistry, type TerminalHandle } from '../src/runtime/terminalRegistry.js'
+import { RunHistory, type RunRecord } from '../src/runtime/runHistory.js'
 import { ValidationError } from '../src/core/errors.js'
 import { ToolRegistry } from '../src/executors/toolRegistry.js'
 import type { JsonObject, ToolCall } from '../src/types/toolCalls.js'
@@ -453,5 +454,111 @@ test('startForOwner kills the child when the terminal mirror cannot be opened', 
     // And the spawned tree was killed, not left running detached forever.
     await Bun.sleep(300)
     expect(await logIsStill(logPath, 800)).toBeTrue()
+  })
+})
+
+test.each([false, true])('completion waits for adopted output drains (pipe remains open: %s)', async heldOpen => {
+  await inTemporaryWorkspace(async root => {
+    const history = new RunHistory(join(root, 'runs.sqlite'))
+    const completed: RunRecord[] = []
+    const terminals = new TerminalRegistry({ runHistory: history, onRunComplete: run => completed.push(run) })
+    const manager = new BackgroundCommandManager(undefined, terminals)
+    const child = Bun.spawn([process.execPath, '-e', ''], { cwd: root, stdout: 'ignore', stderr: 'ignore' })
+    let finishDrain!: () => void
+    let cancelled = false
+    let mirror: TerminalHandle | undefined
+    const done = new Promise<void>(resolve => { finishDrain = resolve })
+    try {
+      manager.adoptForOwner('owner', {
+        child, command: ['fixture'], cwd: root,
+        stdout: new BoundedOutputBuffer(), stderr: new BoundedOutputBuffer(),
+        drains: [{ done, cancel: () => { cancelled = true; finishDrain() } }],
+      }, terminal => { mirror = terminal })
+      await child.exited
+      await Bun.sleep(20)
+      expect(completed).toHaveLength(0)
+      mirror?.append('final stdout\nfinal stderr\n')
+      if (!heldOpen) finishDrain()
+      const deadline = Date.now() + 2_000
+      while (completed.length === 0 && Date.now() < deadline) await Bun.sleep(10)
+      expect(completed).toHaveLength(1)
+      expect(completed[0]?.output).toContain('final stdout\nfinal stderr\n')
+      expect(completed[0]?.state).toBe('succeeded')
+      expect(cancelled).toBe(heldOpen)
+      expect(completed[0]?.output.includes('output pipes remained open')).toBe(heldOpen)
+      const restored = new RunHistory(join(root, 'runs.sqlite'))
+      try { expect(restored.inspect('owner', completed[0]!.id)?.output).toBe(completed[0]!.output) }
+      finally { restored.close() }
+      await manager.disposeAll()
+      expect(completed).toHaveLength(1)
+    } finally {
+      finishDrain()
+      await manager.disposeAll()
+      history.close()
+    }
+  })
+})
+
+test('incremental output tool preserves independent readers and requires the owning session', async () => {
+  await inTemporaryWorkspace(async (root, paths) => {
+    const terminals = new TerminalRegistry()
+    const handle = terminals.open({ ownerSessionId: 'owner', id: 'shell', cwd: root, kind: 'background', command: 'test' })
+    handle.append('one two')
+    handle.close(0)
+    const tools = new ToolRegistry()
+    registerProcessTools(tools, paths, undefined, terminals)
+    const request = call('read_terminal_output', { terminal_id: 'shell', max_output_chars: 3 })
+    const first = JSON.parse(await tools.execute(request, { sessionId: 'owner', metadata: {} }))
+    expect(first.text).toBe('one')
+    const next = JSON.parse(await tools.execute(call('read_terminal_output', { terminal_id: 'shell', cursor: first.cursor }), { sessionId: 'owner', metadata: {} }))
+    expect(next.text).toBe(' two')
+    expect(JSON.parse(await tools.execute(request, { sessionId: 'owner', metadata: {} })).text).toBe('one')
+    await expect(tools.execute(request, { sessionId: 'other', metadata: {} })).rejects.toThrow('Unknown terminal')
+  })
+})
+
+test.skipIf(process.platform === 'win32')('background stop reaps helpers forked by a TERM handler before the leader exits', async () => {
+  await inTemporaryWorkspace(async root => {
+    const logPath = join(root, 'late-ticks.log')
+    const scriptPath = join(root, 'late-stop.sh')
+    await Bun.write(scriptPath,
+      `trap '(trap "" TERM; while :; do echo tick >> "${logPath}"; sleep 0.05; done) & exit 0' TERM\n` +
+      'echo ready\nwhile :; do :; done\n')
+    const background = new BackgroundCommandManager()
+    const started = background.startForOwner('owner', { command: '/bin/sh', args: [scriptPath], cwd: root })
+    try {
+      let ready = false
+      for (let attempt = 0; attempt < 50 && !ready; attempt++) {
+        ready = (await background.checkForOwner('owner', started.procId, 1000, 10)).stdout.includes('ready')
+      }
+      expect(ready).toBe(true)
+      expect((await background.killForOwner('owner', started.procId)).signalled).toBe(true)
+      await Bun.sleep(100)
+      expect(await logIsStill(logPath, 300)).toBe(true)
+    } finally { await background.disposeAll() }
+  })
+})
+
+test('an unconfirmed stop retains the process and terminal for a later retry', async () => {
+  class DeniedSignalRegistry extends ProcessRegistry {
+    deny = true
+    override signal(id: string, signal: Parameters<ProcessRegistry['signal']>[1]): boolean {
+      return this.deny ? false : super.signal(id, signal)
+    }
+  }
+  await inTemporaryWorkspace(async root => {
+    const registry = new DeniedSignalRegistry()
+    const terminals = new TerminalRegistry()
+    const manager = new BackgroundCommandManager(registry, terminals)
+    const started = manager.startForOwner('owner', { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], cwd: root })
+    try {
+      await expect(manager.killForOwner('owner', started.procId)).rejects.toThrow('handle is retained')
+      expect(manager.listForOwner('owner')).toHaveLength(1)
+      expect(terminals.inspect('owner', started.procId)).toMatchObject({ running: true, canKill: true })
+      registry.deny = false
+      await manager.killForOwner('owner', started.procId, 'SIGKILL')
+      expect(manager.listForOwner('owner')).toHaveLength(0)
+      expect(terminals.inspect('owner', started.procId)?.running).toBe(false)
+    } finally { registry.deny = false; await manager.disposeAll() }
   })
 })

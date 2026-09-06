@@ -17,13 +17,14 @@ import { registerFileTools } from './fileTools.js'
 import { registerHomeAssistantTools, type HomeAssistantToolsOptions } from './homeAssistantTools.js'
 import { registerGenerateImageTool, type GenerateImageToolOptions } from './imageGen.js'
 import { registerSearchHistoryTool, type SearchHistoryTool } from './history.js'
+import { registerModelInventoryTool, type ModelInventoryHost } from './modelInventoryTools.js'
 import { registerMathTools } from './mathTools.js'
 import { registerMediaTools, type MediaToolPorts } from './mediaTools.js'
 import { registerMemoryTools, type MemoryToolsOptions } from './memoryTools.js'
 import { WorkspacePathResolver } from './pathSafety.js'
 import type { BackgroundCommandManager } from './backgroundCommands.js'
 import type { PtySessionManager } from '../operators/pty.js'
-import { registerProcessTools } from './processTools.js'
+import { registerProcessTools, type CommandCompletionWatch } from './processTools.js'
 import { registerPtyTools } from './ptyTools.js'
 import { registerRlTools, type RLToolsOptions } from './rlTools.js'
 import { registerSendMessageTool, type SendMessageToolOptions } from './sendMessage.js'
@@ -54,6 +55,7 @@ export * from './history.js'
 export * from './homeAssistantTools.js'
 export * from './imageGen.js'
 export * from './imageGeneration.js'
+export * from './modelInventoryTools.js'
 export * from './mathTools.js'
 export * from './mediaHttp.js'
 export * from './mediaTools.js'
@@ -73,6 +75,8 @@ export * from './workspaceMemory.js'
 export * from './workspaceTools.js'
 
 export interface CoreToolsOptions {
+  /** Host-owned provider inventory; never read another application's credentials implicitly. */
+  readonly modelInventory?: ModelInventoryHost
   /** Persistent memory is host/session scoped and is registered only when supplied. */
   readonly agentMemoryTools?: AgentMemoryToolsOptions
   /** Agent orchestration, session search, and skill ports are host-owned and opt-in. */
@@ -111,6 +115,7 @@ export interface CoreToolsOptions {
    * Purely observational: the mirror is written to as output flows to the model
    * and is never drained, so attaching one cannot change what a tool returns.
    */
+  readonly completionWatch?: CommandCompletionWatch
   readonly terminals?: TerminalRegistry
   readonly includeSystemTools?: boolean
   /** Safe public HTTP tools; enabled by default and independently permission-gated. */
@@ -142,6 +147,8 @@ export interface CoreToolsOptions {
   /** Workspace MEMORY.md/USER.md CRUD is opt-in for hosts that own a markdown workspace. */
   readonly workspaceMemoryTools?: WorkspaceMemoryToolsOptions
   readonly workspaceRoot?: string
+  /** Trusted host resolver for concurrent sessions sharing one tool registry. */
+  readonly activeWorkspaceRoot?: () => string | undefined
 }
 
 /**
@@ -158,7 +165,8 @@ export function registerCoreTools(registry: ToolRegistry, options: CoreToolsOpti
       'agentMetaTools and skillManageTools both register skill_manage; configure one skill-management surface',
     )
   }
-  const paths = new WorkspacePathResolver(options.workspaceRoot ?? process.cwd())
+  if (options.modelInventory) registerModelInventoryTool(registry, options.modelInventory)
+  const paths = new WorkspacePathResolver(options.workspaceRoot ?? process.cwd(), options.activeWorkspaceRoot)
   registerFileTools(registry, paths)
   if (options.includeAiTools ?? true) {
     registerAiTools(registry, options.aiTools ?? {})
@@ -173,7 +181,7 @@ export function registerCoreTools(registry: ToolRegistry, options: CoreToolsOpti
     registerMathTools(registry)
   }
   if (options.includeProcessTools ?? true) {
-    registerProcessTools(registry, paths, options.backgroundCommands, options.terminals)
+    registerProcessTools(registry, paths, options.backgroundCommands, options.terminals, options.completionWatch)
     if (options.ptySessions !== undefined) {
       registerPtyTools(registry, options.ptySessions)
     }

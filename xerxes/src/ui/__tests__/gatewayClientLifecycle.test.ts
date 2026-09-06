@@ -248,6 +248,7 @@ describe('GatewayClient session lifecycle', () => {
           ok: true,
           session: {
             context_limit: 262_144,
+            todos: [{ id: 'todo-1', content: 'Restored task', status: 'completed' }],
             context_tokens: 65_536,
             id: 'tab-b',
             key: 'daemon:key-b',
@@ -302,6 +303,7 @@ describe('GatewayClient session lifecycle', () => {
         ttft_total_ms: 192_100
       }
     })
+    expect(activation).toMatchObject({ todos: [{ id: 'todo-1', content: 'Restored task', status: 'completed' }] })
     expect(calls.slice(1)).toEqual([
       { method: 'session.status', params: { session_key: 'daemon:key-b' } },
       {

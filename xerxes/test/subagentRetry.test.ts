@@ -532,3 +532,41 @@ test('daemon socket reports honestly when the runtime has no subagent retry port
     await rm(directory, { force: true, recursive: true })
   }
 })
+
+test.each([false, true])('cancelling retry allocation never starts another runner (cooperative=%s)', async cooperative => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+  let allocations = 0, runs = 0
+  let signal: AbortSignal | undefined
+  const removed: string[] = []
+  const manager = new SubAgentManager({
+    worktree: {
+      async create(request) {
+        allocations++
+        if (allocations > 1) {
+          signal = request.signal; entered.resolve(); await release.promise
+          if (cooperative) signal?.throwIfAborted()
+        }
+        return { path: '/fixture/' + allocations, branch: 'fixture/' + allocations }
+      },
+      async isClean() { return true },
+      async remove(tree) { removed.push(tree.path) },
+    },
+    runner: async () => { runs++; return 'done' },
+  })
+  try {
+    const task = await manager.spawn({ name: 'retry-cancel', prompt: 'work', isolation: 'worktree' })
+    await manager.wait(task.id, 1000)
+    const retry = manager.retry(task.id)
+    await entered.promise
+    expect(manager.cancel(task.id)).toBe(true)
+    expect(signal?.aborted).toBe(true)
+    await manager.retry(task.id)
+    expect(allocations).toBe(2)
+    expect(runs).toBe(1)
+    release.resolve()
+    await retry
+    expect(task.status).toBe('cancelled')
+    expect(runs).toBe(1)
+    if (!cooperative) expect(removed).toContain('/fixture/2')
+  } finally { release.resolve(); await manager.close() }
+})

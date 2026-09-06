@@ -81,16 +81,16 @@ describe('groupToolRun', () => {
   it('reports a collapsed height the estimator can trust', () => {
     const folded = groupToolRun(Array.from({ length: 6 }, (_, i) => ok('read_file', `f${i}.ts`, 0.2)))
 
-    // Summary row plus the surviving slowest-call row.
-    expect(collapsedRunHeight(folded[0]!)).toBe(2)
+    // A successful run is one summary row.
+    expect(collapsedRunHeight(folded[0]!)).toBe(1)
     const fleet = groupToolRun([
       ok('read_file', 'a.ts', 0.1),
       ok('spawn_agents', '2 agents: structure, security', 4),
       ok('task_list', '', 0.1),
       ok('read_file', 'b.ts', 0.1)
     ])
-    // Summary + slowest + one row per visible fleet member.
-    expect(collapsedRunHeight(fleet[0]!)).toBe(4)
+    // Summary + one row per visible fleet member.
+    expect(collapsedRunHeight(fleet[0]!)).toBe(3)
     expect(collapsedRunHeight({ kind: 'row', line: 'x' })).toBe(1)
   })
 })

@@ -9,7 +9,7 @@ import { act, useState } from 'react'
 import { describe, expect, it } from 'vitest'
 
 import { VOICE } from '../domain/roles.js'
-import { MessageLine, StreamingMarkdown } from '../opentui/messageLine.js'
+import { AssistantFrame, MessageLine, StreamingMarkdown } from '../opentui/messageLine.js'
 import { Text } from '../opentui/primitives.js'
 import { DEFAULT_THEME, themeForMode } from '../theme.js'
 
@@ -45,24 +45,7 @@ const settle = async (setup: Setup, marker: string): Promise<string> => {
 // redesign's turn-opening ✦ column (rail gutter + glyph + blank before the
 // prose), mirroring opentui/messageLine.tsx AssistantMessage exactly.
 function StreamingBlock({ text }: { text: string }) {
-  const assistantVoice = VOICE.assistant(theme)
-
-  return (
-    <box flexDirection="column" flexShrink={0}>
-      <box flexDirection="row" flexShrink={0}>
-        <box flexShrink={0} width={1} />
-        <box flexShrink={0} width={1}>
-          {assistantVoice.glyph ? (
-            <Text color={assistantVoice.glyphColor}>{assistantVoice.glyph}</Text>
-          ) : null}
-        </box>
-        <box flexShrink={0} width={1} />
-        <box flexDirection="column" flexGrow={1} minWidth={0}>
-          <StreamingMarkdown text={text} t={theme} />
-        </box>
-      </box>
-    </box>
-  )
+  return <AssistantFrame t={theme}><StreamingMarkdown text={text} t={theme} /></AssistantFrame>
 }
 
 describe('StreamingMarkdown', () => {

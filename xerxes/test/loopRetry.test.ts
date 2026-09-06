@@ -654,3 +654,30 @@ test('a terminal provider failure reports provider_failed rather than a context 
 
   expect(events.at(-1)).toMatchObject({ type: 'turn_done', reason: 'provider_failed' })
 })
+
+test.each([0, -1, Number.POSITIVE_INFINITY, Number.NaN])('cancellation remains responsive with watchdog disabled (%s)', async timeout => {
+  const controller = new AbortController()
+  let started!: () => void
+  let release!: () => void
+  const waiting = new Promise<void>(resolve => { started = resolve })
+  const blocked = new Promise<void>(resolve => { release = resolve })
+  const events: StreamEvent[] = []
+  const pending = collect(runTurn(
+    { model: 'm', state: createAgentState(), userMessage: 'go' },
+    { llm: { async *stream() { started(); await blocked; yield { content: 'too late' } } }, streamInactivityTimeoutMs: timeout, retryDelays: [] },
+    controller.signal,
+  )).then(result => { events.push(...result); return 'finished' })
+  await waiting
+  controller.abort(new Error('user cancelled'))
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const result = await Promise.race([pending, new Promise<string>(resolve => { timer = setTimeout(() => resolve('stuck'), 100) })])
+    expect(result).toBe('finished')
+    expect(events.at(-1)).toMatchObject({ type: 'turn_done', reason: 'aborted' })
+    expect(events.some(event => event.type === 'text' && event.text.includes('too late'))).toBe(false)
+  } finally {
+    clearTimeout(timer)
+    release()
+    await pending
+  }
+})

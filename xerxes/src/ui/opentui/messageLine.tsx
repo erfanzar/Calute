@@ -15,15 +15,15 @@ import {
   thinkingRowExpanded,
   toggleThinkingRow
 } from '../app/thinkingVisibilityStore.js'
+import { patchOverlayState } from '../app/overlayStore.js'
 import { $spawnHistory, spawnHistoryForSession } from '../app/spawnHistoryStore.js'
 import { $toolRunVisibility, toggleToolRun, toolRunExpanded } from '../app/toolRunStore.js'
 import { $toolStepVisibility, toggleToolStep, toolStepExpanded } from '../app/toolStepStore.js'
 import { $uiDetailVisibility, $uiState } from '../app/uiStore.js'
 import { useTurnSelector } from '../app/turnStore.js'
 import { sectionMode } from '../domain/details.js'
-import { GLYPH, leaderRun } from '../domain/nocturne.js'
+import { GLYPH } from '../domain/nocturne.js'
 import { VOICE } from '../domain/roles.js'
-import { contentColumnWidth } from '../domain/startupLayout.js'
 import { messageHasVisibleDetails, trailHasRenderableContent } from '../lib/liveProgress.js'
 import { spawnRosterFromLine } from '../lib/toolStartDisplay.js'
 import { subagentCardAccent, subagentCardModel } from '../lib/subagentCards.js'
@@ -31,7 +31,6 @@ import { fmtDuration, subagentElapsedSeconds } from '../lib/subagentElapsed.js'
 import { groupToolRun, toolRunSpawnRoster, type ToolRunGroup } from '../lib/toolRun.js'
 import { estimateTokensRough, fmtK, parseToolTrailResultLine, toolTrailParts } from '../lib/text.js'
 import { splitStreamingRender, STREAMING_CHUNKS_EMPTY, type StreamingChunks } from '../lib/streamingMarkdown.js'
-import { stringWidth } from '../lib/terminalRuntime.opentui.js'
 import type { Theme } from '../theme.js'
 import type { Msg, SubagentProgress } from '../types.js'
 
@@ -114,6 +113,7 @@ function UserMessage({ msg, t }: { msg: Msg; t: Theme }) {
         flexGrow={1}
         paddingLeft={1}
         paddingRight={1}
+        paddingY={1}
       >
         <Box flexShrink={0}>
           <Text color={VOICE.user(t).bar}>{`${GLYPH.prompt} `}</Text>
@@ -128,48 +128,18 @@ function UserMessage({ msg, t }: { msg: Msg; t: Theme }) {
   )
 }
 
-/**
- * The small ✦ that opens an assistant turn (anatomy element ②). It lives in
- * the first column of the body indent and renders ONCE — the dim turn rail
- * beside it still spans every row of a multi-paragraph answer.
- */
-function TurnGlyph({ t }: { t: Theme }) {
-  const voice = VOICE.assistant(t)
-
+/** Shared live/settled message layout, matching the design's author and body rows. */
+export function AssistantFrame({children, leadGap, t}: {children: ReactNode; leadGap?: boolean; t: Theme}) {
   return (
-    <Box flexShrink={0} width={1}>
-      {voice.glyph ? <Text color={voice.glyphColor}>{voice.glyph}</Text> : null}
+    <Box flexDirection="column" flexShrink={0} marginTop={leadGap ? 1 : 0}>
+      <Text bold color={t.ds.title}><Span color={t.color.accent}>✦ </Span>Xerxes</Text>
+      <Box flexDirection="column" paddingLeft={3} minWidth={0}>{children}</Box>
     </Box>
   )
 }
 
-function AssistantMessage({
-  leadGap,
-  msg,
-  rail,
-  t
-}: {
-  leadGap?: boolean
-  msg: Msg
-  rail?: TurnRail
-  t: Theme
-}) {
-  // The rail replaces the old flat `paddingLeft={3}` with bar(1) + gap(2), so
-  // the content width is unchanged and no wrapped line moves. That is what
-  // keeps this a purely visual change as far as the height estimator is
-  // concerned. The redesign's ✦ (element ②) takes over the first of those two
-  // gap columns — glyph(1) + blank(1) — so the prose still starts at exactly
-  // the x-offset the wrap estimator predicts and no line ever reflows.
-  return (
-    <Box flexDirection="row" flexShrink={0} marginTop={leadGap ? 1 : 0}>
-      <RailGutter rail={rail} t={t} />
-      <TurnGlyph t={t} />
-      <Box flexShrink={0} width={1} />
-      <Box flexDirection="column" flexGrow={1} minWidth={0}>
-        <Markdown content={msg.text} t={t} />
-      </Box>
-    </Box>
-  )
+function AssistantMessage({leadGap, msg, t}: {leadGap?: boolean; msg: Msg; rail?: TurnRail; t: Theme}) {
+  return <AssistantFrame leadGap={leadGap} t={t}><Markdown content={msg.text} t={t} /></AssistantFrame>
 }
 
 export type TurnRail = 'end' | 'mid' | 'none'
@@ -323,40 +293,6 @@ function toolDetailColor(line: string, diagnostic: boolean, t: Theme): string {
 }
 
 /**
- * Dotted leader between a tool call and its right-aligned cost.
- *
- * `cols` is the terminal width, the same measure `contentColumnWidth` caps
- * the reading column with, minus the rail gutter (1) and the trail padding
- * (2). `Bun.stringWidth` is exact for the mono grid, so when every part fits
- * the duration lands flush at the column edge; when the arguments are too
- * long the dots simply disappear (count < 2) or get truncated first by
- * `truncate-end`, which is exactly how the row behaved before leaders.
- */
-export function toolLeaderDots(
-  parts: { readonly args: string; readonly duration: string; readonly glyph: string; readonly mark: string; readonly name: string },
-  cols: number | undefined
-): string {
-  if (cols === undefined) {
-    return ''
-  }
-
-  const available = contentColumnWidth(cols) - 3
-  const used =
-    stringWidth(`${parts.glyph} ${parts.name}`) +
-    (parts.args ? stringWidth(`  ${parts.args}`) : 0) +
-    (parts.duration ? stringWidth(`  ${parts.duration}`) : 0) +
-    (parts.mark ? stringWidth(` ${parts.mark}`) : 0)
-  // The run stops a few columns shy of the edge on purpose: the leading
-  // separator space plus a 4-column safety margin absorbs ambiguous-width
-  // glyphs (`→` measures 1 cell but some terminals ink 2) and scrollbar
-  // gutters, so the duration is never pushed off the line. `truncate-end`
-  // remains the backstop.
-  const count = available - used - 5
-
-  return count >= 2 ? ` ${'·'.repeat(count)}` : ''
-}
-
-/**
  * Quiet, read-only calls tint their outcome glyph faint instead of ok-green
  * (anatomy element ④: dim=read, green=ok, red=fail) so a wall of reads never
  * masquerades as a wall of wins. Classified from the call's leading verb —
@@ -389,24 +325,6 @@ const fleetRowState = (entry: SubagentProgress | undefined): FleetRowState => {
   if (entry.status === 'completed') return 'done'
   if (entry.status === 'error' || entry.status === 'failed' || entry.status === 'interrupted' || entry.status === 'timeout') return 'failed'
   return 'working'
-}
-
-const cleanFleetActivity = (value: string | undefined): string =>
-  value?.replace(/\s+/g, ' ').trim() ?? ''
-
-/** The freshest human-readable answer to “what is this agent doing?” */
-function fleetActivity(entry: SubagentProgress | undefined, state: FleetRowState): string {
-  if (!entry) return 'queued'
-  const live = cleanFleetActivity(entry.notes.at(-1))
-    || cleanFleetActivity(entry.tools.at(-1))
-    || cleanFleetActivity(entry.thinking.at(-1))
-  const summary = cleanFleetActivity(entry.summary)
-  if (state === 'working') {
-    return live || summary || (entry.status === 'queued' ? 'waiting to start' : 'working')
-  }
-  const status = state === 'done' ? 'completed' : entry.status
-  const result = summary || live
-  return result ? `${status} — ${result}` : status
 }
 
 /**
@@ -481,13 +399,16 @@ export function SpawnFleetRoster({
           : ''
         const timing = elapsed === null ? '' : ` [${fmtDuration(elapsed)}]`
         const tokenText = tokens ? ` · ${tokens} tok` : ''
-        const activity = fleetActivity(entry, state)
+        const activity = entry?.status ?? 'queued'
         return (
-          <Text key={name} wrap="truncate-end">
+          <Box key={name} backgroundColor={t.color.statusBg} borderSides={['left']} borderColor={color}
+            onClick={entry ? () => patchOverlayState({ agents: true, agentsInspectId: entry.id }) : undefined}>
+          <Text wrap="truncate-end">
             <Span color={color}>{`  ${glyph} `}</Span>
             <Span bold color={t.ds.title}>{label}</Span>
-            <Span color={t.color.muted}>{`: ${activity}${timing}${tokenText}`}</Span>
+            <Span color={t.color.muted}>{`  · ${activity}${timing}${tokenText} · ${entry?.toolCount ?? 0} tools`}</Span>
           </Text>
+          </Box>
         )
       })}
     </Box>
@@ -544,7 +465,6 @@ function ToolStep({
   // eye reaches any words. The name stays lapis either way.
   const quiet = !failed && isQuietToolName(name)
   const outcomeColor = failed ? t.color.error : quiet ? t.color.muted : t.color.ok
-  const dots = toolLeaderDots({ args, duration: duration ?? '', glyph: voice.glyph, mark: parsed.mark ?? '', name }, cols)
   const mark = parsed.mark
 
   // Expandable detail: the step id is stable for the message's lifetime so
@@ -560,18 +480,6 @@ function ToolStep({
 
   return (
     <Box flexDirection="column" flexShrink={0}>
-      {/* One line, styled by part: tinted ⏺, lapis name, receding arguments,
-          then the ✓/✗ verdict right after the summary — mockup row shape
-          "⏺ Bash bun test … ✓ 42 pass ·· 1.8s" — before the dotted leader
-          carries the eye to the duration at the column edge. Every segment's
-          width is already counted by toolLeaderDots, so reordering the mark
-          ahead of the leader changes no column math. */}
-      {/* Nocturne's leader row, part by part: the disc carries the verdict,
-          the VERB sits on the ramp's secondary step, the TARGET on `title`,
-          and the duration hangs right on `numeric` so a column of tool rows
-          reads vertically as durations without reading the rows at all. The
-          verb and the disc were the same colour until the ramp was assigned
-          by role; they are different jobs and now different steps. */}
       <Box flexShrink={0} onClick={() => toggleToolStep(stepId)}>
         <Text color={voice.body} wrap="truncate-end">
           <Span color={t.color.muted}>{expanded ? '▾' : '▸'} </Span>
@@ -588,7 +496,7 @@ function ToolStep({
               </Span>
             </>
           ) : null}
-          {dots ? <Span color={t.ds.leader}>{dots}</Span> : null}
+
           {duration ? <Span color={t.ds.numeric}>{`  ${duration}`}</Span> : null}
         </Text>
       </Box>
@@ -692,7 +600,7 @@ const thinkingRowId = (msg: Msg, msgKey?: string): string => {
  * Collapsed thinking header.
  *
  * Thinking is a single row by default: it is evidence, not content — one
- * line, a dotted leader, and the token count it cost. You expand it only if
+ * line and the token count it cost. You expand it only if
  * you doubt the answer.
  *
  * The row leads with the disclosure triangle alone. It used to carry a ✻ as
@@ -721,20 +629,7 @@ function ThinkingBlock({ cols, msg, rowId, t }: { cols?: number; msg: Msg; rowId
   const thinking = msg.thinking?.trim() ?? ''
   const tokens = msg.thinkingTokens && msg.thinkingTokens > 0 ? msg.thinkingTokens : estimateTokensRough(thinking)
   const tokenLabel = tokens > 0 ? `~${fmtK(tokens)} tok` : ''
-  // Same dotted-leader treatment as tool rows: the label stays left, the
-  // token cost hangs right, the run between them fills the reading column.
-  // The count is conservative on purpose — the scrollbox can reserve a
-  // scrollbar column and nested padding varies a few columns by branch, so
-  // the run prefers stopping short over pushing `tokens` onto a wrapped
-  // second line (which would also drift the height estimator).
-  // Deliberate omission: no wire field carries a reasoning duration yet
-  // (`Msg` has only `thinking`/`thinkingTokens`), so the header reads
-  // "thinking"; pass `durationSeconds` the moment one exists.
   const label = thinkingHeaderLabel({ expanded })
-  const dots =
-    cols !== undefined && tokenLabel
-      ? leaderRun(contentColumnWidth(cols) - 4, stringWidth(label), stringWidth(tokenLabel))
-      : ''
 
   return (
     <Box flexDirection="column" flexShrink={0}>
@@ -745,7 +640,7 @@ function ThinkingBlock({ cols, msg, rowId, t }: { cols?: number; msg: Msg; rowId
         <Text wrap="truncate-end">
           <Span color={t.ds.caption}>{label.slice(0, 1)}</Span>
           <Span color={t.color.thinking}>{label.slice(1)}</Span>
-          {dots ? <Span color={t.ds.leaderQuiet}>{dots}</Span> : null}
+
           {tokenLabel ? <Span color={t.ds.numeric}>{` ${tokenLabel}`}</Span> : null}
         </Text>
       </Box>
@@ -776,7 +671,7 @@ function ToolRun({
 }) {
   const visibility = useStore($toolRunVisibility)
   const expanded = toolRunExpanded(visibility, runId)
-  const { duration, slowest, slowestDuration, tally, total } = group.summary
+  const { duration, tally, total } = group.summary
   const roster = toolRunSpawnRoster(group.lines)
 
   if (expanded) {
@@ -805,17 +700,10 @@ function ToolRun({
           <Span bold color={t.color.toolName}>
             {total} tools
           </Span>
-          {duration > 0 ? <Span dimColor>{`  · ${duration.toFixed(1)}s`}</Span> : null}
+          {duration > 0 ? <Span>{`  · ${duration.toFixed(1)}s`}</Span> : null}
           {tally ? <Span color={t.color.muted}>{`   ${tally}`}</Span> : null}
         </Text>
       </Box>
-      {/* The slowest call is the one you would have gone looking for, so it
-          survives the fold rather than being hidden with the rest. */}
-      {slowestDuration > 0 ? (
-        <Text color={t.color.muted} dimColor wrap="truncate-end">
-          {`    slowest ${slowest} ${slowestDuration.toFixed(1)}s`}
-        </Text>
-      ) : null}
       {roster ? (
         <>
           <SpawnFleetRoster archived={archived} names={roster.names} t={t} />

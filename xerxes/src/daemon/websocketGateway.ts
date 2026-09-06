@@ -172,12 +172,13 @@ export class DaemonWebSocketGateway {
   }
 
   /** Fan a daemon event to all currently connected remote clients. */
-  broadcast(type: string, payload: JsonRpcPayload): void {
+  broadcast(type: string, payload: JsonRpcPayload, accepts: (connection: DaemonTransportConnection) => boolean = () => true): void {
     const serialized = this.serialize(daemonEvent(type, payload))
     if (!serialized) {
       return
     }
     for (const client of this.clients) {
+      if (!accepts(client)) continue
       this.sendSerialized(client, serialized)
     }
   }

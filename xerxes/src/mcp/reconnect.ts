@@ -44,6 +44,8 @@ export class MCPReconnectError extends Error {
 }
 
 export interface ReconnectWithBackoffOptions {
+  /** Stop future attempts and interrupt backoff; an active connect still settles normally. */
+  readonly signal?: AbortSignal
   /** Called after each failed attempt, before the next delay. */
   readonly onError?: (attempt: number, error: unknown) => void | Promise<void>
   readonly policy?: ReconnectPolicy | ReconnectPolicyOptions
@@ -66,19 +68,21 @@ export async function reconnectWithBackoff<T>(
   const policy = options.policy instanceof ReconnectPolicy
     ? options.policy
     : new ReconnectPolicy(options.policy)
-  const sleep = options.sleep ?? sleepSeconds
   let lastError: unknown
 
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
+    throwIfCancelled(options.signal)
     try {
       return await connect()
     } catch (error) {
+      throwIfCancelled(options.signal)
       lastError = error
       await options.onError?.(attempt, error)
+      throwIfCancelled(options.signal)
       if (attempt >= policy.maxAttempts) {
         break
       }
-      await sleep(policy.delayForAttempt(attempt))
+      await waitForRetry(policy.delayForAttempt(attempt), options)
     }
   }
 
@@ -143,6 +147,29 @@ function positiveNumber(value: number, name: string): number {
   return value
 }
 
-function sleepSeconds(seconds: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, seconds * 1_000))
+function throwIfCancelled(signal?: AbortSignal): void {
+  // Do not expose arbitrary host-provided abort reasons through diagnostics.
+  if (signal?.aborted) throw new DOMException('MCP reconnect cancelled', 'AbortError')
+}
+
+function waitForRetry(seconds: number, options: ReconnectWithBackoffOptions): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const signal = options.signal
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = (error?: unknown) => {
+      if (timer !== undefined) clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
+      if (error !== undefined) reject(error)
+      else resolve()
+    }
+    const abort = () => finish(new DOMException('MCP reconnect cancelled', 'AbortError'))
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) { abort(); return }
+    if (options.sleep) {
+      // Observe custom sleepers even if cancellation wins; hosts own their timers.
+      Promise.resolve().then(() => options.sleep!(seconds)).then(() => finish(), finish)
+    } else {
+      timer = setTimeout(() => finish(), seconds * 1_000)
+    }
+  })
 }

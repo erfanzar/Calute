@@ -14,6 +14,7 @@ export const CLAUDE_SEARCH_DELEGATES = Object.freeze({
 })
 
 export interface LspRequest {
+  readonly diagnosticsWaitMs?: number
   readonly action: string
   readonly character: number
   readonly filePath: string

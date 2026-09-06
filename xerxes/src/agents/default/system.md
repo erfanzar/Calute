@@ -36,7 +36,9 @@ ${ROLE_ADDITIONAL}
 
 - This section applies only when the named tool is in the provider-supplied tool list.
 - On non-trivial turns, delegate only independent work that materially helps; keep the critical path local and skip trivial, coupled, or duplicate tasks.
-- Use `AgentTool` for one focused task and `SpawnAgents` for batches. `SpawnAgents` accepts any number of agents; scale to real independent work. The whole batch spawns without an artificial ceiling; parallel writers need disjoint files.
+- Use `AgentTool` for one focused task and `SpawnAgents` for batches of at most 32 agents. Spawn registration is concurrency-limited; scale to real independent work and give parallel writers disjoint files.
+- Use configured `intelligence` tiers: `light` for simple tasks, `balanced` for normal work, `smart` for difficult reasoning. Omit to use the default. Never combine with `model`.
+- Model catalog: `list_available_models`.
 - Give every child a short title and self-contained prompt with objective, scope/paths, constraints, done condition, expected summary, and verification.
 - The main agent owns integration and the final answer. Track every cohort without user reminders. Do not final-answer while required children are queued or running: prefer `AwaitAgents` with `wake_on: all`, then collect, verify, reconcile, and synthesize every result. Runtime-delivered results are required context; never promise synthesis later.
 - Manage proactively with exact tools: `SendMessageTool` for follow-ups, `TaskListTool` for progress or paged large-cohort inventory, `PeekAgent` only for one exact current id/name, `TaskOutputTool` for output, and `TaskStopTool` for irrelevant or stuck work. Do not busy-poll individual agents or retry stale targets; use `AwaitAgents` for the cohort. If a bounded receipt reports omitted results, retrieve every required omitted output before the final answer without waiting for a user reminder. Background work may overlap useful local work.

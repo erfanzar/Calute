@@ -548,3 +548,30 @@ describe('useSessionLifecycle', () => {
     }
   })
 })
+
+it.each([false, true])('restores todos and messages after visiting another chat (running=%s)', async (running) => {
+  resetUiState(); turnController.fullReset()
+  const todos = Array.from({ length: 5 }, (_, i) => ({ id: String(i), content: `Task ${i}`, status: i < 3 ? 'completed' : 'pending' }))
+  const history = vi.fn()
+  const messages = Array.from({ length: 24 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', text: `Message ${i}` }))
+  const gw = { request: vi.fn(async (_method: string, params: { session_id: string }) => ({ session_id: params.session_id, messages: params.session_id === 'original' ? messages : [], todos: params.session_id === 'original' ? todos : [], running: params.session_id === 'original' && running })) } as unknown as GatewayClient
+  let lifecycle!: ReturnType<typeof useSessionLifecycle>
+  const Probe = () => {
+    lifecycle = useSessionLifecycle({ colsRef: { current: 120 }, composerActions: { activateSessionQueue: vi.fn(), setPasteSnips: vi.fn() } as unknown as ComposerActions, gw, panel: vi.fn(), rpc: vi.fn() as GatewayRpc, scrollRef: { current: null }, setHistoryItems: history, setLastUserMsg: vi.fn(), setSessionStartedAt: vi.fn(), setStickyPrompt: vi.fn(), setVoiceProcessing: vi.fn(), setVoiceRecording: vi.fn(), sys: vi.fn() })
+    return null
+  }
+  const screen = await testRender(createElement(Probe), { width: 120, height: 30 })
+  try {
+    for (const id of ['original', 'other', 'original']) {
+      act(() => lifecycle.activateLiveSession(id))
+      await vi.waitFor(() => expect(getUiState().sid).toBe(id))
+      expect(getTurnState().todos).toHaveLength(id === 'original' ? 5 : 0)
+    }
+    expect(getTurnState().todos.filter(todo => todo.status === 'completed')).toHaveLength(3)
+    expect(history.mock.lastCall?.[0]).toHaveLength(24)
+    turnController.startMessage()
+    expect(getTurnState().todos).toHaveLength(5)
+    turnController.recordTodos([])
+    expect(getTurnState().todos).toHaveLength(0)
+  } finally { act(() => screen.renderer.destroy()); turnController.fullReset(); resetUiState() }
+})

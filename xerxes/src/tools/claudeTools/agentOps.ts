@@ -1,6 +1,15 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { parseWorktreeRef, parseWorktreeSource } from '../../agents/worktreeOptions.js'
+import {
+  AGENT_INTELLIGENCE_LEVELS,
+  parseAgentIntelligence,
+  parseAgentIntelligenceConfig,
+  resolveAgentIntelligenceSettings,
+  type AgentIntelligence,
+  type AgentIntelligenceConfig,
+} from '../../agents/intelligence.js'
 import { ValidationError } from '../../core/errors.js'
 import {
   replacePersistedSubagentDeliveries,
@@ -60,7 +69,13 @@ const MAX_WIRE_OUTPUT_CHARS = 8_000
 const TERMINAL_STATUSES = new Set(['cancelled', 'closed', 'completed', 'error', 'interrupted'])
 
 export interface ClaudeAgentSpec {
-  readonly model?: string
+  readonly isolation?: 'worktree' | undefined
+  readonly worktreeRef?: string | undefined
+  readonly worktreeSource?: 'working-tree' | undefined
+  readonly providerProfile?: string | undefined
+  readonly reasoningEffort?: string | undefined
+  readonly intelligence?: AgentIntelligence | undefined
+  readonly model?: string | undefined
   readonly name?: string
   readonly prompt: string
   readonly subagentType?: string
@@ -187,6 +202,7 @@ export class AgentEventMailbox {
 }
 
 export interface ClaudeAgentToolsOptions {
+  readonly intelligence?: AgentIntelligenceConfig
   /** Resolves an agent type to the runtime descriptor consumed by the manager. */
   readonly agentResolver?: (subagentType: string, model?: string) => SpawnedAgentDescriptor | undefined
   readonly mailbox?: AgentEventMailbox
@@ -214,9 +230,14 @@ export const CLAUDE_AGENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     prompt: stringSchema('The delegated task.'),
     title: titleSchema('Short human-readable title describing this delegated task.'),
     subagent_type: stringSchema('Agent definition to run.'),
-    isolation: stringSchema('Requested isolation mode. Native worktree isolation is not yet available here.'),
+    worktree_source: { type: 'string', enum: ['working-tree'], description: 'Copy current tracked and untracked non-ignored files into the isolated checkout. Requires isolation=worktree; mutually exclusive with worktree_ref.' },
+    worktree_ref: stringSchema('Optional Git revision for worktree isolation. Defaults to HEAD. Resolved at each allocation; use a commit ID for a fixed baseline.'),
+    isolation: { type: 'string', enum: ['worktree'], description: 'Run in a separate Git checkout. Requires a configured native worktree adapter; starts at committed HEAD.' },
     name: stringSchema('Stable subagent name.'),
-    model: stringSchema('Optional model override.'),
+    model: stringSchema('Optional model override. Mutually exclusive with intelligence.'),
+    provider_profile: stringSchema('Configured provider profile from list_available_models. Requires explicit model; do not combine with intelligence.'),
+    reasoning_effort: stringSchema('Reasoning effort offered by list_available_models. Requires explicit model; do not combine with intelligence.'),
+    intelligence: { type: 'string', enum: [...AGENT_INTELLIGENCE_LEVELS], description: 'Choose light for simple tasks, balanced for normal work, smart for difficult reasoning. Uses user-configured model mappings; omit to use the configured default.' },
     run_in_background: booleanSchema('Return immediately while the subagent keeps working.', false),
     wait: booleanSchema('Wait for the subagent to finish.', true),
     timeout: numberSchema('Maximum seconds to wait.'),
@@ -226,6 +247,10 @@ export const CLAUDE_AGENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     message: stringSchema('Message for the subagent.'),
   }, ['target', 'message']),
   definition('TaskCreateTool', 'Create a background subagent task without waiting.', {
+    model: stringSchema('Optional model override.'),
+    provider_profile: stringSchema('Configured provider profile; requires explicit model.'),
+    reasoning_effort: stringSchema('Reasoning effort offered for the explicit model.'),
+    intelligence: { type: 'string', enum: [...AGENT_INTELLIGENCE_LEVELS], description: 'User-configured model capability tier.' },
     prompt: stringSchema('The delegated task.'),
     title: titleSchema('Short human-readable title describing this background task.'),
     name: stringSchema('Stable subagent name.'),
@@ -233,7 +258,7 @@ export const CLAUDE_AGENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   }, ['prompt', 'title']),
   definition('SpawnAgents', 'Spawn a bounded batch of subagents and optionally wait for all of them.', {
     agents: {
-      description: `JSON array of {title, prompt, name?, subagent_type?, model?}. Every agent needs a short title. One batch accepts at most ${MAX_SPAWN_BATCH_SIZE} agents; spawn registrations run through a bounded concurrency pool.`,
+      description: `JSON array of {title, prompt, name?, subagent_type?, model?, intelligence?}. Every agent needs a short title. One batch accepts at most ${MAX_SPAWN_BATCH_SIZE} agents; spawn registrations run through a bounded concurrency pool.`,
       type: 'array',
       minItems: 1,
       maxItems: MAX_SPAWN_BATCH_SIZE,
@@ -243,10 +268,16 @@ export const CLAUDE_AGENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         required: ['title', 'prompt'],
         properties: {
           title: titleSchema('Short human-readable title for this delegated task.'),
+          worktree_source: { type: 'string', enum: ['working-tree'], description: 'Capture parent uncommitted files; mutually exclusive with worktree_ref.' },
+          worktree_ref: stringSchema('Optional Git revision; requires isolation=worktree. Defaults to HEAD.'),
+          isolation: { type: 'string', enum: ['worktree'], description: 'Separate Git checkout; requires a configured native worktree adapter.' },
           prompt: stringSchema('The delegated task.'),
           name: stringSchema('Optional stable subagent handle.'),
           subagent_type: stringSchema('Agent definition to run.'),
-          model: stringSchema('Optional model override.'),
+          model: stringSchema('Optional model override. Mutually exclusive with intelligence.'),
+    provider_profile: stringSchema('Configured provider profile from list_available_models. Requires explicit model; do not combine with intelligence.'),
+    reasoning_effort: stringSchema('Reasoning effort offered by list_available_models. Requires explicit model; do not combine with intelligence.'),
+          intelligence: { type: 'string', enum: [...AGENT_INTELLIGENCE_LEVELS], description: 'Choose light for simple tasks, balanced for normal work, smart for difficult reasoning. Uses user-configured model mappings; omit to use the configured default.' },
         },
       },
     },
@@ -306,14 +337,41 @@ export function registerClaudeAgentTools(
   agentId = 'default',
 ): readonly ToolDefinition[] {
   const adapter = new ClaudeAgentTools(options)
-  for (const tool of CLAUDE_AGENT_TOOL_DEFINITIONS) {
+  const config = parseAgentIntelligenceConfig(options.intelligence)
+  const tiers = AGENT_INTELLIGENCE_LEVELS.filter(level => config[level]).map(level => `${level}=${typeof config[level] === 'string' ? config[level] : JSON.stringify(config[level])}`).join(', ')
+  const definitions = CLAUDE_AGENT_TOOL_DEFINITIONS.map(tool => ['AgentTool', 'TaskCreateTool', 'SpawnAgents'].includes(tool.function.name)
+    ? { ...tool, function: { ...tool.function, parameters: configuredIntelligenceSchema(tool.function.parameters, config), description: `${tool.function.description} Intelligence default: ${config.default ?? 'inherit'}. Configured tiers: ${tiers || 'none; omit intelligence and inherit, or specify model'}.` } }
+    : tool)
+  for (const tool of definitions) {
     registry.replace(tool, (inputs, context, signal) => adapter.execute(tool.function.name, inputs, context, signal), agentId)
   }
-  return CLAUDE_AGENT_TOOL_DEFINITIONS
+  return definitions
+}
+
+/** Advertise only configured choices, including the nested swarm item schema. */
+function configuredIntelligenceSchema(schema: Readonly<Record<string, unknown>>, config: AgentIntelligenceConfig): Record<string, unknown> {
+  const tiers = AGENT_INTELLIGENCE_LEVELS.filter(level => config[level])
+  const copy = structuredClone(schema)
+  const visit = (input: unknown): void => {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return
+    const value = input as Record<string, unknown>
+    const properties = value.properties as Record<string, unknown> | undefined
+    if (properties && typeof properties === 'object' && !Array.isArray(properties) && 'intelligence' in properties) {
+      if (!tiers.length) delete properties.intelligence
+      else properties.intelligence = { type: 'string', enum: [...tiers], description: 'Configured model tier. Omit to use the default; do not combine with model.' }
+    }
+    for (const child of Object.values(value)) {
+      if (Array.isArray(child)) child.forEach(visit)
+      else visit(child)
+    }
+  }
+  visit(copy)
+  return copy
 }
 
 /** Adapter that maps Claude-style task calls onto the Bun `SpawnedAgentManager`. */
 export class ClaudeAgentTools {
+  private readonly intelligence: AgentIntelligenceConfig
   private readonly mailbox: AgentEventMailbox
   private readonly manifestHeartbeatMs: number
   private readonly now: () => number
@@ -321,6 +379,7 @@ export class ClaudeAgentTools {
   private readonly spawnConcurrency: number
 
   constructor(private readonly options: ClaudeAgentToolsOptions) {
+    this.intelligence = parseAgentIntelligenceConfig(options.intelligence)
     this.mailbox = options.mailbox ?? new AgentEventMailbox()
     this.now = options.now ?? (() => Date.now())
     const heartbeat = options.manifestHeartbeatMs ?? MANIFEST_HEARTBEAT_MS
@@ -342,10 +401,13 @@ export class ClaudeAgentTools {
     signal?: AbortSignal,
   ): Promise<unknown> {
     try {
+      if (signal?.aborted && ['AgentTool', 'TaskCreateTool', 'SpawnAgents', 'HandoffTool'].includes(name)) {
+        throw signal.reason ?? new Error('Subagent spawn cancelled')
+      }
       switch (name) {
         case 'AgentTool': return await this.agentTool(inputs, context, signal)
         case 'SendMessageTool': return await this.sendMessage(inputs, context)
-        case 'TaskCreateTool': return await this.taskCreate(inputs, context)
+        case 'TaskCreateTool': return await this.taskCreate(inputs, context, signal)
         case 'SpawnAgents': return await this.spawnAgents(inputs, context, signal)
         case 'TaskGetTool': return this.taskGet(requiredString(inputs, 'task_id'), context, 'task_id')
         case 'TaskListTool': return this.taskList(inputs, context)
@@ -369,25 +431,24 @@ export class ClaudeAgentTools {
     context: ToolExecutionContext,
     signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
-    const isolation = optionalString(inputs, 'isolation')?.trim()
-    if (isolation) {
-      throw new ValidationError(
-        'isolation',
-        'is not supported by the Bun spawned-agent manager; use a host-provided isolated runner',
-        isolation,
-      )
-    }
+    const isolation = parseIsolation(inputs.isolation)
     const name = optionalString(inputs, 'name')?.trim()
     const subagentType = optionalString(inputs, 'subagent_type')?.trim()
     const model = optionalString(inputs, 'model')?.trim()
     const spec: ClaudeAgentSpec = {
+      isolation,
+      worktreeRef: parseWorktreeRef(inputs.worktree_ref),
+      worktreeSource: parseWorktreeSource(inputs.worktree_source),
+      providerProfile: optionalString(inputs, 'provider_profile'),
+      reasoningEffort: optionalString(inputs, 'reasoning_effort'),
+      intelligence: parseAgentIntelligence(inputs.intelligence),
       prompt: requiredString(inputs, 'prompt'),
       title: normalizeAgentTitle(requiredString(inputs, 'title')),
       ...(name ? { name } : {}),
       ...(subagentType ? { subagentType } : {}),
       ...(model ? { model } : {}),
     }
-    const snapshot = await this.spawnSpec(spec, context)
+    const snapshot = await this.spawnSpec(spec, context, signal)
     const background = optionalBoolean(inputs, 'run_in_background', false)
     if (background || !optionalBoolean(inputs, 'wait', true)) {
       this.observeBackgroundState([snapshot])
@@ -412,16 +473,20 @@ export class ClaudeAgentTools {
     return agentSnapshotWire(snapshot)
   }
 
-  private async taskCreate(inputs: JsonObject, context: ToolExecutionContext): Promise<Record<string, unknown>> {
+  private async taskCreate(inputs: JsonObject, context: ToolExecutionContext, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const name = optionalString(inputs, 'name')?.trim()
     const subagentType = optionalString(inputs, 'subagent_type')?.trim()
     const spec: ClaudeAgentSpec = {
+      providerProfile: optionalString(inputs, 'provider_profile'),
+      reasoningEffort: optionalString(inputs, 'reasoning_effort'),
+      intelligence: parseAgentIntelligence(inputs.intelligence),
+      model: optionalString(inputs, 'model'),
       prompt: requiredString(inputs, 'prompt'),
       title: normalizeAgentTitle(requiredString(inputs, 'title')),
       ...(name ? { name } : {}),
       ...(subagentType ? { subagentType } : {}),
     }
-    const snapshot = await this.spawnSpec(spec, context)
+    const snapshot = await this.spawnSpec(spec, context, signal)
     this.observeBackgroundState([snapshot])
     return agentSnapshotWire(snapshot)
   }
@@ -431,7 +496,7 @@ export class ClaudeAgentTools {
     context: ToolExecutionContext,
     signal?: AbortSignal,
   ): Promise<readonly Record<string, unknown>[] | Record<string, unknown>> {
-    const specs = parseAgentSpecs(inputs.agents)
+    const specs = parseAgentSpecs(inputs.agents).map(spec => this.resolveSpec(spec))
     if (!specs.length) throw new ValidationError('agents', 'must contain at least one agent specification', inputs.agents)
     if (specs.length > MAX_SPAWN_BATCH_SIZE) {
       throw new ValidationError(
@@ -443,7 +508,7 @@ export class ClaudeAgentTools {
     const registration = await settleWithConcurrency(
       specs,
       this.spawnConcurrency,
-      spec => this.spawnSpec(spec, context),
+      spec => this.spawnSpec(spec, context, signal),
       signal,
     )
     const results = registration.results
@@ -672,7 +737,7 @@ export class ClaudeAgentTools {
       name: `handoff-${targetAgent}-${crypto.randomUUID().replaceAll('-', '').slice(0, 6)}`,
       title: normalizeAgentTitle(`Handoff to ${targetAgent}`),
       prompt: `## Handoff from parent agent\n\nReason: ${reason}\n\nContext: ${contextSummary}\n\nYour task: ${prompt}`,
-    }, context)
+    }, context, signal)
     try {
       const settled = await this.waitFor([snapshot.id], timeoutMilliseconds(inputs, 'timeout', DEFAULT_WAIT_SECONDS), signal, context)
       const final = settled[0] ?? snapshot
@@ -684,18 +749,34 @@ export class ClaudeAgentTools {
     }
   }
 
-  private async spawnSpec(spec: ClaudeAgentSpec, context: ToolExecutionContext): Promise<SpawnedAgentSnapshot> {
+  private resolveSpec(spec: ClaudeAgentSpec): ClaudeAgentSpec {
+    if ((spec.providerProfile || spec.reasoningEffort) && (!spec.model?.trim() || spec.intelligence)) throw new ValidationError('model', 'explicit provider/reasoning selectors require model and cannot be combined with intelligence', spec.model)
+    if (spec.worktreeSource && (spec.worktreeRef || spec.isolation !== 'worktree')) throw new ValidationError('worktree_source', 'requires isolation=worktree and no worktree_ref', spec.worktreeSource)
+    if (spec.worktreeRef && spec.isolation !== 'worktree') throw new ValidationError('worktree_ref', 'requires isolation=worktree', spec.worktreeRef)
+    const selected = resolveAgentIntelligenceSettings(this.intelligence, spec.intelligence, spec.model)
+    return { ...spec, intelligence: undefined, model: selected?.model, providerProfile: selected?.provider_profile ?? spec.providerProfile, reasoningEffort: selected?.reasoning_effort ?? spec.reasoningEffort }
+  }
+
+  private async spawnSpec(spec: ClaudeAgentSpec, context: ToolExecutionContext, signal?: AbortSignal): Promise<SpawnedAgentSnapshot> {
+    signal?.throwIfAborted()
+    spec = this.resolveSpec(spec)
     const type = spec.subagentType?.trim() || 'general-purpose'
     const parentPermissionMode = contextPermissionMode(context)
     const resolved = this.options.agentResolver?.(type, spec.model)
     const agent: SpawnedAgentDescriptor = Object.freeze({
       id: resolved?.id ?? type,
+      ...(spec.providerProfile ? { providerProfile: spec.providerProfile } : {}),
+      ...(spec.reasoningEffort ? { reasoningEffort: spec.reasoningEffort } : {}),
       ...(spec.model?.trim() ? { model: spec.model.trim() } : resolved?.model === undefined ? {} : { model: resolved.model }),
       systemPrompt: resolved?.systemPrompt ?? `You are a focused ${type} subagent. Complete the delegated task and return a self-contained result.`,
       ...(resolved?.name === undefined ? { name: type } : { name: resolved.name }),
     })
     const request: SpawnAgentOptions = {
+      ...(signal ? { signal } : {}),
       agent,
+      ...(spec.isolation ? { isolation: spec.isolation } : {}),
+      ...(spec.worktreeRef ? { worktreeRef: spec.worktreeRef } : {}),
+      ...(spec.worktreeSource ? { worktreeSource: spec.worktreeSource } : {}),
       message: spec.prompt,
       promptProfile: type,
       title: spec.title,
@@ -708,6 +789,7 @@ export class ClaudeAgentTools {
       ...(spec.name?.trim() ? { nickname: spec.name.trim() } : {}),
     }
     const snapshot = await this.options.manager.spawn(request)
+    if (signal?.aborted) { this.closeAfterAbort([snapshot.id], signal.reason); signal.throwIfAborted() }
     this.capture()
     // Persist the manifest at the spawn, not at the tool boundary.
     //
@@ -881,6 +963,12 @@ function parseAgentSpecs(value: JsonValue | undefined): ClaudeAgentSpec[] {
     const subagentType = optionalRecordString(item, 'subagent_type')
     const model = optionalRecordString(item, 'model')
     specs.push({
+      isolation: parseIsolation(item.isolation),
+      worktreeRef: parseWorktreeRef(item.worktree_ref),
+      worktreeSource: parseWorktreeSource(item.worktree_source),
+      providerProfile: optionalRecordString(item, 'provider_profile'),
+      reasoningEffort: optionalRecordString(item, 'reasoning_effort'),
+      intelligence: parseAgentIntelligence(item.intelligence),
       prompt,
       title,
       ...(name === undefined ? {} : { name }),
@@ -1141,6 +1229,9 @@ function boundedOutput(value: string, limit = MAX_WIRE_OUTPUT_CHARS): string {
 
 function agentSnapshotWire(snapshot: SpawnedAgentSnapshot): Record<string, unknown> {
   return {
+    ...(snapshot.workspace === undefined ? {} : { workspace: snapshot.workspace }),
+    ...(snapshot.providerRoute === undefined ? {} : { provider_route: snapshot.providerRoute }),
+    ...(snapshot.modelCallBindings === undefined ? {} : { model_call_bindings: snapshot.modelCallBindings }),
     id: snapshot.id,
     ...(snapshot.attempt === undefined ? {} : { attempt: snapshot.attempt }),
     name: snapshot.name,
@@ -1246,4 +1337,10 @@ function contextPermissionMode(context: ToolExecutionContext): PermissionMode | 
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, Math.max(0, milliseconds)))
+}
+
+function parseIsolation(value: unknown): 'worktree' | undefined {
+  if (value === undefined || value === '') return undefined
+  if (value === 'worktree') return value
+  throw new ValidationError('isolation', 'must be worktree when specified', value)
 }

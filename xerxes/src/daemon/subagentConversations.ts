@@ -1,6 +1,7 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { compactionHistory } from '../context/compactionHistory.js'
 import type { PermissionMode } from '../streaming/permissions.js'
 import { createAgentState, type AgentState } from '../streaming/events.js'
 import type { ChatMessage, MessageContent } from '../types/messages.js'
@@ -127,7 +128,11 @@ export class SubagentConversationPersistence {
     checkpoint?: SubagentConversationCheckpoint,
   ): Promise<void> {
     if (!this.transcripts) return
-    const metadata = conversationMetadata(context, status, error)
+    const history = compactionHistory(state.metadata)
+    const metadata = {
+      ...conversationMetadata(context, status, error),
+      ...(history.length ? { compaction_history: history, last_compaction: history[history.length - 1] } : {}),
+    }
     state.metadata = { ...state.metadata, ...metadata }
     const persisted = await this.transcripts.load(context.historySessionId, {
       currentProjectDirectory: context.projectRoot,

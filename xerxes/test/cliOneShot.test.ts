@@ -20,6 +20,7 @@ test('one-shot CLI exposes native subagents and their catalog to the main model'
     port: 0,
     async fetch(request) {
       requests.push((await request.json()) as Record<string, unknown>)
+      if (requests.length === 1) return sseResponse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: 'catalog', function: { name: 'list_available_models', arguments: '{}' } }] }, finish_reason: 'tool_calls' }] }])
       return sseResponse([
         { choices: [{ delta: { content: 'one-shot ready' }, finish_reason: 'stop' }] },
       ])
@@ -73,7 +74,9 @@ test('one-shot CLI exposes native subagents and their catalog to the main model'
     expect(exitCode).toBe(0)
     expect(stderr).toBe('')
     expect(stdout).toBe('one-shot ready\n')
-    expect(requests).toHaveLength(1)
+    expect(requests).toHaveLength(2)
+    expect(JSON.stringify(requests[1]?.messages)).toContain('configured_profiles')
+    expect(JSON.stringify(requests[1]?.messages)).not.toContain('Model inventory requires a session')
     const tools = Array.isArray(requests[0]?.tools) ? requests[0].tools : []
     expect(tools).toEqual(expect.arrayContaining([
       expect.objectContaining({ function: expect.objectContaining({ name: 'AgentTool' }) }),
@@ -276,3 +279,41 @@ function sseResponse(events: readonly Record<string, unknown>[]): Response {
     headers: { 'Content-Type': 'text/event-stream' },
   })
 }
+
+test('one-shot child uses TUI-saved tier provider credentials, model and effort', async () => {
+  const { AgentSettingsStore } = await import('../src/agents/settingsStore.js')
+  const { ProfileStore } = await import('../src/bridge/profiles.js')
+  const root = await mkdtemp(join(tmpdir(), 'xerxes-tier-cli-'))
+  const home = join(root, 'home'), project = join(root, 'project')
+  let parentCalls = 0
+  const discoveryCredentials: (string | null)[] = []
+  const childRequests: { body: Record<string, unknown>; auth: string | null }[] = []
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    if (request.method === 'GET' && new URL(request.url).pathname === '/child/v1/models') {
+      discoveryCredentials.push(request.headers.get('authorization'))
+      return Response.json({ data: [{ id: 'gpt-5' }] })
+    }
+    const body = await request.json() as Record<string, unknown>
+    if (new URL(request.url).pathname.startsWith('/child/')) {
+      childRequests.push({ body, auth: request.headers.get('authorization') })
+      return completionResponse('CHILD_PROVIDER_OK')
+    }
+    if (parentCalls++ > 0) return completionResponse('Delegated successfully.')
+    return sseResponse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: 'delegate', function: { name: 'SpawnAgents', arguments: JSON.stringify({ agents: [{ title: 'Tier test', prompt: 'Return CHILD_PROVIDER_OK', subagent_type: 'reviewer', intelligence: 'smart' }], wait: true }) } }] }, finish_reason: 'tool_calls' }] }])
+  } })
+  try {
+    await mkdir(join(home, 'daemon'), { recursive: true }); await mkdir(project)
+    await Bun.write(join(home, 'daemon', 'config.json'), JSON.stringify({ runtime: { model: 'gpt-4o', provider: 'openai', base_url: `${server.url}parent/v1`, api_key: 'parent-key', permission_mode: 'accept-all' } }))
+    new ProfileStore(join(home, 'profiles.json')).save({ name: 'child-profile', provider: 'openai', model: 'gpt-5', baseUrl: `${server.url}child/v1`, apiKey: 'child-key' })
+    new AgentSettingsStore(join(home, 'daemon', 'agent-settings.sqlite')).save({ smart: { model: 'gpt-5', provider_profile: 'child-profile', reasoning_effort: 'high' } }, 0)
+    const child = Bun.spawn([process.execPath, CLI, 'Delegate this test'], { cwd: project, env: { ...process.env, XERXES_HOME: home }, stdout: 'pipe', stderr: 'pipe' })
+    const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
+    expect(code).toBe(0)
+    expect(stderr).toBe('')
+    expect(stdout).toContain('Delegated successfully')
+    expect(childRequests).toHaveLength(1)
+    expect(discoveryCredentials).toEqual(['Bearer child-key', 'Bearer child-key'])
+    expect(childRequests[0]?.auth).toBe('Bearer child-key')
+    expect(childRequests[0]?.body).toMatchObject({ model: 'gpt-5', reasoning_effort: 'high' })
+  } finally { server.stop(true); await rm(root, { recursive: true, force: true }) }
+})

@@ -3,9 +3,9 @@
 
 /**
  * Terminal width the agents rail needs before it mounts (mockup 11: the rail
- * lives at ≥96 cols; below it F6 is the only path).
+ * lives at ≥120 cols; below it F6 is the only path).
  */
-export const AGENT_SIDEBAR_BREAKPOINT = 96
+export const AGENT_SIDEBAR_BREAKPOINT = 120
 
 /** Show the wide-terminal rail only after delegation has produced something to inspect. */
 export const shouldShowAgentSidebar = (terminalWidth: number, agentCount = 0): boolean =>
@@ -26,11 +26,11 @@ export const shouldMountAgentSidebar = (
   overlayOpen: boolean
 ): boolean => !overlayOpen && shouldShowAgentSidebar(terminalWidth, agentCount)
 
-export const agentSidebarWidth = (terminalWidth: number): number =>
-  Math.max(38, Math.min(48, Math.floor(terminalWidth * 0.3)))
+export const agentSidebarWidth = (terminalWidth: number, delta = 0): number =>
+  Math.max(28, Math.min(terminalWidth - 84, Math.min(36, Math.floor(terminalWidth * 0.25)) + delta))
 
 /** Width actually owned by the transcript/composer after an active rail. */
-export const agentContentWidth = (terminalWidth: number, agentCount = 0): number =>
-  shouldShowAgentSidebar(terminalWidth, agentCount)
-    ? Math.max(1, terminalWidth - agentSidebarWidth(terminalWidth))
+export const agentContentWidth = (terminalWidth: number, agentCount = 0, railVisible = true, delta = 0): number =>
+  railVisible && shouldShowAgentSidebar(terminalWidth, agentCount)
+    ? Math.max(1, terminalWidth - agentSidebarWidth(terminalWidth, delta))
     : terminalWidth

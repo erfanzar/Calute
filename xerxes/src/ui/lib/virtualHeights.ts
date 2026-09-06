@@ -76,8 +76,10 @@ export const wrappedLines = (text: string, width: number, maxLines: number = MAX
 }
 
 /** Rows a settled trail paints once its runs are folded. */
-const collapsedTrailHeight = (tools: readonly string[]): number =>
-  groupToolRun(tools).reduce((rows, group) => rows + collapsedRunHeight(group), 0)
+const collapsedTrailHeight = (tools: readonly string[], expanded?: (index: number) => boolean): number =>
+  groupToolRun(tools).reduce((rows, group, index) => rows + (
+    group.kind === 'run' && expanded?.(index) ? 1 + group.lines.length : collapsedRunHeight(group)
+  ), 0)
 
 export const estimatedMsgHeight = (
   msg: Msg,
@@ -90,6 +92,7 @@ export const estimatedMsgHeight = (
     thinkingExpanded = false,
     thinkingVisible = details,
     toolsVisible = details,
+    toolRunExpanded,
     userPrompt = '',
   }: {
     compact: boolean
@@ -101,6 +104,7 @@ export const estimatedMsgHeight = (
     thinkingExpanded?: boolean
     thinkingVisible?: boolean
     toolsVisible?: boolean
+    toolRunExpanded?: (index: number) => boolean
     userPrompt?: string
   }
 ) => {
@@ -122,7 +126,7 @@ export const estimatedMsgHeight = (
 
   const bodyWidth = transcriptBodyWidth(cols, msg.role, userPrompt, TERMUX_TUI_MODE)
   const text = msg.text
-  let h = wrappedLines(text || ' ', bodyWidth)
+  let h = wrappedLines(text || ' ', bodyWidth) + (msg.role === 'assistant' && /\S/.test(text) ? 1 : 0)
 
   if (!compact && msg.role === 'assistant') {
     // Paragraph gaps add up to 6 extra rows of breathing room. Slice
@@ -146,7 +150,7 @@ export const estimatedMsgHeight = (
       // successful calls folds to a summary. Estimate the collapsed height,
       // which is what paints until someone clicks a run open.
       h +=
-        (hasVisibleTools ? collapsedTrailHeight(msg.tools ?? []) : 0) +
+        (hasVisibleTools ? collapsedTrailHeight(msg.tools ?? [], toolRunExpanded) : 0) +
         (hasVisibleThinking ? 1 + (thinkingExpanded ? wrappedLines(msg.thinking ?? '', bodyWidth) : 0) : 0)
 
       if (msg.role === 'assistant' && /\S/.test(msg.text)) {
@@ -159,7 +163,7 @@ export const estimatedMsgHeight = (
     // One blank row above the band. `diff` used to be counted here too, but
     // it never painted a trailing gap — it takes its row from `leadGap` like
     // every other assistant-side block.
-    h += 1
+    h += 3
   } else if (msg.kind === 'slash') {
     h++
   }

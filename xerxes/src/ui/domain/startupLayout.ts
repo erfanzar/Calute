@@ -21,21 +21,8 @@ export const shouldShowStartupWelcome = ({
   transcriptEmpty
 }: StartupLayoutState): boolean => transcriptEmpty && !busy && !hasLiveTurn && !pendingInteraction
 
-/**
- * The one reading column the app composes onto.
- *
- * Responsive by design: the full available session width minus a small
- * symmetric outer gutter (2 columns per side). There is deliberately no
- * desktop cap — on a 220-column terminal the transcript, user bands, tool
- * rows, and composer all belong to one grid that uses the space, rather than
- * a fixed 75/104-column strip floating in emptiness.
- *
- * Narrow terminals are naturally preserved: the gutter shrinks nothing that
- * matters and the caller's own flex containers clip before overflow.
- *
- * `columns` should be the *session* width — `useMainApp` already subtracts
- * the agent sidebar when it computes `composer.cols`, so every consumer of
- * this measure (transcript column, completion menu, input metrics, tool-row
- * leaders) narrows together when the sidebar mounts.
- */
+/** Conversation fills the available pane, excluding its side gutters. */
 export const contentColumnWidth = (columns: number): number => Math.max(1, Math.floor(columns) - 4)
+
+/** The idle welcome remains a compact centered surface. */
+export const welcomeColumnWidth = (columns: number): number => Math.min(120, contentColumnWidth(columns))

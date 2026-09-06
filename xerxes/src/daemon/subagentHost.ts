@@ -1,6 +1,9 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { recordCompaction } from '../context/compactionHistory.js'
+import { isAbsolute, resolve } from 'node:path'
+import { parseWorktreeRef, parseWorktreeSource } from '../agents/worktreeOptions.js'
 import type { AgentDefinition } from '../agents/definitions.js'
 import {
   SUBAGENT_BLOCKED_TOOLS,
@@ -8,11 +11,14 @@ import {
   type SubAgentEvent,
   type SubAgentTask,
   type SubagentTaskRunRequest,
+  type SubagentWorktreePort,
+  type SubagentWorktree,
 } from '../agents/subagentManager.js'
 import type { ContextMessage } from '../context/compressor.js'
 import { ValidationError } from '../core/errors.js'
 import type { ToolExecutor } from '../executors/toolRegistry.js'
 import type { LlmClient } from '../llms/client.js'
+import { withCapturedModelCallScopes, type ModelCallScope } from '../llms/callBudget.js'
 import { effectiveContextLimit } from '../llms/providerRegistry.js'
 import type {
   SendAgentInputOptions,
@@ -22,6 +28,8 @@ import type {
   SpawnedAgentStatus,
 } from '../operators/subagents.js'
 import { bootstrap } from '../runtime/bootstrap.js'
+import type { RunHistory } from '../runtime/runHistory.js'
+import { runWithActiveSession } from '../runtime/sessionContext.js'
 import { looksLikeSessionId, type DaemonTranscriptStore } from '../session/daemonTranscript.js'
 import { FILE_READS_METADATA_KEY, fileStateTracker } from '../tools/fileState.js'
 import type { AgentState, StreamEvent } from '../streaming/events.js'
@@ -48,9 +56,12 @@ import {
   type SubagentConversationContext,
 } from './subagentConversations.js'
 import { DaemonSubagentEventBus } from './subagentEvents.js'
+import { resolveOwnedSubagentRetry } from './subagentRetryOwnership.js'
 import type { DurableTaskBridge } from '../tasks/durableTaskBridge.js'
 
 export interface NativeSubagentHostOptions {
+  /** Reconstruct original durable budget ownership before a recovered attempt starts. */
+  readonly restoreModelCallScopes?: (snapshot: SpawnedAgentSnapshot) => readonly ModelCallScope[]
   readonly agentDefinitions: ReadonlyMap<string, AgentDefinition>
   /**
    * Fraction of a child's prompt budget at which its conversation is compacted
@@ -62,6 +73,17 @@ export interface NativeSubagentHostOptions {
   /** Live provider/profile capability lookup; absence disables speculative compaction. */
   readonly contextLimit?: (model: string) => number | undefined
   readonly cwd: string
+  /** Resolve the owning session's project root for a new or recovered child. */
+  readonly resolveSourceWorkspace?: (sourceId: string) => string
+  /** Route identity captured for inherited children and checked on recovery. */
+  readonly inheritedProviderRoute?: string
+  /** Resolve the current route identity for an explicit provider profile. */
+  readonly resolveProviderRoute?: (profile: string, model: string) => string
+  /** Explicit isolation adapter, fixed for this host's lifetime. */
+  readonly worktree?: SubagentWorktreePort
+  /** Immutable factory; each allocation uses its captured host generation cwd. */
+  readonly worktreeForWorkspace?: (cwd: string) => SubagentWorktreePort
+  readonly runHistory?: RunHistory
   /**
    * Durable record of subagent attempts, so a crash mid-fan-out leaves a
    * readable account of what ran. Optional: hosts that do not want the sidecar
@@ -71,6 +93,9 @@ export interface NativeSubagentHostOptions {
   readonly eventBus: DaemonSubagentEventBus
   /** Bounded supplemental bootstrap context, such as the discovered skill catalog. */
   readonly extraContext?: string
+  readonly validateProviderSelection?: (profile: string, model: string, effort?: string, signal?: AbortSignal) => Promise<void>
+  readonly validateInheritedSelection?: (model: string, effort?: string, signal?: AbortSignal) => Promise<void>
+  readonly resolveProviderProfile?: (profile: string, model: string, expectedRoute?: string) => Pick<NativeSubagentHostOptions, 'llm' | 'contextLimit' | 'maxTokens' | 'maxOutputTokens' | 'temperature' | 'topK' | 'topP'>
   readonly llm: LlmClient
   /** Explicit runtime/profile request cap. */
   readonly maxTokens?: number
@@ -88,6 +113,8 @@ export interface NativeSubagentHostOptions {
 }
 
 export interface SubagentRetryOptions {
+  /** Host-verified requesting session. When present, resolve task names within this owner only. */
+  readonly sourceAgentId?: string
   /**
    * Optional replacement instruction for the new attempt. Defaults to a
    * continuation nudge when the task's conversation persisted, otherwise the
@@ -145,11 +172,35 @@ export function createNativeSubagentHost(options: NativeSubagentHostOptions): Na
   let activeOptions = options
   let activeDefinitionsFingerprint = agentDefinitionsFingerprint(options.agentDefinitions)
   const generationOptions = new Map<number, NativeSubagentHostOptions>([[activeGeneration, options]])
+  if (options.worktree && options.worktreeForWorkspace) throw new Error('Configure either worktree or worktreeForWorkspace')
+  const taskGenerations = new Map<string, number>()
+  const owners = new Map<string, { tree: SubagentWorktree; port: SubagentWorktreePort }>()
+  const owner = (tree: SubagentWorktree) => {
+    const found = owners.get(tree.path)
+    if (!found || found.tree.branch !== tree.branch) throw new Error('Unknown worktree allocation owner')
+    return found.port
+  }
+  const routedWorktrees: SubagentWorktreePort | undefined = options.worktreeForWorkspace ? {
+    async create(request) {
+      const generation = nativeHostGeneration(request.config ?? {})
+      const configuration = generation === undefined ? activeOptions : generationOptions.get(generation)
+      if (!configuration) throw new Error('Worktree allocation generation is no longer available')
+      taskGenerations.set(request.taskId, generation ?? activeGeneration)
+      const workspace = workspaceFromConfig(request.config) ?? configuration.cwd
+      const port = options.worktreeForWorkspace!(workspace)
+      const tree = await port.create(request)
+      owners.set(tree.path, { tree, port })
+      return tree
+    },
+    isClean: tree => owner(tree).isClean(tree),
+    async remove(tree) { await owner(tree).remove(tree); owners.delete(tree.path) },
+  } : options.worktree
   const conversations = new SubagentConversationPersistence(options.transcriptStore)
   const historySessionIds = new Map<string, string>()
   /** Child depth advertised by the manager for each in-flight run, keyed by the unique running task id. */
   const runningChildDepths = new Map<string, { readonly childDepth: number, readonly taskId: string }>()
   const manager = new SubAgentManager({
+    ...(routedWorktrees ? { worktree: routedWorktrees } : {}),
     idFactory: () => {
       const taskId = `subagent_${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`
       if (options.transcriptStore) {
@@ -160,15 +211,39 @@ export function createNativeSubagentHost(options: NativeSubagentHostOptions): Na
     ...(options.durableTaskBridge === undefined ? {} : { durableTaskBridge: options.durableTaskBridge }),
     onEvent: event => publishSubagentEvent(options.eventBus, event, historySessionIds.get(event.taskId)),
     pathResolver: rawPath => rawPath,
-    runner: request => {
-      const generation = nativeHostGeneration(request.config)
-      return runNativeSubagent(
+    runner: async request => {
+      const generation = nativeHostGeneration(request.config) ?? taskGenerations.get(request.task.id)
+      taskGenerations.set(request.task.id, generation ?? activeGeneration)
+      const configuration = generation === undefined ? activeOptions : generationOptions.get(generation)
+      if (!configuration) throw new Error('Agent execution generation is no longer available; refusing a different workspace')
+      const workspace = workspaceFromConfig(request.config) ?? configuration.cwd
+      const executionConfiguration = workspace === configuration.cwd ? configuration : { ...configuration, cwd: workspace }
+      const history = executionConfiguration.runHistory
+      const run = request.task.sourceId ? history?.start({
+        ownerSessionId: request.task.sourceId,
+        workspace: request.worktree?.path ?? workspace,
+        kind: 'agent', sourceId: request.task.id,
+        title: `${request.task.title || request.task.name || request.prompt} · attempt ${request.task.attempt + 1}`,
+      }) : undefined
+      try {
+        const output = await runWithActiveSession({ cwd: request.worktree?.path ?? workspace }, () => runNativeSubagent(
         request,
-        generation === undefined ? activeOptions : generationOptions.get(generation) ?? activeOptions,
+        executionConfiguration,
         conversations,
         historySessionIds.get(request.task.id),
         runningChildDepths,
-      )
+      ))
+        request.cancelSignal.throwIfAborted()
+        if (!output.content.trim()) throw new Error('Subagent completed without a final response')
+        if (run) history?.finish(run.ownerSessionId, run.id, 'succeeded', { output: output.content })
+        return output
+      } catch (error) {
+        if (run) history?.finish(run.ownerSessionId, run.id, request.cancelSignal.aborted ? 'cancelled' : 'failed', {
+          error: errorText(error),
+          ...(error instanceof IncompleteSubagentTurnError ? { output: error.partialOutput } : {}),
+        })
+        throw error
+      }
     },
   })
   const liveManagerPort = new RichSubagentManagerPort(
@@ -186,9 +261,14 @@ export function createNativeSubagentHost(options: NativeSubagentHostOptions): Na
     undefined,
     snapshots => managerPort.restoreSnapshots(snapshots),
   )
-  /** Drop option generations no live task can still start with; the active generation is always kept. */
+  /** Keep execution generations for retained tasks, including terminal tasks that can be retried. */
   const pruneGenerationOptions = (): void => {
     const live = liveManagerPort.liveGenerations()
+    const retained = new Set(manager.listTasks().map(task => task.id))
+    for (const [id, generation] of taskGenerations) {
+      if (retained.has(id)) live.add(generation)
+      else taskGenerations.delete(id)
+    }
     for (const generation of generationOptions.keys()) {
       if (generation !== activeGeneration && !live.has(generation)) generationOptions.delete(generation)
     }
@@ -202,6 +282,9 @@ export function createNativeSubagentHost(options: NativeSubagentHostOptions): Na
     interruptSource: sourceAgentId => managerPort.interruptSource(sourceAgentId),
     retry: (task, retryOptions) => managerPort.retry(task, retryOptions ?? {}),
     reconfigure(nextOptions) {
+      if (nextOptions.worktreeForWorkspace !== options.worktreeForWorkspace || nextOptions.worktree !== options.worktree || (options.worktree && nextOptions.cwd !== options.cwd)) {
+        throw new Error('A native subagent host cannot change its worktree owner; create a separate host')
+      }
       if (nextOptions.eventBus !== options.eventBus) {
         throw new Error('A native subagent host cannot be moved to a different event bus')
       }
@@ -225,6 +308,8 @@ export function createNativeSubagentHost(options: NativeSubagentHostOptions): Na
 }
 
 interface HandleMetadata {
+  readonly providerProfile?: string
+  readonly reasoningEffort?: string
   readonly agentId: string
   closed: boolean
   readonly createdAt: string
@@ -240,6 +325,13 @@ interface HandleMetadata {
 
 /** Adapt the richer native manager to the Claude-compatible tool contract. */
 class RichSubagentManagerPort implements SpawnedAgentManagerPort {
+  private restoreModelCallScopes: NativeSubagentHostOptions['restoreModelCallScopes']
+  private validateProviderSelection: NativeSubagentHostOptions['validateProviderSelection']
+  private validateInheritedSelection: NativeSubagentHostOptions['validateInheritedSelection']
+  private resolveSourceWorkspace: NativeSubagentHostOptions['resolveSourceWorkspace']
+  private inheritedProviderRoute: NativeSubagentHostOptions['inheritedProviderRoute']
+  private resolveProviderRoute: NativeSubagentHostOptions['resolveProviderRoute']
+  private readonly hasWorkspaceWorktreeFactory: boolean
   private availableTools: readonly ToolDefinition[]
   private cwd: string
   private definitions: ReadonlyMap<string, AgentDefinition>
@@ -258,6 +350,13 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     private readonly historySessionIds: Map<string, string>,
     private readonly runningChildDepths: ReadonlyMap<string, { readonly childDepth: number, readonly taskId: string }>,
   ) {
+    this.restoreModelCallScopes = options.restoreModelCallScopes
+    this.validateProviderSelection = options.validateProviderSelection
+    this.validateInheritedSelection = options.validateInheritedSelection
+    this.resolveSourceWorkspace = options.resolveSourceWorkspace
+    this.inheritedProviderRoute = options.inheritedProviderRoute
+    this.resolveProviderRoute = options.resolveProviderRoute
+    this.hasWorkspaceWorktreeFactory = options.worktreeForWorkspace !== undefined
     this.availableTools = options.tools
     this.cwd = options.cwd
     this.definitions = options.agentDefinitions
@@ -268,6 +367,12 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
   }
 
   reconfigure(options: NativeSubagentHostOptions, generation: number): void {
+    this.restoreModelCallScopes = options.restoreModelCallScopes
+    this.validateProviderSelection = options.validateProviderSelection
+    this.validateInheritedSelection = options.validateInheritedSelection
+    this.resolveSourceWorkspace = options.resolveSourceWorkspace
+    this.inheritedProviderRoute = options.inheritedProviderRoute
+    this.resolveProviderRoute = options.resolveProviderRoute
     this.availableTools = options.tools
     this.cwd = options.cwd
     this.definitions = options.agentDefinitions
@@ -281,6 +386,10 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     return this.manager.listTasks().map(task => this.snapshot(task))
   }
 
+  listRetryTasks(): ReturnType<SubAgentManager['listRetryTasks']> {
+    return this.manager.listRetryTasks()
+  }
+
   /** Generations still pinned by a task that has not reached a terminal state. */
   liveGenerations(): Set<number> {
     const generations = new Set<number>()
@@ -292,6 +401,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
   }
 
   async spawn(options: SpawnAgentOptions = {}): Promise<SpawnedAgentSnapshot> {
+    options.signal?.throwIfAborted()
     const prompt = (options.message ?? options.taskDescription)?.trim()
     if (!prompt) throw new ValidationError('message', 'spawned agent input is required', prompt)
     const name = options.nickname?.trim()
@@ -316,10 +426,20 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     const permissionMode = delegatedPermissionExceeds(requestedPermissionMode, this.fallbackPermissionMode)
       ? this.fallbackPermissionMode
       : requestedPermissionMode
+    const workspace = this.resolveWorkspace(options.sourceAgentId)
+    const providerRoute = this.captureProviderRoute(options.agent?.providerProfile, model)
     const task = await this.spawnResolved({
+      ...(options.signal ? { signal: options.signal } : {}),
       definition,
+      ...(options.isolation ? { isolation: options.isolation } : {}),
+      ...(options.worktreeRef === undefined ? {} : { worktreeRef: options.worktreeRef }),
+      ...(options.worktreeSource === undefined ? {} : { worktreeSource: options.worktreeSource }),
       input: prompt,
+      ...(options.agent?.providerProfile ? { providerProfile: options.agent.providerProfile } : {}),
+      ...(options.agent?.reasoningEffort ? { reasoningEffort: options.agent.reasoningEffort } : {}),
       model,
+      workspace,
+      ...(providerRoute === undefined ? {} : { providerRoute }),
       permissionMode,
       ...(options.title ? { title: options.title } : {}),
       ...(name ? { name } : {}),
@@ -332,11 +452,19 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
 
   /** Shared spawn core used by fresh spawns and identity-preserving retry respawns. */
   private async spawnResolved(resolved: {
+    readonly signal?: AbortSignal
+    readonly isolation?: 'worktree'
+    readonly worktreeRef?: string
+    readonly worktreeSource?: 'working-tree'
+    readonly providerProfile?: string
+    readonly reasoningEffort?: string
     readonly creatorAgentId?: string
     readonly definition: AgentDefinition
     readonly historySessionId?: string
     readonly input: string
     readonly model: string
+    readonly workspace: string
+    readonly providerRoute?: string
     readonly name?: string
     readonly parentAgentId?: string
     readonly permissionMode: PermissionMode
@@ -345,10 +473,32 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     readonly title?: string
   }): Promise<SubAgentTask> {
     const { definition, model, permissionMode } = resolved
+    if ((resolved.isolation ?? definition.isolation) === 'worktree'
+      && resolved.workspace !== normalizeWorkspace(this.cwd, 'host workspace') && !this.hasWorkspaceWorktreeFactory) {
+      throw new ValidationError('workspace', 'alternate workspaces require worktreeForWorkspace', resolved.workspace)
+    }
+    this.assertProviderRoute(resolved.providerProfile, model, resolved.providerRoute)
+    const generation = this.generation
+    resolved.signal?.throwIfAborted()
+    if (resolved.providerProfile) await this.validateProviderSelection?.(resolved.providerProfile, model, resolved.reasoningEffort, resolved.signal)
+    else await this.validateInheritedSelection?.(model, resolved.reasoningEffort, resolved.signal)
+    resolved.signal?.throwIfAborted()
+    if (generation !== this.generation) throw new Error('Agent host changed during selection validation; retry the spawn')
+    this.assertProviderRoute(resolved.providerProfile, model, resolved.providerRoute)
+    const worktreeRef = parseWorktreeRef(resolved.worktreeRef)
+    const worktreeSource = parseWorktreeSource(resolved.worktreeSource)
+    if (worktreeSource && (worktreeRef || (resolved.isolation ?? definition.isolation) !== 'worktree')) throw new ValidationError('worktree_source', 'requires isolation=worktree and no worktree_ref', worktreeSource)
+    if (worktreeRef && (resolved.isolation ?? definition.isolation) !== 'worktree') throw new ValidationError('worktree_ref', 'requires isolation=worktree', worktreeRef)
     const config = {
+      ...(resolved.providerProfile ? { providerProfile: resolved.providerProfile } : {}),
+      ...(resolved.reasoningEffort ? { reasoningEffort: resolved.reasoningEffort } : {}),
       model,
+      _nativeSubagentWorkspace: resolved.workspace,
+      ...(resolved.providerRoute === undefined ? {} : { _nativeSubagentProviderRoute: resolved.providerRoute }),
       permissionMode,
-      _nativeSubagentHostGeneration: this.generation,
+      _nativeSubagentHostGeneration: generation,
+      ...(worktreeRef ? { _nativeSubagentWorktreeRef: worktreeRef } : {}),
+      ...(worktreeSource ? { _nativeSubagentWorktreeSource: worktreeSource } : {}),
       ...(definition.allowedTools === null
         ? {}
         : { _toolsAllowed: [...definition.allowedTools] }),
@@ -356,7 +506,8 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
       ...(definition.tools.length ? { _toolsWhitelist: [...definition.tools] } : {}),
     }
     const toolsets = subagentTools(this.availableTools, config).map(tool => tool.function.name)
-    const rules = nativeRuleLabels(permissionMode, definition.isolation)
+    const isolation = resolved.isolation ?? definition.isolation
+    const rules = [...nativeRuleLabels(permissionMode, isolation), ...(worktreeRef ? ['worktree-ref:' + worktreeRef] : []), ...(worktreeSource ? ['worktree-source:' + worktreeSource] : [])]
     const parentKey = resolved.parentAgentId ?? resolved.creatorAgentId
     const childDepth = parentKey === undefined ? undefined : this.parentRunningChildDepth(parentKey)
     // An identity-preserving respawn must register its persisted history
@@ -370,6 +521,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
       ...(resolved.title ? { title: resolved.title } : {}),
       ...(resolved.name ? { name: resolved.name } : {}),
       agentDefinition: definition,
+      isolation,
       ...(resolved.sourceAgentId ? { sourceId: resolved.sourceAgentId } : {}),
       ...(resolved.creatorAgentId ? { creatorId: resolved.creatorAgentId } : {}),
       ...(resolved.parentAgentId ? { parentId: resolved.parentAgentId } : {}),
@@ -382,10 +534,12 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     })
     this.handles.set(task.id, {
       agentId: definition.name,
+      ...(resolved.providerProfile ? { providerProfile: resolved.providerProfile } : {}),
+      ...(resolved.reasoningEffort ? { reasoningEffort: resolved.reasoningEffort } : {}),
       closed: false,
       createdAt: new Date().toISOString(),
       creatorAgentId: resolved.creatorAgentId,
-      generation: this.generation,
+      generation,
       historySessionId: this.historySessionIds.get(task.id),
       lastInput: resolved.input,
       parentAgentId: resolved.parentAgentId ?? resolved.creatorAgentId,
@@ -428,8 +582,10 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     // Restore the persisted history link before the attempt starts so the
     // runner resumes the prior conversation rather than opening a fresh one.
     if (historySessionId && this.transcripts) this.historySessionIds.set(info.id, historySessionId)
+    const taskRecord = this.manager.listRetryTasks().find(candidate => candidate.id === info.id)
+    const workspace = taskRecord?.workspace ?? this.resolveWorkspace(taskRecord?.sourceAgentId)
     const input = options.message?.trim()
-      || await this.continuationInput(historySessionId, metadata?.lastInput ?? '')
+      || await this.continuationInput(historySessionId, metadata?.lastInput ?? '', workspace)
     const task = await this.manager.retry(info.id, input)
     if (task === undefined) {
       throw new ValidationError(
@@ -450,7 +606,13 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
    * Respawn a task recovered from a persisted parent transcript after a
    * daemon restart, keeping its stable task id, name, and history link.
    */
-  async respawnRecovered(snapshot: SpawnedAgentSnapshot, input: string): Promise<SpawnedAgentSnapshot> {
+  async respawnRecovered(snapshot: SpawnedAgentSnapshot, input: string, mode: 'retry' | 'reset' = 'retry'): Promise<SpawnedAgentSnapshot> {
+    // Unknown serialized scopes cannot become unrestricted work on restart.
+    if (!this.restoreModelCallScopes && snapshot.modelCallBindings?.length) {
+      throw new ValidationError('task', 'Cannot restore delegated budget ownership in this host; dispatch new work from the parent session', snapshot.id)
+    }
+    const scopes = this.restoreModelCallScopes?.(snapshot) ?? []
+    for (const scope of scopes) scope.assertAdmission()
     const definition = this.resolveChildDefinition(snapshot.creatorAgentId, snapshot.promptProfile)
     if (!definition) {
       throw new ValidationError(
@@ -460,23 +622,36 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
       )
     }
     const model = snapshot.model?.trim() || stringConfig(definition.model) || this.fallbackModel
+    const workspace = this.resolveRecoveredWorkspace(snapshot)
+    const providerRoute = providerRouteOf(snapshot)
+    if (providerRoute === undefined && (this.inheritedProviderRoute !== undefined || this.resolveProviderRoute !== undefined)) {
+      throw new ValidationError('provider_route', 'cannot recover a child without its original provider route; dispatch new work under the current route', snapshot.id)
+    }
+    this.assertProviderRoute(snapshot.providerProfile, model, providerRoute)
     const requestedMode = snapshot.rules?.length ? permissionModeFromRules(snapshot.rules) : this.fallbackPermissionMode
     const permissionMode = delegatedPermissionExceeds(requestedMode, this.fallbackPermissionMode)
       ? this.fallbackPermissionMode
       : requestedMode
-    const task = await this.spawnResolved({
+    const task = await withCapturedModelCallScopes(scopes, () => this.spawnResolved({
       definition,
+      ...(snapshot.rules?.includes('worktree-source:working-tree') ? { worktreeSource: 'working-tree' as const } : {}),
+      ...(snapshot.rules?.includes('isolation:worktree') ? { isolation: 'worktree' as const } : {}),
+      ...(snapshot.rules?.find(rule => rule.startsWith('worktree-ref:')) ? { worktreeRef: snapshot.rules.find(rule => rule.startsWith('worktree-ref:'))!.slice('worktree-ref:'.length) } : {}),
       input,
       model,
+      workspace,
+      ...(providerRoute === undefined ? {} : { providerRoute }),
       permissionMode,
-      taskId: snapshot.id,
-      ...(snapshot.historySessionId ? { historySessionId: snapshot.historySessionId } : {}),
+      ...(mode === 'retry' ? { taskId: snapshot.id } : {}),
+      ...(snapshot.providerProfile ? { providerProfile: snapshot.providerProfile } : {}),
+      ...(snapshot.reasoningEffort ? { reasoningEffort: snapshot.reasoningEffort } : {}),
+      ...(mode === 'retry' && snapshot.historySessionId ? { historySessionId: snapshot.historySessionId } : {}),
       ...(snapshot.name ? { name: snapshot.name } : {}),
       ...(snapshot.title ? { title: snapshot.title } : {}),
       ...(snapshot.creatorAgentId ? { creatorAgentId: snapshot.creatorAgentId } : {}),
       ...(snapshot.parentAgentId ? { parentAgentId: snapshot.parentAgentId } : {}),
       ...(snapshot.sourceAgentId ? { sourceAgentId: snapshot.sourceAgentId } : {}),
-    })
+    }))
     return this.snapshot(task)
   }
 
@@ -485,16 +660,20 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
    * conversation persisted, otherwise the recorded original prompt so a task
    * that died before its first checkpoint still gets its instructions.
    */
-  async continuationInput(historySessionId: string | undefined, fallbackInput: string): Promise<string> {
+  async continuationInput(historySessionId: string | undefined, fallbackInput: string, workspace = this.cwd): Promise<string> {
     const store = this.transcripts
     if (!historySessionId || !store) return fallbackInput
     try {
-      const transcript = await store.load(historySessionId, { currentProjectDirectory: this.cwd })
+      const transcript = await store.load(historySessionId, { currentProjectDirectory: workspace })
       if (transcript && transcript.messages.length > 0) return SUBAGENT_RETRY_CONTINUATION_PROMPT
     } catch {
       // An unreadable history falls back to resubmitting the original prompt.
     }
     return fallbackInput
+  }
+
+  continuationInputForSnapshot(snapshot: SpawnedAgentSnapshot): Promise<string> {
+    return this.continuationInput(snapshot.historySessionId, snapshot.lastInput ?? '', this.resolveRecoveredWorkspace(snapshot))
   }
 
   /**
@@ -608,6 +787,36 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     return definition
   }
 
+  private resolveWorkspace(sourceId: string | undefined): string {
+    const raw = sourceId?.trim() && this.resolveSourceWorkspace
+      ? this.resolveSourceWorkspace(sourceId.trim())
+      : this.cwd
+    return normalizeWorkspace(raw, 'source workspace')
+  }
+
+  private captureProviderRoute(profile: string | undefined, model: string): string | undefined {
+    const route = profile?.trim() ? this.resolveProviderRoute?.(profile.trim(), model) : this.inheritedProviderRoute
+    return route === undefined ? undefined : normalizeProviderRoute(route, 'provider route')
+  }
+
+  private assertProviderRoute(profile: string | undefined, model: string, expected: string | undefined): void {
+    if (expected === undefined) return
+    const current = profile?.trim()
+      ? this.resolveProviderRoute?.(profile.trim(), model)
+      : this.inheritedProviderRoute
+    if (current === undefined || normalizeProviderRoute(current, 'provider route') !== expected) {
+      throw new ValidationError('provider_route', 'provider route changed since this child was created; dispatch new work under the current route', { expected, current })
+    }
+  }
+
+  private resolveRecoveredWorkspace(snapshot: SpawnedAgentSnapshot): string {
+    if (snapshot.workspace !== undefined) {
+      if (!snapshot.workspace) throw new ValidationError('workspace', 'persisted workspace is malformed; dispatch new work from the parent session', snapshot.workspace)
+      return normalizeWorkspace(snapshot.workspace, 'persisted workspace')
+    }
+    return this.resolveWorkspace(snapshot.sourceAgentId)
+  }
+
   async sendInput(handleId: string | undefined, options: SendAgentInputOptions): Promise<SpawnedAgentSnapshot> {
     const task = this.requireTask(handleId)
     const input = (options.message ?? options.taskDescription)?.trim()
@@ -685,6 +894,8 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
   private snapshot(task: SubAgentTask, statusOverride?: SpawnedAgentStatus): SpawnedAgentSnapshot {
     const metadata = this.handles.get(task.id) ?? {
       agentId: task.agentDefName || task.name,
+      ...(task.providerProfile === undefined ? {} : { providerProfile: task.providerProfile }),
+      ...(task.reasoningEffort === undefined ? {} : { reasoningEffort: task.reasoningEffort }),
       closed: false,
       createdAt: new Date().toISOString(),
       creatorAgentId: task.creatorId || undefined,
@@ -701,12 +912,17 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     const updatedAt = new Date(task.lastActivityAt ?? Date.now()).toISOString()
     return Object.freeze({
       agentId: metadata.agentId,
+      modelCallBindings: task.modelCallBindings,
+      ...(task.providerRoute === undefined ? {} : { providerRoute: task.providerRoute }),
+      ...(task.workspace === undefined ? {} : { workspace: task.workspace }),
       attempt: task.attempt,
       closed: metadata.closed || status === 'closed',
       createdAt: metadata.createdAt,
       ...(task.error ? { error: task.error } : {}),
       ...(metadata.historySessionId ? { historySessionId: metadata.historySessionId } : {}),
       id: task.id,
+      ...(metadata.providerProfile ? { providerProfile: metadata.providerProfile } : {}),
+      ...(metadata.reasoningEffort ? { reasoningEffort: metadata.reasoningEffort } : {}),
       ...(metadata.lastInput ? { lastInput: metadata.lastInput } : {}),
       ...(task.result === undefined ? {} : { lastOutput: task.result }),
       name: task.name,
@@ -797,7 +1013,7 @@ class RecoverableSubagentManagerPort implements SpawnedAgentManagerPort {
     if (this.findLive(handleId)) return this.live.sendInput(handleId, options)
     const recovered = this.findRecovered(handleId)
     if (!recovered) return this.live.sendInput(handleId, options)
-    if (!this.pendingRestart.delete(recovered.id)) {
+    if (!this.pendingRestart.has(recovered.id)) {
       throw new ValidationError(
         'handle_id',
         'belongs to a task interrupted by a daemon restart; call ResetAgent to rerun it',
@@ -806,21 +1022,13 @@ class RecoverableSubagentManagerPort implements SpawnedAgentManagerPort {
     }
     const input = (options.message ?? options.taskDescription)?.trim()
     if (!input) throw new ValidationError('message', 'spawned agent input is required', input)
-    const replacement = await this.live.spawn({
-      agent: {
-        id: recovered.agentId,
-        ...(recovered.model ? { model: recovered.model } : {}),
-        name: recovered.promptProfile,
-      },
-      message: input,
-      nickname: recovered.name,
-      ...(recovered.creatorAgentId ? { creatorAgentId: recovered.creatorAgentId } : {}),
-      ...(recovered.parentAgentId ? { parentAgentId: recovered.parentAgentId } : {}),
-      promptProfile: recovered.promptProfile,
-      ...(recovered.sourceAgentId ? { sourceAgentId: recovered.sourceAgentId } : {}),
-      title: recovered.title,
+    this.pendingRestart.delete(recovered.id)
+    const replacement = await this.live.respawnRecovered(recovered, input, 'reset').catch(error => {
+      this.pendingRestart.add(recovered.id)
+      throw error
     })
     this.recovered.delete(recovered.id)
+    this.pendingRestart.delete(recovered.id)
     this.tombstones.add(recovered.id)
     return replacement
   }
@@ -867,11 +1075,15 @@ class RecoverableSubagentManagerPort implements SpawnedAgentManagerPort {
    * resumable in a later session after a daemon restart.
    */
   async retry(handleId: string | undefined, options: SubagentRetryOptions = {}): Promise<SpawnedAgentSnapshot> {
+    if (options.sourceAgentId !== undefined) {
+      const identities = new Map([...this.recovered.values(), ...this.live.listRetryTasks()].map(task => [task.id, task]))
+      handleId = resolveOwnedSubagentRetry([...identities.values()], handleId, options.sourceAgentId).id
+    }
     if (this.findLive(handleId)) return this.live.retry(handleId, options)
     const recovered = this.findRecovered(handleId)
     if (!recovered) return this.live.retry(handleId, options)
     const input = options.message?.trim()
-      || await this.live.continuationInput(recovered.historySessionId, recovered.lastInput ?? '')
+      || await this.live.continuationInputForSnapshot(recovered)
     if (!input.trim()) {
       throw new ValidationError(
         'handle_id',
@@ -964,6 +1176,36 @@ async function runNativeSubagent(
   runningChildDepths: Map<string, { readonly childDepth: number, readonly taskId: string }>,
 ): Promise<{ readonly content: string }> {
   const model = request.task.model.trim() || stringConfig(request.config.model) || options.model
+  const providerProfile = stringConfig(request.config.providerProfile)
+  const expectedRoute = providerRouteFromConfig(request.config)
+  const currentRoute = providerProfile
+    ? options.resolveProviderRoute?.(providerProfile, model)
+    : options.inheritedProviderRoute
+  if (expectedRoute !== undefined && currentRoute !== expectedRoute) {
+    throw new ValidationError('provider_route', 'provider route changed before child execution; dispatch new work under the current route', { expected: expectedRoute, current: currentRoute })
+  }
+  if (!providerProfile) {
+    request.cancelSignal.throwIfAborted()
+    await options.validateInheritedSelection?.(model, stringConfig(request.config.reasoningEffort) || undefined, request.cancelSignal)
+    request.cancelSignal.throwIfAborted()
+    const afterValidation = options.inheritedProviderRoute
+    if (expectedRoute !== undefined && afterValidation !== expectedRoute) {
+      throw new ValidationError('provider_route', 'provider route changed before child execution; dispatch new work under the current route', { expected: expectedRoute, current: afterValidation })
+    }
+  }
+  if (providerProfile) {
+    request.cancelSignal.throwIfAborted()
+    await options.validateProviderSelection?.(providerProfile, model, stringConfig(request.config.reasoningEffort) || undefined, request.cancelSignal)
+    request.cancelSignal.throwIfAborted()
+    const afterValidation = options.resolveProviderRoute?.(providerProfile, model)
+    if (expectedRoute !== undefined && afterValidation !== expectedRoute) {
+      throw new ValidationError('provider_route', 'provider route changed before child execution; dispatch new work under the current route', { expected: expectedRoute, current: afterValidation })
+    }
+    if (!options.resolveProviderProfile) throw new Error('This host cannot route per-agent provider profiles')
+    const selected = options.resolveProviderProfile(providerProfile, model, expectedRoute)
+    const { maxTokens: _max, maxOutputTokens: _output, contextLimit: _context, temperature: _temperature, topK: _topK, topP: _topP, ...shared } = options
+    options = { ...shared, ...selected }
+  }
   const permissionMode = permissionModeConfig(request.config.permissionMode, options.permissionMode)
   const permissionBroker = delegatedPermissionBroker(permissionMode)
   const tools = subagentTools(options.tools, request.config)
@@ -1036,6 +1278,7 @@ async function runNativeSubagent(
         agentId: request.task.agentDefName || request.task.id,
         ...(maxTokens === undefined ? {} : { maxTokens }),
         model,
+        ...(stringConfig(request.config.reasoningEffort) ? { thinking: { effort: stringConfig(request.config.reasoningEffort) } } : {}),
         permissionMode,
         sessionId: conversation.historySessionId,
         state,
@@ -1072,12 +1315,14 @@ async function runNativeSubagent(
           }
           const visibleText = reportNativeSubagentEvent(event, request)
           if (event.type === 'turn_done' && (
-            event.reason === 'provider_failed' || event.reason === 'context_overflow'
+            event.reason && event.reason !== 'completed' && event.reason !== 'objective_verified'
           )) {
             terminalFailure = new Error(
               event.reason === 'context_overflow'
                 ? 'Subagent provider context window was exhausted'
-                : 'Subagent provider request failed',
+                : event.reason === 'provider_failed'
+                  ? 'Subagent provider request failed'
+                  : `Subagent stopped before completion: ${event.reason}`,
             )
           }
           output += visibleText
@@ -1106,7 +1351,7 @@ async function runNativeSubagent(
         const firstEvent = await firstEventPromise
         if (!firstEvent.done) await checkpoint(firstEvent.value)
         for await (const event of iterator) await checkpoint(event)
-        if (terminalFailure) throw terminalFailure
+        if (terminalFailure) throw new IncompleteSubagentTurnError(terminalFailure.message, output)
         await conversations.save(
           conversation,
           state,
@@ -1196,7 +1441,8 @@ async function compactChildConversation(input: ChildCompactionRequest): Promise<
     // Splice, not reassign: `AgentState.messages` is a shared array the turn
     // already holds a reference to.
     state.messages.splice(0, state.messages.length, ...(outcome.messages as unknown as ChatMessage[]))
-    state.metadata = { ...state.metadata, last_compaction: outcome.stamp }
+    state.metadata = { ...state.metadata }
+    recordCompaction(state.metadata, outcome.stamp)
     // Same rule as the main session's compaction: the summary no longer
     // carries full file contents, so the child must re-read before editing.
     fileStateTracker.clearSession(conversation.historySessionId)
@@ -1374,6 +1620,8 @@ function daemonEventFromSubagent(
     ...(historySessionId ? { history_session_id: historySessionId } : {}),
     parent_id: event.parentId || null,
     model: event.model || undefined,
+    ...(event.providerProfile ? { provider_profile: event.providerProfile } : {}),
+    ...(event.reasoningEffort ? { reasoning_effort: event.reasoningEffort } : {}),
     rules: event.rules,
     toolsets: event.toolsets,
     tool_count: event.toolCalls,
@@ -1567,6 +1815,13 @@ function stringList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
+class IncompleteSubagentTurnError extends Error {
+  constructor(message: string, readonly partialOutput: string) {
+    super(message)
+    this.name = 'IncompleteSubagentTurnError'
+  }
+}
+
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -1586,7 +1841,9 @@ function latestAssistantText(messages: readonly { readonly content: unknown; rea
 
 /** Serializable v35 wire view of a retried subagent for the `subagent.retry` response. */
 export function subagentRetryWirePayload(snapshot: SpawnedAgentSnapshot): Record<string, unknown> {
+  const providerRoute = providerRouteOf(snapshot)
   return {
+    ...(snapshot.modelCallBindings === undefined ? {} : { model_call_bindings: snapshot.modelCallBindings }),
     id: snapshot.id,
     name: snapshot.name,
     title: snapshot.title,
@@ -1597,8 +1854,45 @@ export function subagentRetryWirePayload(snapshot: SpawnedAgentSnapshot): Record
     ...(snapshot.historySessionId ? { history_session_id: snapshot.historySessionId } : {}),
     ...(snapshot.error ? { error: snapshot.error } : {}),
     ...(snapshot.model ? { model: snapshot.model } : {}),
+    ...(snapshot.providerProfile ? { provider_profile: snapshot.providerProfile } : {}),
+    ...(snapshot.reasoningEffort ? { reasoning_effort: snapshot.reasoningEffort } : {}),
+    ...(snapshot.workspace === undefined ? {} : { workspace: snapshot.workspace }),
+    ...(providerRoute === undefined ? {} : { provider_route: providerRoute }),
     ...(snapshot.sourceAgentId ? { source_agent_id: snapshot.sourceAgentId } : {}),
     ...(snapshot.creatorAgentId ? { creator_agent_id: snapshot.creatorAgentId } : {}),
     ...(snapshot.parentAgentId ? { parent_agent_id: snapshot.parentAgentId } : {}),
   }
+}
+
+function workspaceFromConfig(config: Readonly<Record<string, unknown>> | undefined): string | undefined {
+  if (!config || !Object.hasOwn(config, '_nativeSubagentWorkspace')) return undefined
+  const value = config._nativeSubagentWorkspace
+  if (typeof value !== 'string' || !value) throw new ValidationError('workspace', 'native subagent workspace is malformed', value)
+  return normalizeWorkspace(value, 'native subagent workspace')
+}
+
+function providerRouteFromConfig(config: Readonly<Record<string, unknown>> | undefined): string | undefined {
+  if (!config || !Object.hasOwn(config, '_nativeSubagentProviderRoute')) return undefined
+  const value = config._nativeSubagentProviderRoute
+  return normalizeProviderRoute(value, 'native subagent provider route')
+}
+
+function providerRouteOf(snapshot: SpawnedAgentSnapshot): string | undefined {
+  if (!Object.hasOwn(snapshot, 'providerRoute')) return undefined
+  const value = snapshot.providerRoute
+  return normalizeProviderRoute(value, 'persisted provider route')
+}
+
+function normalizeProviderRoute(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new ValidationError('provider_route', `${field} is malformed; dispatch new work under the current route`, value)
+  }
+  return value
+}
+
+function normalizeWorkspace(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !value || value.trim() !== value || value.includes('\u0000') || !isAbsolute(value)) {
+    throw new ValidationError(field, 'must be a non-empty absolute path without whitespace padding or NUL bytes', value)
+  }
+  return resolve(value)
 }

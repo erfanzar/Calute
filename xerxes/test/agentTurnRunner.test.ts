@@ -14,6 +14,9 @@ import { AgentMemory } from '../src/memory/agentMemory.js'
 import { AgentSelfMemory } from '../src/memory/agentSelfMemory.js'
 import { appendContextDelta, readContextDeltas } from '../src/runtime/contextDeltas.js'
 import { registerInteractionModeTool } from '../src/runtime/interactionModeTool.js'
+import { createGoal, editGoal, getGoal } from '../src/runtime/goalDomain.js'
+import { registerGoalTools } from '../src/runtime/goalTools.js'
+import { findGoalEvidenceExecution } from '../src/runtime/goalEvidence.js'
 import { BUILTIN_AGENTS, type AgentDefinition } from '../src/agents/definitions.js'
 import { AuditEmitter, InMemoryCollector } from '../src/index.js'
 import type { DaemonEvent, DaemonSession } from '../src/daemon/runtime.js'
@@ -26,6 +29,87 @@ class TextClient implements LlmClient {
     yield { content: 'Hello from the real loop.', usage: { inputTokens: 3, outputTokens: 5 } }
   }
 }
+
+test('goal evidence resolves a real completed tool call before the next provider inference', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'xerxes-goal-evidence-'))
+  try {
+    const registry = new ToolRegistry()
+    let runtime: InMemoryDaemonRuntime
+    registerGoalTools(registry, {
+      sessionId: context => String(context.sessionId), metadata: context => context.metadata,
+      isHumanTurn: () => true, currentRound: () => undefined,
+      evidenceExecution: (context, id) => findGoalEvidenceExecution(runtime.listSessions().find(row => row.id === context.sessionId)?.toolExecutions ?? [], id),
+    })
+    registry.register({ type: 'function', function: { name: 'CompareArtifacts', description: 'Compare two test artifacts', parameters: { type: 'object', properties: {} } } }, () => ({ exit_code: 0 }))
+    let calls = 0
+    let activeSession: DaemonSession
+    const runner = new AgentTurnRunner({ model: 'gpt-4o', permissionMode: 'accept-all', toolExecutor: registry, tools: registry.definitions(),
+      llm: { async *stream() {
+        calls++
+        const goal = getGoal(activeSession.metadata, activeSession.id)!
+        if (calls === 1) yield { toolCalls: [{ id: 'artifact-proof', type: 'function' as const, function: { name: 'CompareArtifacts', arguments: {} } }] }
+        else if (calls === 2) yield { toolCalls: [{ id: 'record-proof', type: 'function' as const, function: { name: 'update_goal', arguments: { goal_id: goal.id, revision: goal.revision, action: 'record_evidence', criterion_id: 'equal', tool_call_id: 'artifact-proof', evidence_summary: 'Comparison exited zero' } } }] }
+        else if (calls === 3) {
+          expect(goal.criteria?.[0]?.evidence?.toolCallId).toBe('artifact-proof')
+          yield { toolCalls: [{ id: 'complete-goal', type: 'function' as const, function: { name: 'update_goal', arguments: { goal_id: goal.id, revision: goal.revision, action: 'complete' } } }] }
+        } else yield { content: 'Completed with comparison evidence.' }
+      } },
+    })
+    runtime = new InMemoryDaemonRuntime(runner, { model: 'gpt-4o', currentProjectDirectory: root, sessionDirectory: join(root, 'sessions') })
+    activeSession = await runtime.openSession('evidence-flow')
+    createGoal(activeSession.metadata, activeSession.id, { objective: 'Match the artifacts', criteria: [{ id: 'equal', description: 'Artifacts match' }] }, Date.now())
+    await runtime.submitTurn(activeSession.sessionKey, 'Verify and finish', () => {})
+    expect(activeSession.toolExecutions[1]).toMatchObject({ result: expect.stringContaining('artifact-proof') })
+    expect(activeSession.toolExecutions).toHaveLength(3)
+    expect(getGoal(activeSession.metadata, activeSession.id)?.phase).toBe('complete')
+    expect(calls).toBe(4)
+    const reloadedRuntime = new InMemoryDaemonRuntime(undefined, { model: 'gpt-4o', currentProjectDirectory: root, sessionDirectory: join(root, 'sessions') })
+    const reloaded = await reloadedRuntime.openSession(activeSession.id, activeSession.agentId, { resume: true, cwd: activeSession.cwd })
+    expect(getGoal(reloaded.metadata, reloaded.id)?.criteria?.[0]?.evidence).toMatchObject({ toolCallId: 'artifact-proof', summary: 'Comparison exited zero' })
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('goal tools update the live session before the next inference and preserve intervening human edits on failure', async () => {
+  const registry = new ToolRegistry()
+  registerGoalTools(registry, {
+    sessionId: context => String(context.sessionId), metadata: context => context.metadata,
+    isHumanTurn: () => true, currentRound: () => undefined,
+  })
+  let activeSession: DaemonSession
+  let calls = 0
+  const runner = new AgentTurnRunner({
+    model: 'gpt-4o', permissionMode: 'accept-all', toolExecutor: registry, tools: registry.definitions(),
+    llm: { async *stream() {
+      if (++calls === 1) {
+        const goal = getGoal(activeSession.metadata, activeSession.id)!
+        yield { toolCalls: [{ id: 'edit-goal', type: 'function' as const, function: {
+          name: 'update_goal', arguments: { goal_id: goal.id, revision: goal.revision, action: 'edit', objective: 'Optimize TPU kernels' },
+        } }] }
+        return
+      }
+      const goal = getGoal(activeSession.metadata, activeSession.id)!
+      expect(goal.objective).toBe('Optimize TPU kernels')
+      editGoal(activeSession.metadata, activeSession.id, goal, { objective: 'Human revised objective' }, Date.now())
+      throw new Error('provider unavailable after goal edit')
+    } },
+  })
+  const runtime = new InMemoryDaemonRuntime(runner, { model: 'gpt-4o' })
+  activeSession = await runtime.openSession('live-goal', 'default')
+  createGoal(activeSession.metadata, activeSession.id, { objective: 'Old review goal' }, Date.now())
+  let observed = false
+  try {
+    for await (const event of runner.run(activeSession, 'change the goal', new AbortController().signal)) {
+      if (event.type === 'tool_result') {
+        expect(getGoal(activeSession.metadata, activeSession.id)?.objective).toBe('Optimize TPU kernels')
+        observed = true
+      }
+    }
+  } catch (error) {
+    expect(String(error)).toContain('provider unavailable')
+  }
+  expect(observed).toBe(true)
+  expect(getGoal(activeSession.metadata, activeSession.id)?.objective).toBe('Human revised objective')
+})
 
 class CapturingClient implements LlmClient {
   readonly requests: CompletionRequest[] = []
@@ -160,7 +244,7 @@ test('a vendor-prefixed model id runs without being read as a routing prefix', a
   expect((status as unknown as { payload: Record<string, unknown> }).payload).not.toHaveProperty('max_context')
 })
 
-test('agent turn runner fires extension hooks during the turn (hookRunner pass-through)', async () => {
+test.each([false, true])('agent turn runner fires extension hooks with session selection=%s', async useFactory => {
   const { HookRunner } = await import('../src/extensions/hooks.js')
   const hookRunner = new HookRunner()
   const fired: string[] = []
@@ -172,7 +256,7 @@ test('agent turn runner fires extension hooks during the turn (hookRunner pass-t
   })
 
   const runner = new AgentTurnRunner({
-    hookRunner,
+    ...(useFactory ? { hookRunnerForSession: (session: DaemonSession) => { expect(session.cwd).toBe(process.cwd()); return hookRunner } } : { hookRunner }),
     llm: new TextClient(),
     model: 'hook-model',
   })
@@ -285,6 +369,7 @@ test('agent turn runner maps portable loop events and supplied live capacity to 
         model: 'gpt-4o',
         usage: { inputTokens: 3, outputTokens: 5 },
         usage_complete: true,
+        stop_reason: 'completed',
         tool_calls: 0,
         api_calls: 1,
         calls: 1,
@@ -1037,6 +1122,33 @@ test('agent turn runner injects project-scoped persistent memory and exposes its
   }
 })
 
+test('session memory controls reach provider assembly without removing mandatory context', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'xerxes-runner-controls-'))
+  try {
+    const memory = new AgentMemory({ globalDirectory: join(root, 'global'), projectRoot: root })
+    await memory.write('project', 'MEMORY.md', 'EXCLUDED_PRIVATE_FACT')
+    await memory.write('project', 'KNOWLEDGE.md', 'VISIBLE_KNOWLEDGE')
+    const client = new CapturingClient()
+    const runner = new AgentTurnRunner({ agentMemory: () => memory, llm: client, model: 'gpt-4o' })
+    const session: DaemonSession = {
+      activeTurnId: '', agentId: 'default', cancelRequested: false, cwd: root, extra: {}, id: 'controls-session',
+      interactionMode: 'code', sessionKey: 'controls', lastActive: 0, messages: [],
+      metadata: { context_controls: { version: 1, revision: 1, pins: [{ scope: 'project', path: 'saved.md', content: 'PINNED_FACT' }], excluded: [{ scope: 'project', path: 'MEMORY.md' }] } },
+      model: 'gpt-4o', planMode: false, status: 'working', thinkingContent: [], toolExecutions: [],
+      totalInputTokens: 0, totalOutputTokens: 0, turnCount: 0, workspace: '/tmp/agents/default',
+      systemPromptAddendum: 'MANDATORY_CONTEXT',
+    }
+    for await (const _event of runner.run(session, 'recall', new AbortController().signal)) { /* observe provider below */ }
+    const system = String(client.requests[0]?.messages[0]?.content)
+    expect(system).toContain('PINNED_FACT')
+    expect(system).toContain('VISIBLE_KNOWLEDGE')
+    expect(system).toContain('MANDATORY_CONTEXT')
+    expect(system).not.toContain('EXCLUDED_PRIVATE_FACT')
+    expect(session.requestScaffold?.memorySources?.some(source => source.path === 'KNOWLEDGE.md')).toBe(true)
+    expect(session.requestScaffold?.memorySources?.some(source => source.scope === 'project' && source.path === 'MEMORY.md')).toBe(false)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('agent turn runner captures explicit workflow instructions before building the memory prompt', async () => {
   const root = await mkdtemp(join(tmpdir(), 'xerxes-runner-workflow-'))
   try {
@@ -1525,4 +1637,70 @@ test('agent turn runner does not fall back once content has streamed', async () 
   const joined = texts.join('')
   expect(joined).toContain('partial')
   expect(joined).not.toContain('fallback model reply')
+})
+
+test('background turn origins do not inherit human or previous goal-round authority', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-turn-origin-'))
+  const runtime = new InMemoryDaemonRuntime(new AgentTurnRunner({ llm: new TextClient(), model: 'test-model' }), {
+    currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions'),
+  })
+  try {
+    const session = await runtime.openSession('origin-test')
+    await runtime.submitTurn('origin-test', 'human task', () => {})
+    expect(session.metadata.goal_turn_human).toBe(true)
+    for (const origin of ['monitor', 'schedule'] as const) {
+      session.metadata.goal_turn_round = 99
+      await runtime.submitTurn('origin-test', 'background evidence', () => {}, { origin })
+      expect(session.metadata.goal_turn_human).toBe(false)
+      expect(session.metadata.goal_turn_round).toBeUndefined()
+      expect(session.metadata.turn_origin).toBe(origin)
+    }
+    await expect(runtime.submitTurn('origin-test', 'invalid', () => {}, { origin: 'monitor', goalRound: 1 })).rejects.toThrow('authority')
+    await runtime.submitTurn('origin-test', 'human again', () => {})
+    expect(session.metadata.goal_turn_human).toBe(true)
+    expect(session.metadata.turn_origin).toBe('human')
+  } finally { await runtime.shutdown(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test('agent runner exposes output-limit stop reason through the daemon runtime', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-stop-reason-'))
+  const runner = new AgentTurnRunner({ model: 'fixture-model', llm: { async *stream() { yield { content: 'Partial', finishReason: 'length' as const } } } })
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') })
+  try {
+    const events: DaemonEvent[] = []
+    await runtime.openSession('limited')
+    await runtime.submitTurn('limited', 'Continue', event => events.push(event))
+    expect(events).toContainEqual(expect.objectContaining({ type: 'status_update', payload: expect.objectContaining({ stop_reason: 'output_limit' }) }))
+  } finally { await runtime.shutdown(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test('runtime tool inventory reflects live registration, deferral and agent filtering without calling the provider', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-tool-inventory-'))
+  const registry = new ToolRegistry({ deferredToolLoading: true })
+  for (const name of ['ReadFile', 'WriteFile', 'Special']) registry.register({ type: 'function', function: { name, description: name, parameters: {} } }, async () => 'ok')
+  const client = new CapturingClient()
+  const definition: AgentDefinition = { name: 'reviewer', description: '', systemPrompt: '', model: '', tools: [], allowedTools: null, excludeTools: ['WriteFile'], source: 'test', maxDepth: 3, isolation: '' }
+  const runtime = new InMemoryDaemonRuntime(new AgentTurnRunner({ llm: client, model: 'fixture', toolRegistry: registry, tools: registry.definitions(), agentDefinitions: new Map([['reviewer', definition]]) }), { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') })
+  try {
+    await runtime.openSession('inventory')
+    const session = runtime.sessionStatus('inventory')!
+    session.agentId = 'reviewer'
+    expect(runtime.toolInventory('missing')).toBeUndefined()
+    expect(runtime.toolInventory('inventory')).toEqual([
+      expect.objectContaining({ name: 'ReadFile', exposure: 'loaded' }),
+      expect.objectContaining({ name: 'WriteFile', exposure: 'filtered' }),
+      expect.objectContaining({ name: 'Special', exposure: 'deferred' }),
+    ])
+    session.messages.push({ role: 'tool', content: '{"loaded_tool":"Special"}', tool_call_id: 'load' })
+    expect(runtime.toolInventory('inventory')?.find(tool => tool.name === 'Special')?.exposure).toBe('loaded')
+    registry.unregister('Special')
+    expect(runtime.toolInventory('inventory')?.some(tool => tool.name === 'Special')).toBe(false)
+    const staticRegistry = new ToolRegistry()
+    staticRegistry.register({ type: 'function', function: { name: 'ReadFile', description: '', parameters: {} } }, async () => 'ok')
+    const staticRunner = new AgentTurnRunner({ llm: client, model: 'fixture', toolRegistry: staticRegistry, tools: [] })
+    expect(staticRunner.toolInventory(session)[0]?.exposure).toBe('unexposed')
+    session.interactionMode = 'plan'
+    expect(() => runtime.toolInventory('inventory')).toThrow('enforcement profile')
+    expect(client.requests).toHaveLength(0)
+  } finally { await runtime.shutdown(); await rm(directory, { recursive: true, force: true }) }
 })

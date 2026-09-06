@@ -15,8 +15,9 @@ import { focusComposer, registerComposerFocusTarget } from '../app/composerFocus
 import { setInputSelection } from '../app/inputSelectionStore.js'
 import { isLiveTailActive, liveTailScrollKey, shouldAutoScrollLiveTail } from '../app/liveTailScroll.js'
 import { $isBlocked, $overlayState, overlayBlocksBackgroundHotkeys, patchOverlayState } from '../app/overlayStore.js'
-import { $panelWidthDelta, withPanelWidthDelta } from '../app/panelSizeStore.js'
+import { $agentRailVisible, $panelWidthDelta, toggleAgentRail } from '../app/panelSizeStore.js'
 import { $uiState, $uiTheme } from '../app/uiStore.js'
+import { toggleAllToolRuns } from '../app/toolRunStore.js'
 import { $turnLive, getTurnPulse, getTurnState, useTurnSelector } from '../app/turnStore.js'
 import { $spawnHistory, spawnHistoryForSession } from '../app/spawnHistoryStore.js'
 import {
@@ -27,12 +28,9 @@ import {
   derafshAnimationEnabled,
   derafshCompactGradientFrame,
   derafshGradientFrame,
-  derafshGradientRamp,
-  derafshKaviani,
-  WORDMARK_ROWS,
-  wordmarkRows
+  derafshKaviani
 } from '../banner.js'
-import { agentSidebarWidth, shouldMountAgentSidebar, shouldShowAgentSidebar } from '../domain/agentPanelLayout.js'
+import { agentContentWidth, agentSidebarWidth, shouldMountAgentSidebar } from '../domain/agentPanelLayout.js'
 import { densityFor, GLYPH, stateSkin, wrapWithContinuation } from '../domain/nocturne.js'
 import { chipKey, type StartChip, startWithChips } from '../domain/startWith.js'
 import { agentGroup } from '../lib/agentGroups.js'
@@ -43,7 +41,7 @@ import { sectionMode } from '../domain/details.js'
 import { VOICE } from '../domain/roles.js'
 import { completionToApplyOnSubmit } from '../domain/slash.js'
 import { activeToken } from '../lib/completion.js'
-import { shouldShowStartupWelcome, contentColumnWidth } from '../domain/startupLayout.js'
+import { shouldShowStartupWelcome, contentColumnWidth, welcomeColumnWidth } from '../domain/startupLayout.js'
 import {
   isProviderPrompt,
   providerPromptCancelAnswer,
@@ -66,27 +64,28 @@ import { themeForMode, type Theme } from '../theme.js'
 
 import { AgentPanel, AgentPanelHotkey, AgentPanelOverlay, collectAgentPanelRecords } from './agentPanel.js'
 import { GoalOverlay } from './goalOverlay.js'
+import { ContextOverlay } from './contextOverlay.js'
+import { MonitorOverlay } from './monitorOverlay.js'
+import { ScheduleOverlay } from './scheduleOverlay.js'
+import { LspSettingsOverlay } from './lspSettingsOverlay.js'
+import { McpSettingsOverlay } from './mcpSettingsOverlay.js'
+import { AgentSettingsOverlay } from './agentSettingsOverlay.js'
+import { SnapshotOverlay } from './snapshotOverlay.js'
+import { WorkspaceOverlay } from './workspaceOverlay.js'
+import { RunOverlay } from './runOverlay.js'
 import { MachinePicker } from './machinePicker.js'
 import { displayModeLabel, SessionHeader, SessionTabStrip, SessionTelemetryRow, WorkspaceFooter } from './appChrome.js'
 import { CompletionMenu } from './completionMenu.js'
 import { CopyPicker } from './copyPicker.js'
 import { DiffPanelHotkey, DiffPanelOverlay } from './diffPanel.js'
 import { TerminalPanelHotkey, TerminalPanelOverlay } from './terminalPanel.js'
-import { MessageLine, SpawnFleetRoster, StreamingMarkdown } from './messageLine.js'
+import { AssistantFrame, MessageLine, SpawnFleetRoster, StreamingMarkdown } from './messageLine.js'
 import { ModelPicker } from './modelPicker.js'
 import { OVERLAY_PANEL_SPECS, overlayPanelWidth, responsivePanelWidth } from './overlayLayout.js'
 import { rebasePasteResult } from './pasteRebase.js'
 import { ReasoningPicker } from './reasoningPicker.js'
 import { Box, Span, Text } from './primitives.js'
 import { SessionPicker } from './sessionPicker.js'
-
-/**
- * Rows the session chrome takes before the transcript gets any: header, tab
- * strip, column padding, prompt zone, composer well (including the v2 border
- * ring — a rounded border costs one row per edge), hint row and footer.
- * 14 → 16 when the ring landed.
- */
-const TRANSCRIPT_CHROME_ROWS = 16
 
 const TEXTAREA_KEY_BINDINGS: KeyBinding[] = [
   { name: 'return', action: 'submit' },
@@ -170,14 +169,9 @@ export function StreamingAssistant({ cols }: { cols: number }) {
         // conditional for the same reason the settled block's is: it
         // separates the prose from tool rows above it, but must not open the
         // band with a stray blank row when the prose is all there is.
-        <Box
-          flexDirection="column"
-          flexShrink={0}
-          marginTop={segments.length || unsettledTools.length || tools.length ? 1 : 0}
-          paddingLeft={3}
-        >
+        <AssistantFrame leadGap={Boolean(segments.length || unsettledTools.length || tools.length)} t={t}>
           <StreamingMarkdown text={streaming} t={t} />
-        </Box>
+        </AssistantFrame>
       ) : null}
     </Box>
   )
@@ -331,6 +325,7 @@ function progressToneColor(tone: CompactProgressRow['tone'], t: Theme): string {
 }
 
 function CompactLiveProgress({ show }: { show: boolean }) {
+  const compact = useTerminalDimensions().height < 24
   const ui = useStore($uiState)
   const t = useStore($uiTheme)
   const activity = useTurnSelector(state => state.activity)
@@ -373,16 +368,25 @@ function CompactLiveProgress({ show }: { show: boolean }) {
           {'Compacting context…'}
         </Text>
       ) : null}
-      {goal ? (
-        <Text color={t.ds.caption} wrap="truncate-end">
-          <Span color={t.ds.caption}>{'◎ '}</Span>
-          {goal}
-          {goalPhase && goalPhase !== 'active' ? (
-            <Span color={t.color.muted}>{` (${goalPhase})`}</Span>
-          ) : null}
-        </Text>
+      {goal || todos.length ? (
+        <Box flexDirection="column" flexShrink={0} backgroundColor={t.color.statusBg}
+          borderSides={['left']} borderColor={t.color.accent} paddingX={compact ? 1 : 2} paddingY={compact ? 0 : 1}
+          marginBottom={compact ? 0 : 1} onClick={() => patchOverlayState({ goal: true })}>
+          <Box justifyContent="space-between">
+            <Text bold color={t.ds.title}>{'Tasks ' + todos.filter(todo => todo.status === 'completed').length + '/' + todos.length}</Text>
+            <Text color={t.ds.secondary}>{compact ? 'F10' : 'F10 · View plan →'}</Text>
+          </Box>
+          {goal && !compact ? <Text color={t.color.text} wrap="wrap">{goal}{goalPhase ? ' · ' + goalPhase : ''}</Text> : null}
+          {todos.filter(todo => todo.status !== 'completed' && todo.status !== 'cancelled').slice(0, compact ? 0 : 3).map(todo => (
+            <Box key={todo.id} flexDirection="row" gap={1} marginTop={compact ? 0 : 1}>
+              <Text color={todo.status === 'in_progress' ? t.color.accent : t.ds.secondary}>{todo.status === 'in_progress' ? '◌' : '○'}</Text>
+              <Text color={t.color.text} wrap="wrap">{todo.content}</Text>
+            </Box>
+          ))}
+          {!compact && todos.filter(todo => todo.status !== 'completed' && todo.status !== 'cancelled').length > 3 ? <Text color={t.ds.secondary}>More tasks in F10 →</Text> : null}
+        </Box>
       ) : null}
-      {visibleRows.map((row, index) => {
+      {visibleRows.filter(row => row.kind !== 'todo').map((row, index) => {
         const color = progressToneColor(row.tone, t)
         const glyph = row.kind === 'todo' ? '◇' : row.kind === 'outcome' ? '✓' : row.kind === 'activity' ? '·' : '→'
 
@@ -404,7 +408,7 @@ function CompactLiveProgress({ show }: { show: boolean }) {
 const APPROVAL_OPTS = ['once', 'session', 'always', 'deny'] as const
 const APPROVAL_LABELS = { once: 'run it once', session: 'allow for this session', always: 'always allow this exact shape', deny: 'deny and tell the agent why' }
 /** The letter each answer actually answers to, printed as its own cap. */
-const APPROVAL_HOTKEY = { once: 'y', session: 'a', always: 'A', deny: 'n' }
+const APPROVAL_HOTKEY = { once: 'y', session: 'a', always: '3', deny: 'n' }
 /**
  * What each answer costs you next time. The canvas puts this on the right of
  * every option row for the same reason the home chips carry their counts:
@@ -630,7 +634,7 @@ function ProviderPromptOverlay({ actions }: Pick<AppLayoutProps, 'actions'>) {
         {typing ? (
           <>
             <box
-              backgroundColor={t.color.completionCurrentBg}
+              backgroundColor={t.color.statusBg}
               flexDirection="row"
               flexShrink={0}
               marginTop={1}
@@ -649,7 +653,7 @@ function ProviderPromptOverlay({ actions }: Pick<AppLayoutProps, 'actions'>) {
               ) : (
                 <textarea
                   focused
-                  focusedBackgroundColor={t.color.completionCurrentBg}
+                  focusedBackgroundColor={t.color.statusBg}
                   focusedTextColor={t.color.text}
                   keyBindings={TEXTAREA_KEY_BINDINGS}
                   maxHeight={5}
@@ -719,7 +723,14 @@ export function PromptZone({ actions }: Pick<AppLayoutProps, 'actions'>) {
   const t = useStore($uiTheme)
   // The prompt zone renders inside the composer's reading column, so its own
   // wrapping has to measure against the same width the column does.
-  const { width: composerColumns } = useTerminalDimensions()
+  const { width: terminalColumns, height: terminalRows } = useTerminalDimensions()
+  const railVisible = useStore($agentRailVisible)
+  const panelDelta = useStore($panelWidthDelta)
+  const agents = useTurnSelector(state => state.subagents.length)
+  const history = useStore($spawnHistory)
+  const archived = spawnHistoryForSession(history, ui.sid).reduce((count, snapshot) => count + snapshot.subagents.length, 0)
+  const composerColumns = agentContentWidth(terminalColumns, agents + archived, railVisible, panelDelta)
+  const approvalScroll = useRef<ScrollBoxRenderable | null>(null)
   const [sel, setSel] = useState(0)
   const [customClarify, setCustomClarify] = useState(false)
   const [maskedValue, setMaskedValue] = useState('')
@@ -764,6 +775,12 @@ export function PromptZone({ actions }: Pick<AppLayoutProps, 'actions'>) {
     }
 
     if (approval) {
+      if (name === 'pageup' || name === 'pagedown') {
+        approvalScroll.current?.scrollBy(name === 'pageup' ? -3 : 3)
+        event.preventDefault()
+        event.stopPropagation()
+        return
+      }
       const letter = approvalKeyChoice(event.sequence ?? '')
 
       if (name === 'escape') {
@@ -851,128 +868,37 @@ export function PromptZone({ actions }: Pick<AppLayoutProps, 'actions'>) {
   }, [approval, confirm, clarify, secret, sudo])
 
   if (approval) {
-    // Three statements, always in this order: what will run, who asked, why
-    // you are being asked. Anything else on the card is a distraction at the
-    // moment of consent — which is why the description, the scope note and
-    // the keys are each folded into one of the three rather than added
-    // alongside them.
-    //
-    // The tint comes from the policy verdict, not from how the command feels.
-    // Amber is ask; there is no "this looks scary" tier. (Red is deny, and a
-    // denied call never reaches this card: the daemon answers it without
-    // asking, so there is no red branch to write until a wire verdict says
-    // otherwise.)
-    const tool = approval.command.trim().split(/\s+/)[0] ?? ''
     const scope = writePolicyLabel(ui.info?.permission_mode)
-
+    const compact = terminalRows < 32 || composerColumns < 76
+    const labels = { once: 'run it once', session: 'allow this session', always: 'always allow this command', deny: 'deny' }
     return (
-      <InlinePromptPanel accent={t.color.warn}>
-        <Box alignItems="center" flexDirection="row" flexShrink={0} justifyContent="space-between">
-          <Text wrap="truncate-end">
-            <Span color={t.color.warn}>{`${GLYPH.state} `}</Span>
-            <Span bold color={t.ds.title}>
-              permission
-            </Span>
-            {tool ? (
-              <>
-                <Span color={t.ds.separator}>{` ${GLYPH.separator} `}</Span>
-                <Span color={t.ds.secondary}>{tool}</Span>
-              </>
-            ) : null}
-          </Text>
-          <Text color={t.color.warn}>POLICY: ASK</Text>
-        </Box>
-
-        <PromptPanelGap />
-        <Text color={t.ds.caption}>WHAT WILL RUN</Text>
-        {/* Verbatim, in a code box, never summarised. A paraphrase is a
-            different command. */}
-        {approval.command ? (
-          <Box backgroundColor={t.ds.sunken} flexDirection="column" flexShrink={0} marginTop={1} paddingX={1}>
-            {/* Wrapped by us, not by the renderer, so every continuation
-                carries `↳`. A soft wrap and a second command look identical
-                in a monospace column, and here that is the difference
-                between running one thing and running two. */}
-            {wrapWithContinuation(approval.command.slice(0, 320), contentColumnWidth(composerColumns) - 8).map(
-              (segment, index) => (
-                <Text color={index ? t.ds.caption : t.ds.strong} key={index}>
-                  {index ? (
-                    <>
-                      <Span color={t.ds.caption}>{segment.slice(0, 2)}</Span>
-                      <Span color={t.ds.strong}>{segment.slice(2)}</Span>
-                    </>
-                  ) : (
-                    segment
-                  )}
-                </Text>
-              )
-            )}
+      <Box flexDirection="column" flexShrink={0} marginTop={1} paddingLeft={1} borderSides={['left']} borderColor={t.color.warn}>
+        <Text bold color={t.color.warn}>Approval needed · POLICY: ASK</Text>
+        <scrollbox ref={approvalScroll} style={{ height: Math.max(2, Math.min(14, terminalRows - 20)), flexShrink: 0 }}>
+          <Box flexDirection="column" flexShrink={0}>
+            <Text color={t.ds.caption}>WHAT WILL RUN</Text>
+            {wrapWithContinuation(approval.command, Math.max(1, contentColumnWidth(composerColumns) - 3)).map((line,index) =>
+              <Text color={t.ds.strong} key={index}>{line}</Text>)}
+            {ui.info?.cwd ? <Text color={t.ds.meta} wrap="wrap">{'cwd ' + ui.info.cwd}</Text> : null}
+            <Text color={t.ds.caption}>WHO ASKED</Text>
+            <Text color={t.ds.prose} wrap="wrap">{approval.description}</Text>
+            <Text color={t.ds.caption}>WHY YOU ARE SEEING THIS</Text>
+            <Text color={t.ds.prose} wrap="wrap">{'Interaction mode is ' + (ui.info?.mode || 'code') + ' — ' + scope + '.'}</Text>
+            <Text color={t.ds.meta} wrap="wrap">{approval.allowPermanent === false
+              ? 'Permanent allow is unavailable for this command.'
+              : 'Always creates a rule for this exact command shape; different arguments ask again.'}</Text>
           </Box>
-        ) : null}
-        {ui.info?.cwd ? (
-          <Text color={t.ds.meta} wrap="truncate-end">
-            {`cwd ${ui.info.cwd}`}
+        </scrollbox>
+        {opts.map((option,index)=><Box onClick={() => actions.answerApproval(option)} key={option} flexShrink={0} justifyContent="space-between"
+          backgroundColor={sel === index ? t.color.selectionBg : undefined}>
+          <Text color={sel === index ? t.ds.title : t.ds.secondary} wrap="truncate-end">
+            {(sel === index ? '› ' : '  ') + APPROVAL_HOTKEY[option] + ' ' + (compact ? labels[option] : APPROVAL_LABELS[option])}
           </Text>
-        ) : null}
-
-        <PromptPanelGap />
-        <Text color={t.ds.caption}>WHO ASKED</Text>
-        <Text color={t.ds.prose} wrap="wrap">
-          {approval.description}
-        </Text>
-
-        <PromptPanelGap />
-        <Text color={t.ds.caption}>WHY YOU ARE SEEING THIS</Text>
-        <Text color={t.ds.prose} wrap="wrap">
-          {`Interaction mode is ${ui.info?.mode || 'code'} — ${scope}.`}
-        </Text>
-        {approval.allowPermanent === false ? (
-          <Text color={t.ds.meta} wrap="wrap">
-            The daemon will not honour a permanent allow for this call, so
-            &quot;always&quot; is not offered.
-          </Text>
-        ) : (
-          <Text color={t.ds.meta} wrap="wrap">
-            &quot;always&quot; is scoped to this exact command shape, not to the {tool || 'tool'} tool. A different
-            path, flag or argument asks again.
-          </Text>
-        )}
-
-        <PromptPanelGap />
-        {/* One row per answer, each stating its own consequence — the choice
-            has to be informed before the keypress, same rule as the home
-            chips. Deny is the ⎋ default. */}
-        <Box flexDirection="column" flexShrink={0}>
-          {opts.map((option, index) => (
-            <Box
-              alignItems="center"
-              backgroundColor={sel === index ? t.color.selectionBg : undefined}
-              flexDirection="row"
-              flexShrink={0}
-              justifyContent="space-between"
-              key={option}
-              paddingX={1}
-            >
-              <Text wrap="truncate-end">
-                <Span color={sel === index ? t.color.warn : t.ds.separator}>{sel === index ? '› ' : '  '}</Span>
-                <Span color={t.ds.secondary}>{APPROVAL_HOTKEY[option]}</Span>
-                <Span color={sel === index ? t.ds.title : t.ds.secondary}>{` ${APPROVAL_LABELS[option]}`}</Span>
-              </Text>
-              <Text color={t.ds.meta} wrap="truncate-end">
-                {APPROVAL_CONSEQUENCE[option]}
-              </Text>
-            </Box>
-          ))}
-        </Box>
-        <PromptPanelGap />
-        <Text color={t.ds.caption}>
-          <Span color={t.ds.secondary}>↑↓</Span> move
-          <Span color={t.ds.separator}>{`  ${GLYPH.separator} `}</Span>
-          <Span color={t.ds.secondary}>⏎</Span> choose
-          <Span color={t.ds.separator}>{`  ${GLYPH.separator} `}</Span>
-          <Span color={t.ds.secondary}>⎋</Span> deny and go back
-        </Text>
-      </InlinePromptPanel>
+          {!compact ? <Text color={t.ds.meta} wrap="truncate-end">{APPROVAL_CONSEQUENCE[option]}</Text> : null}
+        </Box>)}
+        {compact ? <Text color={t.ds.meta} wrap="wrap">{APPROVAL_CONSEQUENCE[opts[sel] ?? 'deny']}</Text> : null}
+        <Text color={t.ds.caption} wrap="wrap">↑↓ choose · ⏎ choose · Esc deny · PgUp/PgDn details</Text>
+      </Box>
     )
   }
 
@@ -1007,7 +933,7 @@ export function PromptZone({ actions }: Pick<AppLayoutProps, 'actions'>) {
         <PromptPanelGap />
         {typingClarify ? (
           <>
-            <Box backgroundColor={t.color.completionCurrentBg} paddingX={1} paddingY={1}>
+            <Box backgroundColor={t.color.statusBg} paddingX={1} paddingY={1}>
               <Text color={t.color.accent}>› </Text>
               <textarea
                 focused
@@ -1072,13 +998,7 @@ export function PromptZone({ actions }: Pick<AppLayoutProps, 'actions'>) {
 
 // ── Composer ───────────────────────────────────────────────────────────────
 
-/**
- * The composer identity chip: the active permission mode in gold.
- *
- * Idle only. While a turn runs the chip disappears — the ◆ activity line in
- * the status row below owns that moment, and a second diamond beside the
- * textarea read as two competing indicators, not one system.
- */
+/** Queued follow-ups remain attached to the composer. */
 function QueuePanel({ composer }: Pick<AppLayoutProps, 'composer'>) {
   const t = useStore($uiTheme)
 
@@ -1137,17 +1057,19 @@ export function Composer({ composer }: Pick<AppLayoutProps, 'composer'>) {
     return () => registerComposerFocusTarget(null)
   }, [])
 
+  const { height: terminalRows } = useTerminalDimensions()
+  const roomyComposer = terminalRows >= 30
   const modelLabel = ui.info?.model || 'choose model with /provider'
   const modeLabel = ui.info?.mode || 'code'
   // 'code' is the assumed mode; every other one changes what the turn is
   // allowed to do and deserves to read as an exception rather than as chrome.
   const modeIsDefault = modeLabel === 'code'
   const yoloEnabled = isYoloEnabled(ui.info?.permission_mode)
-  const narrow = composer.cols < 76
+  const narrow = contentColumnWidth(composer.cols) < 96
   // Below this the identity alone (model + YOLO + context + tokens) already
   // fills the row, so any hint would have to eat into it. Showing nothing
   // beats showing a hint welded onto a half-truncated token count.
-  const cramped = composer.cols < 52
+  const cramped = contentColumnWidth(composer.cols) < 56
 
   const syncInputSelection = useCallback(() => {
     const textarea = ref.current
@@ -1244,7 +1166,7 @@ export function Composer({ composer }: Pick<AppLayoutProps, 'composer'>) {
     syncInputSelection()
   }
 
-  usePaste(event => {
+  usePaste((event) => {
     const textarea = ref.current
 
     if (isBlocked || !textarea) {
@@ -1259,7 +1181,7 @@ export function Composer({ composer }: Pick<AppLayoutProps, 'composer'>) {
 
     void Promise.resolve(
       composer.handleTextPaste({ bracketed: true, cursor, hotkey: false, text: decodePaste(event.bytes), value })
-    ).then(result => applyPasteResult(result, { cursor, value }))
+    ).then((result) => applyPasteResult(result, { cursor, value }))
   })
 
   // Ctrl+V smart paste: terminals only deliver Cmd+V / bracketed paste when
@@ -1267,7 +1189,7 @@ export function Composer({ composer }: Pick<AppLayoutProps, 'composer'>) {
   // all, so a chord the TUI can actually receive is the only way to paste
   // images. The hotkey path pastes clipboard text normally and attaches a
   // clipboard image (with visible feedback) when there is no usable text.
-  useKeyboard(event => {
+  useKeyboard((event) => {
     if (event.name !== 'v' || !event.ctrl || event.meta || event.super || event.shift) {
       return
     }
@@ -1283,18 +1205,14 @@ export function Composer({ composer }: Pick<AppLayoutProps, 'composer'>) {
     const value = textarea.plainText
     const cursor = textarea.cursorOffset
 
-    void Promise.resolve(
-      composer.handleTextPaste({ bracketed: false, cursor, hotkey: true, text: '', value })
-    ).then(result => applyPasteResult(result, { cursor, value }))
+    void Promise.resolve(composer.handleTextPaste({ bracketed: false, cursor, hotkey: true, text: '', value })).then(
+      (result) => applyPasteResult(result, { cursor, value })
+    )
   })
 
   // Say what Enter will actually do. The mode is configurable and defaults to
   // steer, so a hardcoded "queue" label misreported the common case.
   const busyLabels = busyInputLabels(ui.busyInputMode, composer.queuedDisplay.length)
-  // What the turn is doing right now, read from the same turn state the live
-  // indicator uses so the two can never disagree.
-  const latestActivity = useTurnSelector(s => s.activity.at(-1)?.text ?? '')
-  const liveActivity = latestActivity.trim() || 'working'
 
   return (
     <Box backgroundColor={t.color.completionBg} flexDirection="column" flexShrink={0} width="100%">
@@ -1308,163 +1226,103 @@ export function Composer({ composer }: Pick<AppLayoutProps, 'composer'>) {
         query={activeToken(composer.input)}
         width={contentColumnWidth(composer.cols)}
       />
-      {/* The v2 input well: one rounded ring around everything that belongs
-          to the prompt — queued lines, attachments, the textarea, and the
-          identity row. Gold while you can type, hairline while an overlay
-          owns the screen. Cramped terminals keep the two rows the border
-          would cost. */}
-      <Box
-        flexDirection="column"
-        flexShrink={0}
-        {...(cramped
-          ? {}
-          : {
-              borderColor: isBlocked ? t.color.border : t.color.brandGold,
-              borderStyle: 'round' as const
-            })}
-      >
-      <QueuePanel composer={composer} />
-      <AttachmentsPanel />
-      <Box
-        alignItems="flex-start"
-        backgroundColor={t.color.completionCurrentBg}
-        flexDirection="row"
-        flexShrink={0}
-        gap={1}
-        minHeight={1}
-        paddingX={1}
-      >
-        {/* The prompt glyph, and only the prompt glyph. A mode chip used to
+      {/* A horizontal rule defines the input without a box around every row. */}
+      <Box flexDirection="column" flexShrink={0}>
+        <box height={1} width="100%" flexShrink={0} border={['top']} borderColor={isBlocked ? t.color.border : t.ds.hairline} />
+        {roomyComposer ? <Box height={1} /> : null}
+        <QueuePanel composer={composer} />
+        <AttachmentsPanel />
+        <Box
+          alignItems="flex-start"
+          backgroundColor={t.color.statusBg}
+          flexDirection="row"
+          flexShrink={0}
+          gap={1}
+          minHeight={1}
+          paddingX={1}
+        >
+          {/* The prompt glyph, and only the prompt glyph. A mode chip used to
             sit here as well, which stated the mode twice on one screen — the
             row below now owns that, so this column is free to be what the
             canvas draws: the mark that says you are typing. */}
-        <Text color={t.color.accent}>{t.brand.prompt}</Text>
-        <Box flexGrow={1} flexShrink={1} minWidth={1}>
-          <textarea
-            focused={!isBlocked}
-            focusedBackgroundColor={t.color.completionCurrentBg}
-            focusedTextColor={t.color.text}
-            keyBindings={TEXTAREA_KEY_BINDINGS}
-            maxHeight={10}
-            minHeight={1}
-            onContentChange={onContentChange}
-            onCursorChange={syncInputSelection}
-            onSubmit={onSubmit}
-            placeholder={
-              // The canvas prints "reply, or ⎋ to interrupt the current turn"
-              // on a WORKING session. Showing it whenever the transcript is
-              // non-empty made an idle composer claim a turn was running and
-              // offer to interrupt something that had already finished.
-              ui.busy
-                ? busyLabels.placeholder
-                : composer.empty
-                  ? 'describe a task, paste a stack trace, or press / for commands'
-                  : 'reply, or press / for commands'
-            }
-            placeholderColor={t.color.muted}
-            ref={ref}
-            style={{ flexGrow: 1, flexShrink: 0 }}
-            textColor={t.color.text}
-            wrapMode="word"
-          />
+          <Text color={t.color.accent}>{t.brand.prompt}</Text>
+          <Box flexGrow={1} flexShrink={1} minWidth={1}>
+            <textarea
+              focused={!isBlocked}
+              focusedBackgroundColor={t.color.statusBg}
+              focusedTextColor={t.color.text}
+              keyBindings={TEXTAREA_KEY_BINDINGS}
+              maxHeight={10}
+              minHeight={roomyComposer ? 2 : 1}
+              onContentChange={onContentChange}
+              onCursorChange={syncInputSelection}
+              onSubmit={onSubmit}
+              placeholder={
+                // The canvas prints "reply, or ⎋ to interrupt the current turn"
+                // on a WORKING session. Showing it whenever the transcript is
+                // non-empty made an idle composer claim a turn was running and
+                // offer to interrupt something that had already finished.
+                ui.busy
+                  ? busyLabels.placeholder
+                  : composer.empty
+                    ? 'describe a task, paste a stack trace, or press / for commands'
+                    : 'reply, or press / for commands'
+              }
+              placeholderColor={t.color.muted}
+              ref={ref}
+              style={{ flexGrow: 1, flexShrink: 0 }}
+              textColor={t.color.text}
+              wrapMode="word"
+            />
+          </Box>
         </Box>
-      </Box>
-      <Box
-        alignItems="center"
-        flexDirection="row"
-        flexShrink={0}
-        // A guaranteed gutter between the identity and the hints. Without it
-        // `space-between` lets the two groups meet with no separator the
-        // moment the row is tight, which renders as "YOLO ONTab modes" —
-        // reading as corrupted text rather than as a truncation.
-        // No rule between the input and this row: a per-side border inside a
-        // box that already has a full frame makes OpenTUI paint the edge
-        // THROUGH the text, so the identity row came out as
-        // `╰─◆─code─mode─·─…─╯`. The canvas's hairline is a ground change
-        // here instead, which a terminal can actually draw.
-        backgroundColor={t.ds.chrome}
-        gap={2}
-        height={1}
-        justifyContent="space-between"
-        paddingX={1}
-      >
-        {/* Two tiers, not one row of everything.
-            The model and permission mode barely change all session; the
-            context percentage and token counts change every few seconds.
-            Packing both into one line is what made them collide at narrow
-            widths — the collision was the symptom, this is the cause.
-            While a turn runs the row answers the question you actually have
-            (what is it doing, how much context is left); when nothing is
-            running it states identity and gets out of the way. */}
-        {/* Mode, model and write policy, stated together: those three decide
-            what the next ⏎ is allowed to do, and knowing two of them is not
-            knowing. The context read-out moved to the session header, where
-            it answers "what is happening" instead of competing here. */}
-        <Box alignItems="center" flexDirection="row" flexShrink={1} gap={1} height={1} overflow="hidden">
-          {ui.busy ? (
-            <>
-              <Text color={t.color.system}>{GLYPH.mode}</Text>
-              {/* The mode stays on screen while the turn runs. It used to be
-                  swapped out for the activity, so the one moment you need to
-                  know you are in plan or objective mode — something is running
-                  and behaving in a way you did not ask for — was the one moment
-                  it was hidden. A non-default mode is coloured, because that is
-                  the state worth catching the eye. */}
-              <Text wrap="truncate-end">
-                <Span color={modeIsDefault ? t.ds.meta : t.color.warn}>{modeLabel}</Span>
-                <Span color={t.ds.separator}>{` ${GLYPH.separator} `}</Span>
-                <Span color={t.ds.title}>{liveActivity}</Span>
-              </Text>
-            </>
-          ) : (
-            <Text wrap="truncate-end">
-              <Span color={t.color.accent}>{`${GLYPH.mode} `}</Span>
-              <Span color={t.ds.secondary}>{`${modeLabel} mode`}</Span>
-              <Span color={t.ds.separator}>{` ${GLYPH.separator} `}</Span>
+        <Box flexDirection="column" flexShrink={0} paddingX={1}>
+          <Box flexDirection="column" flexShrink={0} width="100%">
+            <Text wrap="wrap">
+              <Span color={modeIsDefault ? t.ds.secondary : t.color.accent}>{'◆ ' + modeLabel + ' mode'}</Span>
+              <Span color={t.ds.separator}>{' · '}</Span>
               <Span color={t.ds.meta}>{modelLabel}</Span>
               {narrow ? null : (
-                <>
-                  <Span color={t.ds.separator}>{` ${GLYPH.separator} `}</Span>
-                  <Span color={yoloEnabled ? t.color.warn : t.ds.meta}>
-                    {writePolicyLabel(ui.info?.permission_mode)}
-                  </Span>
-                </>
+                <Span color={yoloEnabled ? t.color.warn : t.ds.meta}>
+                  {' · ' + writePolicyLabel(ui.info?.permission_mode)}
+                </Span>
               )}
             </Text>
-          )}
+            {narrow ? (
+              <Text color={yoloEnabled ? t.color.warn : t.ds.meta} wrap="wrap">
+                {writePolicyLabel(ui.info?.permission_mode)}
+              </Text>
+            ) : null}
+          </Box>
+          {roomyComposer ? <Box height={1} /> : null}
         </Box>
-        <Box alignItems="center" flexDirection="row" flexShrink={0} gap={1} height={1}>
-          {ui.busy ? (
-            <Text color={t.color.text}>
-              Enter <Span color={t.color.muted}>{busyLabels.enter}</Span> · Esc{' '}
-              <Span color={t.color.muted}>{busyLabels.escape}</Span>
-            </Text>
-          ) : composer.completions.length ? (
-            <Text color={t.color.text}>
-              Tab <Span color={t.color.muted}>accept</Span> · ↑↓ <Span color={t.color.muted}>navigate</Span> · Esc{' '}
-              <Span color={t.color.muted}>dismiss</Span>
-            </Text>
-          ) : cramped ? null : narrow ? (
-            <Text color={t.ds.caption}>
-              <Span color={t.ds.secondary}>tab</Span> mode
-            </Text>
-          ) : (
-            // Lowercase keys, exactly as typed, in the footer's own order:
-            // what changes the turn, then what edits the draft, then send.
-            <Text color={t.ds.caption}>
-              <Span color={t.ds.secondary}>tab</Span> mode
-              <Span color={t.ds.separator}>{` ${GLYPH.separator} `}</Span>
-              <Span color={t.ds.secondary}>/</Span> commands
-              <Span color={t.ds.separator}>{` ${GLYPH.separator} `}</Span>
-              <Span color={t.ds.secondary}>@</Span> files
-              <Span color={t.ds.separator}>{` ${GLYPH.separator} `}</Span>
-              <Span color={t.ds.secondary}>⇧⏎</Span> newline
-              <Span color={t.ds.separator}>{` ${GLYPH.separator} `}</Span>
-              <Span color={t.ds.secondary}>⏎</Span> send
-            </Text>
-          )}
+        {roomyComposer ? <box height={1} width="100%" flexShrink={0} border={['bottom']} borderColor={t.ds.hairline} /> : null}
+        <Box flexDirection="column" flexShrink={0} paddingX={1} paddingBottom={roomyComposer ? 1 : 0}>
+          <Box alignItems="center" flexDirection="row" flexShrink={0} gap={1} height={1}>
+            {ui.busy ? (
+              <Text color={t.color.text}>
+                Enter <Span color={t.color.muted}>{busyLabels.enter}</Span> · Esc{' '}
+                <Span color={t.color.muted}>{busyLabels.escape}</Span>
+              </Text>
+            ) : composer.completions.length ? (
+              <Text color={t.color.text}>
+                Tab <Span color={t.color.muted}>accept</Span> · ↑↓ <Span color={t.color.muted}>navigate</Span> · Esc{' '}
+                <Span color={t.color.muted}>dismiss</Span>
+              </Text>
+            ) : cramped ? (
+              <Text color={t.ds.caption}>/ commands · ⏎ send</Text>
+            ) : narrow ? (
+              <Text color={t.ds.caption}>
+                <Span color={t.ds.secondary}>tab</Span> mode · / commands · ⏎ send
+              </Text>
+            ) : (
+              <Box width="100%" justifyContent="space-between" gap={2}>
+                <Text color={t.ds.caption}>tab mode · / commands · @ files</Text>
+                <Text color={t.ds.caption}>⇧⏎ newline · ⏎ send</Text>
+              </Box>
+            )}
+          </Box>
         </Box>
-      </Box>
       </Box>
     </Box>
   )
@@ -1581,45 +1439,6 @@ function useDerafshAnimation(
 }
 
 /**
- * The Derafsh mark, strictly for the empty startup state.
- *
- * It lives ONLY on the welcome screen. Once a session has any transcript
- * content the mark must never reappear — not as a filler under a short
- * conversation, not centered in spare space. Decorative branding inside an
- * active conversation competes with the work on screen and reads as stale
- * layout, so this renders null the moment `contentRows > 0`.
- */
-function TranscriptWatermark({ cols, contentRows, rows }: { cols: number; contentRows: number; rows: number }) {
-  const t = useStore($uiTheme)
-  if (contentRows > 0) {
-    return null
-  }
-  const compact = derafshCompactGradientFrame(t.color, 0)
-  const fitsWidth = cols >= DERAFSH_KAVIANI_WIDTH + 4
-  // Chrome the transcript never gets: header, tab strip, column padding,
-  // prompt zone, composer, hint row and footer.
-  const viewport = rows - TRANSCRIPT_CHROME_ROWS
-  const marginTop = Math.max(2, Math.floor((viewport - compact.length) / 2))
-  const fits = compact.length + marginTop <= viewport
-
-  if (!fitsWidth || !fits || !derafshAnimationEnabled()) {
-    return null
-  }
-
-  return (
-    <Box alignItems="center" flexDirection="column" flexShrink={0} marginTop={marginTop}>
-      {compact.map(([, line], index) => (
-        // One flat dim colour rather than the welcome screen's gradient: this
-        // sits behind an empty prompt, and must never compete with it.
-        <Text color={t.color.turnRail} key={index}>
-          {line}
-        </Text>
-      ))}
-    </Box>
-  )
-}
-
-/**
  * One START WITH chip: a key cap, a state mark, what it does, and — the whole
  * point — what is true right now that makes it worth pressing.
  *
@@ -1643,35 +1462,28 @@ function StartChipRow({
   const key = chipKey(index)
   const skin = stateSkin(chip.tone, t.ds)
   const density = densityFor(cols)
+  const {height} = useTerminalDimensions()
 
-  // A bordered pill on the card ground, exactly as the canvas draws it. The
-  // first pass rendered a flat row, which read as a list item rather than as
-  // something you press — and the whole point of the band is that these are
-  // entry points.
+  // One flat shortcut row; the draft still requires an explicit submit.
   return (
     <Box
-      backgroundColor={t.ds.card}
-      borderColor={t.ds.hairline}
-      borderStyle="round"
       flexShrink={0}
       onClick={() => {
         composer.updateInput(chip.prompt)
         focusComposer()
       }}
       paddingX={1}
+      marginBottom={height >= 30 ? 1 : 0}
     >
-      <Text wrap="truncate-end">
-        {key ? <Span color={t.ds.secondary}>{`${key} `}</Span> : null}
-        <Span color={skin.dot}>{`${GLYPH.tool} `}</Span>
-        {chip.command ? <Span color={t.color.accent}>{`${chip.command} `}</Span> : null}
-        <Span color={t.ds.title}>{chip.label}</Span>
-        {density.goals ? (
-          <>
-            <Span color={t.ds.separator}>{` ${GLYPH.separator} `}</Span>
-            <Span color={t.ds.meta}>{chip.consequence}</Span>
-          </>
-        ) : null}
-      </Text>
+      <Box flexGrow={1} flexShrink={1} minWidth={0}>
+        <Text wrap="truncate-end">
+          {key ? <Span color={t.color.accent}>{key + ' '}</Span> : null}
+          <Span color={skin.dot}>{GLYPH.tool + ' '}</Span>
+          {chip.command ? <Span color={t.color.accent}>{chip.command + ' '}</Span> : null}
+          <Span color={t.ds.title}>{chip.label}</Span>
+        </Text>
+      </Box>
+      {density.goals ? <Text color={t.ds.meta} wrap="truncate-end">{chip.consequence}</Text> : null}
     </Box>
   )
 }
@@ -1730,133 +1542,61 @@ export function StartupWelcome({
 }) {
   const ui = useStore($uiState)
   const t = useStore($uiTheme)
-  const liveAgents = useTurnSelector(state => state.subagents)
-  const markFits = cols >= DERAFSH_KAVIANI_WIDTH + 4
-  // The canvas gives the mark about a third of the screen, not half. At the
-  // reference 150x40 the full 20-row mark plus a six-row wordmark leaves no
-  // room for the chips, so the half-height mark is the DEFAULT here and the
-  // full one is reserved for terminals tall enough to spend the rows.
-  const showFullMark = markFits && rows >= 48
-  const useGradient = !t.bannerLogo
-  const showCompactMark = useGradient && markFits && !showFullMark && rows >= 22
-  const showMark = showFullMark || showCompactMark
-  const animationEnabled = useGradient && showMark && derafshAnimationEnabled()
-  // The wordmark is letter-spaced and tinted across the same Derafsh ramp the
-  // boot mark animates. It follows brand.name, so a skin that renames the
-  // agent inherits the treatment; [...name] keeps any astral character in a
-  // custom name intact.
-  const nameLetters = [...t.brand.name]
-  // Block letters when the name can be drawn and the rows exist; otherwise
-  // the letter-spaced form. A wordmark that has to compete with a 20-row mark
-  // above it cannot be one row tall.
-  const blockWordmark = useMemo(() => wordmarkRows(t.brand.name), [t.brand.name])
-  const showBlockWordmark = blockWordmark.length > 0 && cols >= blockWordmark[0]!.length + 4
-  const wordmarkRamp = useMemo(
-    () => derafshGradientRamp(t.color, showBlockWordmark ? WORDMARK_ROWS : nameLetters.length),
-    [nameLetters.length, showBlockWordmark, t.color]
+  const liveAgents = useTurnSelector((state) => state.subagents)
+  const showMark = rows >= 40 && cols >= DERAFSH_KAVIANI_WIDTH + 32
+  const compactMark = rows < 60
+  const welcomePadding = cols >= 100 ? 6 : cols >= 70 ? 2 : 0
+  const mark = useMemo(
+    () => t.bannerLogo
+      ? derafshKaviani(t.color, t.bannerLogo)
+      : compactMark ? derafshCompactGradientFrame(t.color, 0) : derafshGradientFrame(t.color, 0),
+    [t.bannerLogo, t.color, compactMark]
   )
   const markLinesRef = useRef<Array<TextRenderable | null>>([])
-  const mark = useMemo(() => {
-    if (showCompactMark) {
-      return derafshCompactGradientFrame(t.color, 0)
-    }
-    return useGradient ? derafshGradientFrame(t.color, 0) : derafshKaviani(t.color, t.bannerLogo || undefined)
-  }, [showCompactMark, t.bannerLogo, t.color, useGradient])
-
-  // "A chip with nothing true to say is not shown" — so the list is derived
-  // from live signals every render rather than being a constant.
-  const chips = useMemo(
-    () =>
-      startWithChips({
-        agentsNeedingInput: liveAgents.filter(agent => agentGroup(agent.status) === 'input').length,
-        agentsWorking: liveAgents.filter(agent => agentGroup(agent.status) === 'working').length,
-        hasModel: Boolean(ui.info?.model?.trim()),
-        pulse
-      }),
-    [liveAgents, pulse, ui.info?.model]
-  )
-  // Rows the chips may take without pushing the composer off a short screen.
-  // The composer is the one thing on this screen that never degrades, so it
-  // is subtracted first and the chips get whatever is left.
-  const markRows = showMark ? mark.length : 1
-  const wordmarkRowCount = showBlockWordmark ? WORDMARK_ROWS : 1
-  // Bordered pills cost three rows per wrapped line, and roughly two fit on a
-  // reading column at the reference width.
-  const chipsPerLine = Math.max(1, Math.floor(contentColumnWidth(cols) / 52))
-  const chipLines = Math.max(0, Math.floor((rows - markRows - wordmarkRowCount - 14) / 3))
-  const visibleChips = chips.slice(0, Math.max(0, chipLines * chipsPerLine))
-
-  useDerafshAnimation(animationEnabled, showCompactMark, t.color, markLinesRef)
+  useDerafshAnimation(showMark && !t.bannerLogo && derafshAnimationEnabled(), compactMark, t.color, markLinesRef)
+  const chips = startWithChips({
+    agentsNeedingInput: liveAgents.filter((agent) => agentGroup(agent.status) === 'input').length,
+    agentsWorking: liveAgents.filter((agent) => agentGroup(agent.status) === 'working').length,
+    hasModel: Boolean(ui.info?.model?.trim()),
+    pulse
+  }).slice(0, rows < 18 ? 1 : 3)
 
   return (
-    // Flush left, whitespace on the right: the mark, the wordmark, the
-    // tagline and the chips all start on the same column, so the eye walks
-    // one edge down the screen instead of re-centering on every band.
-    <Box flexDirection="column" flexShrink={0} width="100%">
-      <StartChipKeys chips={visibleChips} composer={composer} enabled={!composer.input} />
-      {showMark ? (
-        <Box flexDirection="column" flexShrink={0}>
-          {mark.map(([color, line], index) => (
-            <text
-              fg={color || t.color.accent}
-              flexShrink={0}
-              key={index}
-              ref={(renderable: TextRenderable | null) => {
-                markLinesRef.current[index] = renderable
-              }}
-            >
-              {line || ' '}
-            </text>
-          ))}
-        </Box>
-      ) : (
-        <Text bold color={t.color.accent}>
-          {DERAFSH_KAVIANI_GLYPH}
-        </Text>
-      )}
-      <Box flexShrink={0} height={1} />
-      {showBlockWordmark ? (
-        // One ramp stop per ROW, so the gradient runs down the wordmark the
-        // way the canvas runs it across the word.
-        <Box flexDirection="column" flexShrink={0}>
-          {blockWordmark.map((row, index) => (
-            <Text color={wordmarkRamp[index]} key={index}>
-              {row}
-            </Text>
-          ))}
-        </Box>
-      ) : nameLetters.length ? (
-        <Text bold>
-          {nameLetters.map((letter, index) => (
-            <Span color={wordmarkRamp[index]} key={index}>
-              {letter}
-              {index < nameLetters.length - 1 ? ' ' : ''}
-            </Span>
-          ))}
-        </Text>
-      ) : null}
-      <Text color={t.ds.meta} wrap="truncate-end">
-        {t.brand.welcome}
-      </Text>
-      {visibleChips.length ? (
-        <>
-          <Box flexShrink={0} height={1} />
-          <Text color={t.ds.caption}>START WITH</Text>
-          {/* A wrapping cluster, not a stacked list: the canvas lays the chips
-              out as pills that flow across the column, so a screen with four
-              live signals reads as a cluster rather than as a menu. */}
-          <Box flexDirection="row" flexShrink={0} flexWrap="wrap" gap={1}>
-            {visibleChips.map((chip, index) => (
-              <StartChipRow chip={chip} cols={cols} composer={composer} index={index} key={chip.id} t={t} />
+    <Box flexDirection="column" flexShrink={0} width="100%" paddingX={welcomePadding} paddingBottom={rows >= 40 ? 2 : 0}>
+      <StartChipKeys chips={chips} composer={composer} enabled={!composer.input} />
+      <Box flexDirection="column" gap={rows >= 60 ? 2 : 1} flexShrink={0} marginBottom={rows >= 40 ? 2 : 1}>
+        {showMark ? (
+          <Box flexDirection="column" flexShrink={0}>
+            {mark.map(([color, line], index) => (
+              <text
+                fg={color || t.color.accent}
+                flexShrink={0}
+                key={index}
+                ref={(renderable: TextRenderable | null) => {
+                  markLinesRef.current[index] = renderable
+                }}
+              >
+                {line || ' '}
+              </text>
             ))}
           </Box>
-        </>
-      ) : null}
+        ) : null}
+        <Box flexDirection="column" flexShrink={0} minWidth={0}>
+          <Text bold color={t.ds.title}>What are we working on?</Text>
+          <Text color={t.ds.secondary} wrap="wrap">{t.brand.welcome}</Text>
+        </Box>
+      </Box>
+      {!showMark ? <Text color={t.color.brandGold}>{DERAFSH_KAVIANI_GLYPH + ' ' + t.brand.name}</Text> : null}
+      <Text color={t.ds.caption}>START WITH</Text>
+      <Box flexDirection="column" flexShrink={0} paddingTop={rows >= 40 ? 1 : 0}>
+        {chips.map((chip, index) => (
+          <StartChipRow chip={chip} cols={cols - welcomePadding * 2} composer={composer} index={index} key={chip.id} t={t} />
+        ))}
+      </Box>
     </Box>
   )
 }
 
-/** Keep stream-cadence scrolling out of the heavyweight app controller. */
 function LiveTailFollower({ scrollRef }: { scrollRef: AppLayoutProps['transcript']['scrollRef'] }) {
   const active = useTurnSelector(isLiveTailActive)
   const changeKey = useTurnSelector(liveTailScrollKey)
@@ -2108,36 +1848,27 @@ export function AppLayout({
     () => collectAgentPanelRecords(liveAgents, spawnHistory).length,
     [liveAgents, spawnHistory]
   )
-  const agentSidebarFits = shouldShowAgentSidebar(width, agentCount)
-  const showAgentSidebar = shouldMountAgentSidebar(width, agentCount, overlay.agents)
+  const railVisible = useStore($agentRailVisible)
+  const showAgentSidebar = railVisible && shouldMountAgentSidebar(width, agentCount, overlay.agents)
   const panelWidthDelta = useStore($panelWidthDelta)
-  const sidebarWidth = withPanelWidthDelta(agentSidebarWidth(width), width)
-  void panelWidthDelta
+  const sidebarWidth = agentSidebarWidth(width, panelWidthDelta)
   // Derived from the overlayStore policy table (OVERLAY_BLOCKS_BACKGROUND_HOTKEYS):
   // every overlay blocks the background hotkeys except `agents` itself, whose
   // F6 chord must stay live so it can also close the agents overlay.
   const agentHotkeyBlocked = overlayBlocksBackgroundHotkeys(overlay)
-  // Keyed off whether the rail *fits*, not whether it is showing right now, so
-  // opening the overlay does not swap the footer text underneath the backdrop
-  // and swap it back on close.
-  // The long hint only survives when the whole right side (hints + version
-  // + provider dot) fits beside a truncated path; otherwise the flex-end clip
-  // beheads it ("..terminals"). Bare keys are the mockup's narrow tier.
-  const compactFooterHints = composer.cols < 100
-  const footerAgentHint = agentSidebarFits
-    ? undefined
-    : compactFooterHints
-      ? 'F6 · F7 · F8'
-      : 'F6 agents · F7 diff · F8 terminals'
-  // Compact tier drops the version too: at 80 cols the right side (hints +
-  // version + provider dot) overflows by a character and the flex-end clip
-  // beheads the F-keys. The wide footer keeps it.
-  const welcomeRightLabel = [
-    footerAgentHint,
-    !compactFooterHints && ui.info?.version ? `v${ui.info.version}` : undefined
-  ]
-    .filter(Boolean)
-    .join(' · ')
+  useKeyboard(event => {
+    if (event.name === 'f10' && (!agentHotkeyBlocked || overlay.goal) && !overlay.agents) {
+      event.preventDefault()
+      event.stopPropagation()
+      patchOverlayState({ goal: !overlay.goal })
+    }
+    if (event.name === 'f9' && !agentHotkeyBlocked && !overlay.agents) {
+      event.preventDefault()
+      event.stopPropagation()
+      toggleAllToolRuns()
+    }
+  })
+  const compactFooterHints = width < 120
   // One poll for the whole screen: the statusbar's branch and dirty count and
   // the home chips' file totals are the same question asked twice.
   const pulse = useRepoPulse(ui.info?.cwd ?? '')
@@ -2163,6 +1894,7 @@ export function AppLayout({
     >
       <LiveTailFollower scrollRef={transcript.scrollRef} />
       <AgentPanelHotkey
+        onToggleRail={toggleAgentRail}
         disabled={agentHotkeyBlocked}
         // Clearing the inspect target on every toggle keeps a click from
         // sticking: reopening with F6 later should land on the list.
@@ -2189,51 +1921,39 @@ export function AppLayout({
         onOpenAgentView={() => patchOverlayState({ sessions: true })}
         tabs={ui.sessionTabs}
       />
+      <WorkspaceFooter onPanel={panel => {
+        if (agentHotkeyBlocked || overlay.agents) return
+        if (panel === 'tools') toggleAllToolRuns()
+        else patchOverlayState({ [panel]: true })
+      }} cwdLabel={status.cwdLabel} providerModel={ui.info?.model} pulse={pulse}
+        rightLabel={compactFooterHints ? 'F6 · F7 · F8 · F9 · F10' : 'F6 agents · F7 diff · F8 terminals · F9 tools · F10 goals'} t={t} />
       <Box flexDirection="row" flexGrow={1} minHeight={0} width="100%">
         <Box flexDirection="column" flexGrow={1} flexShrink={1} minHeight={0} minWidth={0}>
           {showStartupWelcome ? (
             <>
-              {/* Flush left, not centred. The canvas is explicit that content
-                  hugs the left edge with the whitespace on the right, and the
-                  welcome column is the same reading column the composer
-                  below it uses — so the mark, the chips and the caret all
-                  start on one line down the screen. */}
-              <Box alignItems="flex-start" flexDirection="column" flexGrow={1} minHeight={0} paddingX={2}>
-                <Box flexGrow={1} minHeight={0} />
-                {composer.completions.length ? null : (
-                  <Box
-                    flexDirection="column"
-                    flexShrink={0}
-                    maxWidth={contentColumnWidth(composer.cols)}
-                    width="100%"
-                  >
-                    <StartupWelcome cols={composer.cols} composer={composer} pulse={pulse} rows={height} />
+              <Box key="welcome" flexDirection="column" flexGrow={1} minHeight={0}>
+                <SessionHeader busy={false} sessionTitle="New session" t={t} />
+                <Box flexDirection="column" flexGrow={1} minHeight={0}
+                  paddingLeft={Math.max(2, Math.ceil((composer.cols - welcomeColumnWidth(composer.cols)) / 2))}
+                  paddingRight={Math.max(2, Math.floor((composer.cols - welcomeColumnWidth(composer.cols)) / 2))}>
+                  <scrollbox style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }}>
+                    {composer.completions.length ? null : (
+                      <Box flexDirection="column" flexShrink={0} paddingTop={height >= 60 ? 4 : height >= 30 ? 2 : 0}>
+                        <StartupWelcome cols={Math.min(124, composer.cols)} composer={composer} pulse={pulse} rows={height} />
+                      </Box>
+                    )}
+                  </scrollbox>
+                  <Box flexDirection="column" flexShrink={0} width="100%">
+                    <PromptZone actions={actions} />
+                    <Composer composer={{ ...composer, cols: Math.min(124, composer.cols) }} />
                   </Box>
-                )}
-                <Box flexShrink={1} height={1} minHeight={0} />
-                <Box
-                  flexDirection="column"
-                  flexShrink={0}
-                  maxWidth={contentColumnWidth(composer.cols)}
-                  width="100%"
-                >
-                  <PromptZone actions={actions} />
-                  <Composer composer={composer} />
                 </Box>
-                <Box flexShrink={1} height={2} minHeight={0} />
-                <Box flexGrow={1} minHeight={0} />
               </Box>
               <NoticeBanner notice={ui.notice} t={t} />
-              <WorkspaceFooter
-                cwdLabel={status.cwdLabel}
-                providerModel={ui.info?.model}
-                pulse={pulse}
-                rightLabel={welcomeRightLabel || undefined}
-                t={t}
-              />
+
             </>
           ) : (
-            <Box flexDirection="column" flexGrow={1} minHeight={0}>
+            <Box key="session" flexDirection="column" flexGrow={1} minHeight={0}>
               <SessionHeader
                 busy={ui.busy}
                 contextMax={usageCounts(ui.usage).max}
@@ -2245,7 +1965,7 @@ export function AppLayout({
                 sessionTitle={sessionTitle}
                 t={t}
               />
-              <SessionTelemetryRow line={sessionTelemetryLine(ui.usage)} t={t} />
+              {ui.detailsMode === 'expanded' ? <SessionTelemetryRow line={sessionTelemetryLine(ui.usage)} t={t} /> : null}
               <SessionTabStrip
                 activeId={ui.sid ?? ui.info?.session_id ?? null}
                 onNewTab={() => actions.newLiveSession()}
@@ -2254,7 +1974,7 @@ export function AppLayout({
                 t={t}
                 width={composer.cols}
               />
-              <Box flexDirection="column" flexGrow={1} gap={1} minHeight={0} paddingX={2} paddingY={1}>
+              <Box flexDirection="column" flexGrow={1} gap={1} minHeight={0} paddingX={2}>
                 <scrollbox
                   ref={scrollboxRef}
                   stickyScroll
@@ -2262,18 +1982,7 @@ export function AppLayout({
                   style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }}
                   viewportCulling
                 >
-                  {/* One reading column for the whole transcript, shared with
-                      the composer below it. Capping only the prose would leave
-                      tool rows and the user band running to the full terminal
-                      width — a ragged right edge that reads as less designed,
-                      not more. */}
-                  {/* Top-anchored, with the composer pinned below — the
-                      canvas layout. Bottom-anchoring this was a worse trade:
-                      it moved the dead space from under the content to ABOVE
-                      it, so a tall terminal opened on a header, forty empty
-                      rows, and the conversation huddled at the bottom. The
-                      scrollbox's sticky-bottom already keeps the newest row
-                      in view once the transcript overflows. */}
+                  {/* Transcript and composer fill the pane left by the agent rail. */}
                   <Box
                     flexDirection="column"
                     maxWidth={contentColumnWidth(composer.cols)}
@@ -2305,21 +2014,12 @@ export function AppLayout({
                     {/* Mockup 02: the quiet progress pill floats at the very end
                         of the live tail and unmounts on completion. */}
                     <LiveProgressPill />
-                    <TranscriptWatermark
-                      cols={composer.cols}
-                      contentRows={transcript.virtualHistory.totalHeight}
-                      rows={height}
-                    />
+
                     {transcript.virtualHistory.bottomSpacer > 0 ? (
                       <Box flexShrink={0} height={transcript.virtualHistory.bottomSpacer} />
                     ) : null}
                   </Box>
                 </scrollbox>
-                {/* Same reading column as the welcome screen, so sending the
-                    first message no longer snaps the input from 104 columns to
-                    the full terminal width. Left-aligned rather than centered:
-                    the transcript above it is left-aligned at this same
-                    padding, and centering would offset the two. */}
                 <Box
                   flexDirection="column"
                   flexShrink={0}
@@ -2331,13 +2031,7 @@ export function AppLayout({
                 </Box>
               </Box>
               <NoticeBanner notice={ui.notice} t={t} />
-              <WorkspaceFooter
-                cwdLabel={status.cwdLabel}
-                providerModel={ui.info?.model}
-                pulse={pulse}
-                rightLabel={footerAgentHint}
-                t={t}
-              />
+
             </Box>
           )}
         </Box>
@@ -2384,6 +2078,16 @@ export function AppLayout({
         <TerminalPanelOverlay onClose={() => patchOverlayState({ terminals: false })} t={t} />
       ) : null}
       {overlay.goal ? <GoalOverlay t={t} /> : null}
+      {overlay.contextInspector ? <ContextOverlay t={t} /> : null}
+      {overlay.monitors ? <MonitorOverlay t={t} /> : null}
+      {overlay.loops ? <ScheduleOverlay t={t} followupsOnly /> : null}
+      {overlay.schedules ? <ScheduleOverlay t={t} /> : null}
+      {overlay.lspSettings ? <LspSettingsOverlay t={t} /> : null}
+      {overlay.mcpSettings ? <McpSettingsOverlay t={t} /> : null}
+      {overlay.agentSettings ? <AgentSettingsOverlay t={t} /> : null}
+      {overlay.runs ? <RunOverlay t={t} /> : null}
+      {overlay.snapshots ? <SnapshotOverlay t={t} /> : null}
+      {overlay.workspaces ? <WorkspaceOverlay t={t} /> : null}
       {overlay.machinePicker ? (
         <MachinePicker
           onSelect={machine => {

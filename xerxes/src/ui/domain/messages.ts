@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 import { LONG_MSG } from '../config/limits.js'
 import { buildToolTrailLine, fmtK } from '../lib/text.js'
+import { summarizeToolStartDisplay } from '../lib/toolStartDisplay.js'
 import type { Msg, SessionInfo } from '../types.js'
 
 export const introMsg = (info: SessionInfo): Msg => ({ info, kind: 'intro', role: 'system', text: '' })
@@ -55,7 +56,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       if (!name && !context && !error) {
         continue
       }
-      pending.push(buildToolTrailLine(name ?? 'tool', context ?? '', Boolean(error), error || undefined, duration_s))
+      pending.push(buildToolTrailLine(name ?? 'tool', summarizeToolStartDisplay(name ?? 'tool', context ?? '').context, Boolean(error), error || undefined, duration_s))
 
       continue
     }

@@ -337,6 +337,47 @@ describe('CopilotSession', () => {
 })
 
 describe('fetchCopilotModels', () => {
+  test('cancellation during a retry wait releases the caller without another request', async () => {
+    const controller = new AbortController()
+    let requests = 0, enter!: () => void
+    const entered = new Promise<void>(resolve => { enter = resolve })
+    const pending = fetchCopilotModels({ access: 'fixture', refresh: 'fixture', expires: 9999999999 }, {
+      signal: controller.signal,
+      fetchImplementation: Object.assign(async () => { requests++; return new Response('{}', { status: 429, headers: { 'retry-after': '30' } }) }, { preconnect: fetch.preconnect }),
+      sleep: () => { enter(); return new Promise<void>(() => {}) },
+    })
+    await entered
+    controller.abort(new Error('stop discovery'))
+    await expect(pending).rejects.toThrow('stop discovery')
+    expect(requests).toBe(1)
+  })
+
+  test('pre-cancelled discovery makes no request', async () => {
+    let requests = 0
+    await expect(fetchCopilotModels({ access: 'fixture', refresh: 'fixture', expires: 9999999999 }, {
+      signal: AbortSignal.abort(new Error('cancelled')),
+      fetchImplementation: Object.assign(async () => { requests++; return Response.json({ data: [] }) }, { preconnect: fetch.preconnect }),
+    })).rejects.toThrow('cancelled')
+    expect(requests).toBe(0)
+  })
+
+  test('the request cancellation signal remains active while reading the catalog body', async () => {
+    const controller = new AbortController()
+    let enter!: () => void
+    const entered = new Promise<void>(resolve => { enter = resolve })
+    const pending = fetchCopilotModels({ access: 'fixture', refresh: 'fixture', expires: 9999999999 }, {
+      signal: controller.signal,
+      fetchImplementation: (async (_url, init) => new Response(new ReadableStream({
+        start(stream) {
+          init?.signal?.addEventListener('abort', () => stream.error(init.signal?.reason), { once: true })
+          enter()
+        },
+      }))) as typeof fetch,
+    })
+    await entered
+    controller.abort(new Error('stop body'))
+    await expect(pending).rejects.toThrow('stop body')
+  })
   const credential: CopilotCredential = {
     access: INDIVIDUAL_TOKEN,
     expires: 1_800_000_000,

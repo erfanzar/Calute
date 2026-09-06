@@ -238,8 +238,8 @@ test('system prompt lists resolved built-in subagent types only when delegation 
   const directPrompt = buildBootstrapSystemPrompt({ cwd: '/workspace' })
 
   expect(delegationPrompt).toContain('# Multi-Agent Orchestration')
-  expect(delegationPrompt).toContain('You may spawn any number of agents in one batch')
-  expect(delegationPrompt).toContain('without an artificial ceiling')
+  expect(delegationPrompt).toContain('Spawn at most 32 agents per batch')
+  expect(delegationPrompt).toContain('Registration is concurrency-limited')
   expect(delegationPrompt).toContain('Track spawned work without waiting for a user reminder')
   expect(delegationPrompt).toContain('Do not final-answer while required agents are queued or running')
   expect(delegationPrompt).toContain('Available subagent types:')

@@ -115,6 +115,7 @@ export class QueryEngine {
       let inputTokens = 0
       let outputTokens = 0
       for await (const event of runTurn({
+        sessionId: this.sessionId,
         ...(this.config.agentId ? { agentId: this.config.agentId } : {}),
         model: this.config.model,
         permissionMode: this.config.permissionMode,

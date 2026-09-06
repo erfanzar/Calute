@@ -86,6 +86,8 @@ const subagentMetadata = (...sources: Record<string, unknown>[]): Partial<Subage
   const inputTokens = numberField('input_tokens')
   const iteration = numberField('iteration')
   const model = stringField('model')
+  const providerProfile = stringField('provider_profile')
+  const reasoningEffort = stringField('reasoning_effort')
   const outputTokens = numberField('output_tokens')
   const cacheReadTokens = numberField('cache_read_tokens')
   const cacheCreationTokens = numberField('cache_creation_tokens')
@@ -110,6 +112,8 @@ const subagentMetadata = (...sources: Record<string, unknown>[]): Partial<Subage
     ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
     ...(iteration !== undefined ? { iteration: iteration } : {}),
     ...(model ? { model: model } : {}),
+    ...(providerProfile ? { provider_profile: providerProfile } : {}),
+    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
     ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
     ...(cacheReadTokens !== undefined ? { cache_read_tokens: cacheReadTokens } : {}),
     ...(cacheCreationTokens !== undefined ? { cache_creation_tokens: cacheCreationTokens } : {}),
@@ -400,6 +404,10 @@ export function adaptDaemonEvent(type: string, payload: Record<string, unknown>)
           type: 'session.info',
           payload: {
             model: str(payload.model),
+            // Omission is a partial telemetry update; null explicitly clears
+            // the goal. Do not retain a previous session's objective on clear.
+            ...('goal' in payload ? { goal: optionalStr(payload.goal) } : {}),
+            ...('goal_phase' in payload ? { goal_phase: optionalStr(payload.goal_phase) } : {}),
             ...(mode ? { mode } : {}),
             ...(activePermissionMode ? { permission_mode: activePermissionMode } : {}),
             ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),

@@ -17,7 +17,7 @@
 // and its exit status. The model starts it, does something else, and polls.
 
 import { ValidationError } from '../core/errors.js'
-import { ProcessRegistry, terminalExitCode, type ProcessRecord } from '../runtime/processRegistry.js'
+import { ProcessRegistry, sweepProcessGroupAfterExit, terminalExitCode, type ProcessRecord } from '../runtime/processRegistry.js'
 import type { TerminalHandle, TerminalRegistry } from '../runtime/terminalRegistry.js'
 
 import { BoundedOutputBuffer, capOutput, drainStream, type StreamDrain } from './processOutput.js'
@@ -84,6 +84,7 @@ export interface BackgroundCheckResult {
 interface BackgroundEntry {
   readonly command: readonly string[]
   readonly drains: readonly StreamDrain[]
+  readonly completion: Promise<void>
   readonly owner: BackgroundCommandOwner
   readonly process: Bun.Subprocess
   readonly stderr: BoundedOutputBuffer
@@ -176,6 +177,7 @@ export class BackgroundCommandManager {
     ]
     this.entries.set(procId, {
       command: argv,
+      completion: finishTerminal(child, drains, terminal),
       drains,
       owner,
       process: child,
@@ -183,9 +185,6 @@ export class BackgroundCommandManager {
       stderr,
       ...(terminal ? { terminal } : {}),
     })
-    // Close the mirror on natural exit too, not only on an explicit kill: a
-    // build that finishes on its own must stop being listed as running.
-    void child.exited.then(code => terminal?.close(typeof code === 'number' ? code : null)).catch(() => {})
     return { procId, pid: child.pid, running: true, command: argv, cwd: options.cwd }
   }
 
@@ -233,9 +232,10 @@ export class BackgroundCommandManager {
       this.registry.remove(procId)
       throw error
     }
-    onTerminal?.(terminal as TerminalHandle)
+    if (terminal) onTerminal?.(terminal)
     this.entries.set(procId, {
       command: options.command,
+      completion: finishTerminal(options.child, options.drains, terminal),
       drains: options.drains,
       owner,
       process: options.child,
@@ -243,9 +243,6 @@ export class BackgroundCommandManager {
       stderr: options.stderr,
       ...(terminal ? { terminal } : {}),
     })
-    void options.child.exited
-      .then(code => terminal?.close(typeof code === 'number' ? code : null))
-      .catch(() => {})
     return {
       procId,
       pid: options.child.pid,
@@ -354,6 +351,13 @@ export class BackgroundCommandManager {
         await this.exitedWithin(entry, KILL_GRACE_MS)
       }
     }
+    if (terminalExitCode(entry.process) === null) {
+      throw new Error('Command shutdown could not be confirmed; its handle is retained for inspection or another stop attempt')
+    }
+    // Only sweep immediately after a signal we delivered to a live leader.
+    // Reaping an old completed record must never signal a potentially reused PID.
+    if (signalled && PROCESS_GROUPS_AVAILABLE) await sweepProcessGroupAfterExit(entry.process)
+    await entry.completion
     this.release(procId)
     return { procId, signalled, exitCode: terminalExitCode(entry.process) }
   }
@@ -440,4 +444,19 @@ async function raceBounded<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   } finally {
     if (timer !== undefined) clearTimeout(timer)
   }
+}
+
+/** Publish completion only after pipe tails arrive, with a bound for inherited pipes. */
+async function finishTerminal(
+  child: Bun.Subprocess,
+  drains: readonly StreamDrain[],
+  terminal: TerminalHandle | undefined,
+): Promise<void> {
+  const code = await child.exited.then(code => code, () => null)
+  const drained = await raceBounded(Promise.all(drains.map(drain => drain.done)).then(() => true), 1_000)
+  if (!drained) {
+    for (const drain of drains) drain.cancel()
+    terminal?.append('\n[Output capture stopped: process exited but its output pipes remained open.]\n')
+  }
+  terminal?.close(code)
 }

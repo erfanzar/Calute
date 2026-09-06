@@ -701,7 +701,7 @@ test('foreground SpawnAgents cancellation closes only children spawned by that c
   expect(closed).toEqual(['batch-a', 'batch-b'])
 })
 
-test('background AgentTool can detach but an already-aborted SpawnAgents batch registers nothing', async () => {
+test('already-aborted delegation registers no single agents or swarm agents', async () => {
   const snapshots: SpawnedAgentSnapshot[] = []
   const closed: string[] = []
   const tracked: string[][] = []
@@ -734,22 +734,21 @@ test('background AgentTool can detach but an already-aborted SpawnAgents batch r
   const controller = new AbortController()
   controller.abort(new Error('parent already cancelled'))
 
-  const single = await tools.execute('AgentTool', {
+  await expect(tools.execute('AgentTool', {
     name: 'detached-one',
     prompt: 'continue independently',
     title: 'Continue independently',
     run_in_background: true,
-  }, { metadata: {} }, controller.signal) as { id: string }
+  }, { metadata: {} }, controller.signal)).rejects.toThrow('parent already cancelled')
   await expect(tools.execute('SpawnAgents', {
     agents: [{ name: 'detached-two', prompt: 'also continue', title: 'Also continue' }],
     wait: false,
   }, { metadata: {} }, controller.signal)).rejects.toThrow('parent already cancelled')
 
-  expect(single.id).toBe('detached-one')
   expect(waits).toBe(0)
   expect(closed).toEqual([])
-  expect(snapshots.map(snapshot => snapshot.id)).toEqual(['detached-one'])
-  expect(tracked).toEqual([['detached-one']])
+  expect(snapshots).toEqual([])
+  expect(tracked).toEqual([])
 })
 
 test('AwaitAgents observes the exact tracked cohort even when every child already finished', async () => {
@@ -1324,4 +1323,140 @@ test('the todo list a client renders round-trips from what TodoWriteTool writes'
     { content: 'Freeze the naming drift', status: 'pending' },
   ])
   expect(state.todoItems()).toHaveLength(3)
+})
+
+test('delegation maps intelligence tiers and defaults before spawning, preserving explicit models', async () => {
+  const spawned: string[] = []
+  const tools = new ClaudeAgentTools({
+    intelligence: { default: 'balanced', light: 'fixture-fast', balanced: 'fixture-normal', smart: 'fixture-deep' },
+    manager: {
+      spawn: async options => { spawned.push(options?.agent?.model ?? 'inherit'); return agentSnapshot(`tier-${spawned.length}`) },
+      listHandles: () => [], close: id => ({ ...agentSnapshot(id, 'closed'), previousStatus: 'running' as const }), resume: id => agentSnapshot(id),
+      sendInput: async id => agentSnapshot(id ?? 'missing'), wait: async () => ({ completed: [], pending: [] }),
+    },
+  })
+  await tools.execute('SpawnAgents', { agents: [
+    { title: 'Small task', prompt: 'small', intelligence: 'light' },
+    { title: 'Deep task', prompt: 'deep', intelligence: 'smart' },
+    { title: 'Normal task', prompt: 'normal' },
+    { title: 'Exact model', prompt: 'exact', model: 'fixture-explicit' },
+  ], wait: false }, { metadata: {} })
+  expect(spawned).toEqual(['fixture-fast', 'fixture-deep', 'fixture-normal', 'fixture-explicit'])
+  for (const name of ['AgentTool', 'TaskCreateTool']) {
+    await tools.execute(name, { title: 'Small task', prompt: 'small', intelligence: 'light', wait: false }, { metadata: {} })
+  }
+  expect(spawned.slice(-2)).toEqual(['fixture-fast', 'fixture-fast'])
+})
+
+test('invalid swarm tiers fail before any child is registered', async () => {
+  let spawned = 0
+  const tools = new ClaudeAgentTools({
+    intelligence: { light: 'fixture-fast' },
+    manager: {
+      spawn: async () => { spawned++; return agentSnapshot('unexpected') },
+      listHandles: () => [], close: id => ({ ...agentSnapshot(id, 'closed'), previousStatus: 'running' as const }), resume: id => agentSnapshot(id),
+      sendInput: async id => agentSnapshot(id ?? 'missing'), wait: async () => ({ completed: [], pending: [] }),
+    },
+  })
+  for (const invalid of [ { intelligence: 'smart' }, { intelligence: 'bogus' }, { intelligence: 12 }, { intelligence: 'light', model: 'explicit' } ]) {
+    await expect(tools.execute('SpawnAgents', { agents: [
+      { title: 'Valid task', prompt: 'valid', intelligence: 'light' },
+      { title: 'Invalid task', prompt: 'invalid', ...invalid },
+    ], wait: false }, { metadata: {} })).rejects.toThrow()
+  }
+  expect(spawned).toBe(0)
+})
+
+test('registered delegation schemas advertise only configured intelligence tiers', () => {
+  const manager = new SpawnedAgentManager({ runner: async () => ({ content: 'ok' }) })
+  for (const intelligence of [{}, { light: 'fixture-fast' }]) {
+    const definitions = registerClaudeAgentTools(new ToolRegistry(), { manager, intelligence })
+    for (const name of ['AgentTool', 'TaskCreateTool', 'SpawnAgents']) {
+      const tool = definitions.find(tool => tool.function.name === name)!
+      const schema = tool.function.parameters as { properties: Record<string, unknown> }
+      const properties = name === 'SpawnAgents'
+        ? (schema.properties.agents as { items: { properties: Record<string, unknown> } }).items.properties
+        : schema.properties
+      if ('light' in intelligence) expect(properties.intelligence).toMatchObject({ enum: ['light'] })
+      else expect(properties.intelligence).toBeUndefined()
+      expect(properties.model).toBeDefined()
+    }
+  }
+  // Separate registrations must not mutate the shared declarations.
+  const all = registerClaudeAgentTools(new ToolRegistry(), { manager, intelligence: { smart: 'fixture-deep' } })
+  expect((all.find(tool => tool.function.name === 'AgentTool')!.function.parameters.properties as Record<string, unknown>).intelligence).toMatchObject({ enum: ['smart'] })
+})
+
+test('agent and swarm isolation is forwarded explicitly and unsupported runners reject it', async () => {
+  const seen: Array<string | undefined> = []
+  const refs: Array<string | undefined> = []
+  const sources: Array<string | undefined> = []
+  const manager: SpawnedAgentManagerPort = {
+    close: () => { throw new Error('unused') },
+    listHandles: () => [],
+    resume: () => { throw new Error('unused') },
+    sendInput: async () => { throw new Error('unused') },
+    spawn: async options => { seen.push(options?.isolation); refs.push(options?.worktreeRef); sources.push(options?.worktreeSource); return agentSnapshot('isolated-' + seen.length) },
+    wait: async () => ({ completed: [], pending: [] }),
+  }
+  const tools = new ClaudeAgentTools({ manager })
+  await tools.execute('AgentTool', { title: 'Isolated', prompt: 'work', isolation: 'worktree', worktree_ref: 'release', wait: false }, { metadata: {} })
+  await tools.execute('SpawnAgents', { agents: [{ title: 'Isolated', prompt: 'work', isolation: 'worktree', worktree_source: 'working-tree' }, { title: 'Default', prompt: 'work' }], wait: false }, { metadata: {} })
+  expect(seen).toEqual(['worktree', 'worktree', undefined])
+  expect(refs).toEqual(['release', undefined, undefined])
+  expect(sources).toEqual([undefined, 'working-tree', undefined])
+  await expect(tools.execute('AgentTool', { title: 'Conflict', prompt: 'work', isolation: 'worktree', worktree_ref: 'HEAD', worktree_source: 'working-tree' }, { metadata: {} })).rejects.toThrow('no worktree_ref')
+  await expect(tools.execute('SpawnAgents', { agents: [{ title: 'Valid', prompt: 'work' }, { title: 'Invalid', prompt: 'work', worktree_ref: 'HEAD' }] }, { metadata: {} })).rejects.toThrow('requires isolation=worktree')
+  await expect(tools.execute('AgentTool', { title: 'Invalid', prompt: 'work', isolation: 'container' }, { metadata: {} })).rejects.toThrow('must be worktree')
+  await expect(tools.execute('SpawnAgents', { agents: [{ title: 'Invalid', prompt: 'work', isolation: true }] }, { metadata: {} })).rejects.toThrow('must be worktree')
+  expect(seen).toHaveLength(3)
+  let ran = false
+  const unsupported = new SpawnedAgentManager({ runner: async () => { ran = true; return 'unexpected' } })
+  await expect(unsupported.spawn({ message: 'work', isolation: 'worktree' })).rejects.toThrow('configured worktree adapter')
+  expect(ran).toBe(false)
+  expect(unsupported.listHandles()).toHaveLength(0)
+})
+
+test('agent tools forward explicit discovered provider and reasoning choices without mixing tiers', async () => {
+  const requests: unknown[] = []
+  const manager: SpawnedAgentManagerPort = {
+    close: () => { throw new Error('unused') }, listHandles: () => [], resume: () => { throw new Error('unused') }, sendInput: async () => { throw new Error('unused') },
+    spawn: async options => { requests.push(options); return agentSnapshot('selected-' + requests.length) }, wait: async () => ({ completed: [], pending: [] }),
+  }
+  const tools = new ClaudeAgentTools({ manager, intelligence: { default: 'smart', smart: 'other-model' } })
+  const choice = { title: 'Review', prompt: 'work', model: 'discovered', provider_profile: 'subscription', reasoning_effort: 'high' }
+  await tools.execute('AgentTool', { ...choice, wait: false }, { metadata: {} })
+  await tools.execute('TaskCreateTool', choice, { metadata: {} })
+  await tools.execute('SpawnAgents', { agents: [choice], wait: false }, { metadata: {} })
+  expect(requests).toHaveLength(3)
+  for (const request of requests) expect(request).toMatchObject({ agent: { model: 'discovered', providerProfile: 'subscription', reasoningEffort: 'high' } })
+  const { model: _model, ...withoutModel } = choice
+  await expect(tools.execute('AgentTool', withoutModel, { metadata: {} })).rejects.toThrow('require model')
+  await expect(tools.execute('SpawnAgents', { agents: [{ ...choice, intelligence: 'smart' }] }, { metadata: {} })).rejects.toThrow('cannot be combined')
+  expect(requests).toHaveLength(3)
+})
+
+test('all delegation entry points forward allocation cancellation and close a late allocation', async () => {
+  const controller = new AbortController()
+  let allocations = 0
+  const closed: string[] = []
+  let cancelDuringSpawn = false
+  const manager: SpawnedAgentManagerPort = {
+    close: id => { closed.push(id); return { ...agentSnapshot(id, 'closed'), previousStatus: 'running' as const } },
+    listHandles: () => [], resume: id => agentSnapshot(id), sendInput: async id => agentSnapshot(id ?? 'missing'),
+    spawn: async options => { expect(options?.signal).toBe(controller.signal); allocations++; if (cancelDuringSpawn) controller.abort(new Error('cancelled allocation')); return agentSnapshot('allocated-' + allocations) },
+    wait: async () => ({ completed: [], pending: [] }),
+  }
+  const tools = new ClaudeAgentTools({ manager })
+  const choice = { title: 'Review', prompt: 'work', wait: false }
+  await tools.execute('AgentTool', choice, { metadata: {} }, controller.signal)
+  await tools.execute('TaskCreateTool', choice, { metadata: {} }, controller.signal)
+  await tools.execute('SpawnAgents', { agents: [choice], wait: false }, { metadata: {} }, controller.signal)
+  await tools.execute('HandoffTool', { target_agent: 'coder', reason: 'review', prompt: 'work' }, { metadata: {} }, controller.signal)
+  expect(allocations).toBe(4)
+  cancelDuringSpawn = true
+  await expect(tools.execute('TaskCreateTool', choice, { metadata: {} }, controller.signal)).rejects.toThrow('cancelled allocation')
+  expect(closed).toEqual(['allocated-5'])
+  await expect(tools.execute('AgentTool', choice, { metadata: {} }, controller.signal)).rejects.toThrow('cancelled allocation')
+  expect(allocations).toBe(5)
 })

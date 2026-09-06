@@ -1,11 +1,16 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
+import type { LspSettingsView } from '../lsp/settings.js';
+import { readContextControls, type ContextControls } from '../context/controls.js';
+import type { LspServerHealth } from '../lsp/manager.js';
 
 import { join, resolve } from "node:path";
 
 import { ValidationError } from "../core/errors.js";
 import type { HookRunner } from "../extensions/hooks.js";
+import { inspectWorkspaceHooks, type WorkspaceHookInspection } from "../extensions/workspaceHooks.js";
 import { disarmGoal } from "../runtime/goalDomain.js";
+import { GOAL_WAKE_KEY, readGoalWake } from "../runtime/goalWake.js";
 import { normalizeInteractionMode } from "../runtime/interactionModes.js";
 import {
   appendContextDelta,
@@ -28,7 +33,7 @@ import {
 } from "../tools/fileState.js";
 import { processAtMentions } from "./atMentions.js";
 import { imageUrlContentParts, type TurnImage } from "./images.js";
-import { xerxesHome } from "./paths.js";
+import { resolveProjectDirectory, xerxesHome } from "./paths.js";
 import { displayTitle } from "./titleGenerator.js";
 import type { DaemonInteractionBoard } from "./interactions.js";
 import {
@@ -82,6 +87,7 @@ export interface DaemonSession {
    * mid-turn reattach would see a bare user line instead of the work so far.
    */
   inflightTools?: InflightToolSnapshot[];
+  inflightTodoResult?: string;
   messages: DaemonTranscriptMessage[];
   metadata: Record<string, unknown>;
   /** Persisted revision and message boundary this in-memory copy was based on. */
@@ -125,6 +131,9 @@ export interface DaemonSession {
    * cost in the request, which is what drives auto-compaction too late.
    */
   requestScaffold?: {
+    readonly capturedAt?: number;
+    readonly systemSegments?: readonly { readonly name: string; readonly text: string }[];
+    readonly memorySources?: readonly { readonly scope: string; readonly path: string; readonly content: string }[];
     readonly systemPrompt?: string;
     readonly toolSchemas?: readonly Readonly<Record<string, unknown>>[];
   };
@@ -167,7 +176,11 @@ export interface InflightToolSnapshot {
 }
 
 export interface OpenSessionOptions {
+  /** Bound background work must never create or select a replacement conversation. */
+  readonly expectedSessionId?: string;
   readonly cwd?: string;
+  /** Background work must not relocate an existing conversation. Checked under the session-open lock. */
+  readonly preserveProject?: boolean;
   readonly model?: string;
   /** Only explicit resume requests may rehydrate a persisted transcript. */
   readonly resume?: boolean;
@@ -206,7 +219,15 @@ export interface SavedSessionListOptions {
   readonly projectDirectory?: string;
 }
 
+export interface RuntimeToolInventoryEntry {
+  readonly name: string;
+  readonly description?: string;
+  readonly exposure: 'loaded' | 'deferred' | 'filtered' | 'unexposed';
+  readonly reason: string;
+}
+
 export interface TurnRunner {
+  toolInventory?(session: DaemonSession): readonly RuntimeToolInventoryEntry[];
   /** True when the runner synchronizes complete agent state onto the session. */
   readonly managesSessionState?: boolean;
   /** Release cached per-session state when the daemon evicts the session. */
@@ -220,7 +241,11 @@ export interface TurnRunner {
 }
 
 /** Controls that the daemon supplies around a single active turn. */
+export type TurnOrigin = 'human' | 'schedule' | 'monitor';
+
 export interface TurnRunControls {
+  /** Host-provided origin; background turns never inherit human authority. */
+  readonly origin?: TurnOrigin;
   /** Drain user steering received since the last provider/tool boundary. */
   drainSteer?(): readonly string[];
   /** Text authored by the user before hidden attachment expansion. */
@@ -236,14 +261,18 @@ export interface TurnRunControls {
   /**
    * Positive round number when this turn is an automatic goal continuation.
    *
-   * Absent means a human opened the turn. The goal tools authorise against
-   * this: only a human may create, edit, pause or resume a goal, while an
+   * A missing round is human authority only when origin is human (the
+   * default). Scheduled and monitor turns remain non-human. Only a human
+   * may create, edit, pause or resume a goal, while an
    * automatic round may additionally complete or block the one it belongs to.
    */
   readonly goalRound?: number;
 }
 
 export interface SubmitTurnOptions {
+  readonly origin?: TurnOrigin;
+  /** Host-owned cancellation; never serialized into the wire protocol. */
+  readonly signal?: AbortSignal;
   /** Transcript text retained separately from the provider-facing prompt. */
   readonly displayText?: string;
   /** Validated image attachments for this turn's user message. */
@@ -258,7 +287,7 @@ export interface SubmitTurnOptions {
 export interface SubagentRetryRequest {
   /** Optional replacement instruction for the new attempt. */
   readonly message?: string;
-  /** Connection session that requested the retry; informational. */
+  /** Connection session that requested the retry; native hosts enforce its task ownership. */
   readonly sessionKey?: string;
   /** Stable task id or name of the dead subagent to resume. */
   readonly task: string;
@@ -272,6 +301,10 @@ export interface SubagentRetryResult {
 }
 
 export interface DaemonRuntime {
+  lspSettings?(): LspSettingsView | undefined;
+  saveLspSettings?(request: unknown, signal?: AbortSignal): Promise<LspSettingsView | undefined>;
+  releaseLsp?(sessionKey: string, name: string): Promise<boolean>;
+  lspHealth?(sessionKey: string): Promise<readonly LspServerHealth[] | undefined>;
   cancelAllTurns(): number;
   cancelTurn(sessionKey: string): boolean;
   /**
@@ -290,6 +323,7 @@ export interface DaemonRuntime {
   removeSavedTranscript?(sessionId: string): Promise<boolean>;
   evictSession(sessionKey: string): void;
   flushSessions(mode?: 'append' | 'rewrite'): Promise<void>;
+  saveSessionContextControls?(sessionKey: string, controls: ContextControls): Promise<void>;
   /** Reset optimistic persistence baselines after the saved store is wiped. */
   resetSavedTranscriptState?(): void;
   listSavedSessions(
@@ -352,6 +386,8 @@ export interface DaemonRuntime {
     enabled: boolean,
   ): Promise<DaemonSession | undefined>;
   sessionStatus(sessionKey: string): DaemonSession | undefined;
+  toolInventory?(sessionKey: string): readonly RuntimeToolInventoryEntry[] | undefined;
+  inspectHooks?(sessionKey: string): WorkspaceHookInspection | undefined;
   /** Release host-owned resources such as native delegated-agent managers. */
   shutdown?(): Promise<void>;
   steerTurn(sessionKey: string, content: string): boolean;
@@ -377,12 +413,17 @@ export interface DaemonBackgroundCommandLifecycle {
 }
 
 export interface InMemoryDaemonRuntimeOptions {
+  readonly lspSettings?: () => LspSettingsView;
+  readonly saveLspSettings?: (request: unknown, signal?: AbortSignal) => Promise<LspSettingsView>;
+  readonly releaseLsp?: (cwd: string, name: string) => Promise<void>;
+  readonly lspHealth?: (cwd: string) => Promise<readonly LspServerHealth[]>;
   readonly backgroundCommands?: DaemonBackgroundCommandLifecycle;
   readonly baseUrl?: string;
   readonly buildId?: string;
   readonly currentProjectDirectory?: string;
   /** Extension hook sink: session start/end and compaction events fire here. */
   readonly hookRunner?: HookRunner;
+  readonly hookRunnerForSession?: (session: DaemonSession) => HookRunner;
   readonly model?: string;
   readonly permissionMode?: string;
   /** Coordinates approval and question replies for agent runners that opt in. */
@@ -436,6 +477,7 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
   private readonly options: InMemoryDaemonRuntimeOptions;
   private readonly runtimeSettings: JsonRpcPayload;
   private readonly sessions = new Map<string, DaemonSession>();
+  private readonly exclusiveSessionWrites = new Set<string>();
   /** Coalesces async transcript loads so one key cannot initialize twice. */
   private readonly sessionOpenPromises = new Map<string, Promise<DaemonSession>>();
   /**
@@ -541,17 +583,19 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
   }
 
   async deleteSavedSession(sessionId: string): Promise<boolean> {
+    if (this.exclusiveSessionWrites.has(sessionId)) throw new Error('A session persistence operation is already in progress');
     const active = [...this.sessions.entries()].find(
       ([, session]) => session.id === sessionId,
     );
     if (active?.[1].activeTurnId) {
       throw new Error("Cannot delete a session with an active turn");
     }
-    const deleted = await this.transcriptStore.remove(sessionId);
-    if (active) {
-      this.evictSession(active[0]);
-    }
-    return deleted || active !== undefined;
+    this.exclusiveSessionWrites.add(sessionId);
+    try {
+      const deleted = await this.transcriptStore.remove(sessionId);
+      if (active) this.evictSession(active[0]);
+      return deleted || active !== undefined;
+    } finally { this.exclusiveSessionWrites.delete(sessionId); }
   }
 
   async removeSavedTranscript(sessionId: string): Promise<boolean> {
@@ -563,8 +607,9 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
     const sessionId = session?.id ?? sessionKey;
     // SessionEnd hook: fired synchronously-scheduled before the record is
     // dropped so the payload still has the session's identity and cwd.
-    if (session && this.options.hookRunner?.hasHooks("on_session_end")) {
-      void this.options.hookRunner.run("on_session_end", {
+    const hooks = session ? this.options.hookRunnerForSession?.(session) ?? this.options.hookRunner : undefined;
+    if (session && hooks?.hasHooks("on_session_end")) {
+      void hooks.run("on_session_end", {
         cwd: session.cwd,
         session_id: sessionId,
         turns: session.turnCount,
@@ -636,6 +681,21 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
         `Cleaning up resources for evicted session '${sessionId}' failed: ${errorMessage(error)}`,
       );
     }
+  }
+
+  async saveSessionContextControls(sessionKey: string, controls: ContextControls): Promise<void> {
+    const session = this.sessions.get(sessionKey);
+    if (!session || session.activeTurnId || session.status !== 'idle') throw new Error('An idle active session is required');
+    if (this.exclusiveSessionWrites.has(session.id)) throw new Error('A session persistence operation is already in progress');
+    if (!transcriptHasHistory({ messages: session.messages, turnCount: session.turnCount })) throw new Error('Complete a conversation turn before saving context controls');
+    const next = readContextControls({ context_controls: controls });
+    if (next.revision !== readContextControls(session.metadata).revision + 1) throw new Error('Context controls changed; refresh before saving');
+    const previous = session.metadata;
+    this.exclusiveSessionWrites.add(session.id);
+    session.metadata = { ...previous, context_controls: next };
+    try { await this.saveSession(session); }
+    catch (error) { session.metadata = previous; throw error; }
+    finally { this.exclusiveSessionWrites.delete(session.id); }
   }
 
   async flushSessions(mode: 'append' | 'rewrite' = 'append'): Promise<void> {
@@ -801,8 +861,12 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
   ): Promise<DaemonSession> {
     const existing = this.sessions.get(key);
     if (existing) {
+      if (options.expectedSessionId !== undefined && existing.id !== options.expectedSessionId) throw new Error('Scheduled conversation identity changed');
       const existingIsSubagent = metadataIsSubagent(existing.metadata);
       const requestedCwd = options.cwd ? resolve(options.cwd) : undefined;
+      if (options.preserveProject && requestedCwd && resolveProjectDirectory(existing.cwd) !== resolveProjectDirectory(requestedCwd)) {
+        throw new ValidationError("session_id", "belongs to another workspace; choose a separate session", key);
+      }
       if (
         existingIsSubagent &&
         requestedCwd &&
@@ -864,7 +928,7 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
     const transcript = loadResult.kind === "loaded" ? loadResult.transcript : undefined;
     if (
       transcript &&
-      transcriptProjectDirectory(transcript) !== cwd
+      resolveProjectDirectory(transcriptProjectDirectory(transcript)) !== resolveProjectDirectory(cwd)
     ) {
       const kind = transcriptIsSubagent(transcript)
         ? "subagent history"
@@ -875,6 +939,7 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
         key,
       );
     }
+    if (options.expectedSessionId !== undefined && transcript?.sessionId !== options.expectedSessionId) throw new Error('Scheduled conversation is missing or its identity changed');
     let effectiveTranscript = transcript;
     let session = effectiveTranscript
       ? sessionFromTranscript(
@@ -974,8 +1039,9 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
       // newly opened session, with `resumed` distinguishing a fresh session
       // from one reloaded from disk. Observer-only; failures are isolated by
       // the HookRunner.
-      if (this.options.hookRunner?.hasHooks("on_session_start")) {
-        void this.options.hookRunner.run("on_session_start", {
+      const hooks = this.options.hookRunnerForSession?.(session) ?? this.options.hookRunner;
+      if (hooks?.hasHooks("on_session_start")) {
+        void hooks.run("on_session_start", {
           cwd: session.cwd,
           resumed: effectiveTranscript !== undefined,
           session_id: session.id,
@@ -1157,6 +1223,36 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
     return this.sessions.get(sessionKey);
   }
 
+  lspSettings(): LspSettingsView | undefined { return this.options.lspSettings?.(); }
+
+  async saveLspSettings(request: unknown, signal?: AbortSignal): Promise<LspSettingsView | undefined> {
+    return this.options.saveLspSettings?.(request, signal);
+  }
+
+  async releaseLsp(sessionKey: string, name: string): Promise<boolean> {
+    const session = this.sessionStatus(sessionKey);
+    if (!session || !this.options.releaseLsp) return false;
+    await this.options.releaseLsp(session.cwd, name);
+    return true;
+  }
+
+  async lspHealth(sessionKey: string): Promise<readonly LspServerHealth[] | undefined> {
+    const session = this.sessionStatus(sessionKey);
+    return session ? this.options.lspHealth?.(session.cwd) : undefined;
+  }
+
+  toolInventory(sessionKey: string): readonly RuntimeToolInventoryEntry[] | undefined {
+    const session = this.sessionStatus(sessionKey);
+    return session ? this.turnRunner.toolInventory?.(session) : undefined;
+  }
+
+  inspectHooks(sessionKey: string): WorkspaceHookInspection | undefined {
+    const session = this.sessionStatus(sessionKey);
+    if (!session) return undefined;
+    const runner = this.options.hookRunnerForSession?.(session) ?? this.options.hookRunner;
+    return runner ? inspectWorkspaceHooks(runner) : undefined;
+  }
+
   async shutdown(): Promise<void> {
     this.shutdownPromise ??= Promise.allSettled([
       Promise.resolve().then(() => this.options.shutdown?.()),
@@ -1273,6 +1369,37 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
     emit: (event: DaemonEvent) => void,
     options: SubmitTurnOptions = {},
   ): Promise<void> {
+    options.signal?.throwIfAborted();
+    if (options.origin !== undefined && !['human', 'schedule', 'monitor'].includes(options.origin)) throw new Error('Invalid turn origin');
+    if (options.origin && options.origin !== 'human' && options.goalRound !== undefined) throw new Error('Background turn cannot claim goal-round authority');
+    if (this.abortControllers.has(sessionKey)) {
+      throw new Error("A turn is already active for this session");
+    }
+    // Admission in submitTurnOwned is synchronous up to registering ownership.
+    const pending = this.submitTurnOwned(sessionKey, text, emit, options);
+    const controller = this.abortControllers.get(sessionKey);
+    const cancel = (): void => {
+      // Use the complete cancellation path (children and goal authority too),
+      // but never cancel a replacement turn that now owns this session key.
+      if (controller && this.abortControllers.get(sessionKey) === controller) {
+        this.cancelTurn(sessionKey);
+      }
+    };
+    options.signal?.addEventListener("abort", cancel, { once: true });
+    if (options.signal?.aborted) cancel();
+    try {
+      await pending;
+    } finally {
+      options.signal?.removeEventListener("abort", cancel);
+    }
+  }
+
+  private async submitTurnOwned(
+    sessionKey: string,
+    text: string,
+    emit: (event: DaemonEvent) => void,
+    options: SubmitTurnOptions,
+  ): Promise<void> {
     // Admission begins before session loading and other asynchronous setup.
     // Otherwise cancelTurn observes no controller in that window and the
     // supposedly stopped request proceeds to launch once setup resolves.
@@ -1329,6 +1456,7 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
     session.inflightStartedAt = Date.now();
     delete session.inflightThinking;
     delete session.inflightTools;
+    delete session.inflightTodoResult;
     // Every event produced by this turn must retain its owning session. One
     // TUI connection can keep multiple native sessions alive and switch the
     // foreground tab while an earlier turn is still streaming; unscoped text,
@@ -1407,6 +1535,7 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
           journal: this.messageJournal(session.id),
           ...(images.length ? { images } : {}),
           ...(options.goalRound === undefined ? {} : { goalRound: options.goalRound }),
+          ...(options.origin === undefined ? {} : { origin: options.origin }),
         },
       )) {
         emitSessionEvent(event);
@@ -1487,6 +1616,7 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
       delete session.inflightStartedAt;
       delete session.inflightThinking;
       delete session.inflightTools;
+      delete session.inflightTodoResult;
       // An evicted session may already have a replacement turn registered;
       // only release the controller this turn actually owns.
       if (this.abortControllers.get(sessionKey) === controller) {
@@ -1518,10 +1648,21 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
     // write plus the crash journal are what make a mid-turn crash recoverable.
     if (
       !session.activeTurnId &&
-      !transcriptHasHistory({ messages: session.messages, turnCount: session.turnCount })
+      !transcriptHasHistory({ messages: session.messages, turnCount: session.turnCount, metadata: session.metadata })
     ) {
       return;
     }
+    const metadata = { ...session.metadata }
+    const forkedFrom = typeof metadata.forked_from === 'string' ? metadata.forked_from : undefined
+    const rawWake = metadata[GOAL_WAKE_KEY]
+    const rawWakeSessionId = rawWake !== null && typeof rawWake === 'object'
+      ? (rawWake as Record<string, unknown>).sessionId
+      : undefined
+    if (forkedFrom && metadata.parent_session_id === forkedFrom && rawWakeSessionId === forkedFrom) {
+      delete metadata.goal_wake
+      session.metadata = metadata
+    }
+    readGoalWake(metadata, session.id)
     await this.transcriptStore.save({
       agentId: session.agentId,
       ...(session.apiCallsComplete === undefined
@@ -1538,7 +1679,7 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
       // written with instead of silently adopting whatever the profile last
       // stored, which could be a different provider entirely.
       metadata: {
-        ...session.metadata,
+        ...metadata,
         model: session.model,
         // The read-before-edit guard's per-session state rides with the
         // transcript so a resumed session still knows which files the model
@@ -1945,15 +2086,24 @@ function inflightPreviewText(value: unknown, limit: number): string {
  * then has neither readable tool context nor names for its status cubes.
  */
 function inflightToolContext(name: string, value: unknown): string {
-  if (name.replace(/[^a-z0-9]+/gi, "").toLowerCase() !== "spawnagents") {
-    return "";
-  }
   const raw = typeof value === "string" ? value : "";
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
     return "";
+  }
+  if (isRecord(parsed) && name.replace(/[^a-z0-9]+/gi, "").toLowerCase() !== "spawnagents") {
+    const command = parsed.cmd ?? parsed.command;
+    if (typeof command === 'string' || Array.isArray(command)) {
+      const argv = Array.isArray(command) ? command.filter(item => typeof item === 'string') : [command];
+      const args = parsed.args ?? parsed.arguments;
+      return inflightPreviewText([...argv, ...(Array.isArray(args) ? args.filter(item => typeof item === 'string') : [])].join(' '), 200);
+    }
+    for (const key of ['file_path', 'path', 'task_id', 'query', 'pattern']) {
+      if (typeof parsed[key] === 'string') return inflightPreviewText(parsed[key], 200);
+    }
+    return '';
   }
   if (!isRecord(parsed) || !Array.isArray(parsed.agents)) {
     return "";
@@ -2013,6 +2163,7 @@ function recordInflightTrail(session: DaemonSession, event: DaemonEvent): void {
     return;
   }
   if (event.type === "tool_result") {
+    if (event.payload.name === "TodoWriteTool" && event.payload.permitted !== false && !event.payload.error && typeof event.payload.return_value === "string") session.inflightTodoResult = event.payload.return_value;
     const tools = session.inflightTools;
     if (!tools?.length) {
       return;

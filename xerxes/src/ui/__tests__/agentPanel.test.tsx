@@ -7,6 +7,7 @@ import { act, Profiler } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { SpawnSnapshot } from '../app/spawnHistoryStore.js'
+import { adjustPanelWidth, resetPanelWidth } from '../app/panelSizeStore.js'
 import { GatewayProvider } from '../app/gatewayContext.js'
 import type { GatewayServices } from '../app/interfaces.js'
 import { agentContentWidth, agentSidebarWidth, shouldMountAgentSidebar } from '../domain/agentPanelLayout.js'
@@ -76,14 +77,17 @@ describe('agent panel model', () => {
   })
 
   it('keeps the sidebar at zero width until an agent is actually tracked', () => {
-    // Mockup 11: the rail unmounts below ~96 cols — F6 becomes the only path.
+    // The rail leaves at least 80 readable columns and unmounts below 120 cols — F6 becomes the only path.
     expect(shouldShowAgentSidebar(95, 4)).toBe(false)
     expect(shouldShowAgentSidebar(96, 0)).toBe(false)
-    expect(shouldShowAgentSidebar(96, 1)).toBe(true)
-    expect(agentSidebarWidth(96)).toBe(38)
+    expect(shouldShowAgentSidebar(96, 1)).toBe(false)
+    expect(shouldShowAgentSidebar(120, 1)).toBe(true)
+    expect(agentSidebarWidth(120)).toBe(30)
     expect(agentContentWidth(96, 0)).toBe(96)
-    expect(agentContentWidth(96, 1)).toBe(58)
-    expect(agentContentWidth(100, 4)).toBe(62)
+    expect(agentContentWidth(96, 1)).toBe(96)
+    expect(agentContentWidth(100, 4)).toBe(100)
+    expect(agentContentWidth(120, 4, false)).toBe(120)
+    expect(agentContentWidth(120, 4, true, 60)).toBe(84)
   })
 })
 
@@ -105,7 +109,29 @@ const auditAgent = (overrides: Partial<SubagentProgress> = {}): SubagentProgress
   })
 
 describe('OpenTUI agent panel', () => {
-  it('reduces each row to what the agent cost, not what it is saying', async () => {
+  it('switches to a single inspector when the panel is narrowed on a wide terminal', async () => {
+    resetPanelWidth()
+    const setup = await testRender(
+      <AgentPanelOverlay history={[]} liveAgents={[agent({ status: 'running' })]} onClose={() => {}} t={DEFAULT_THEME} />,
+      { height: 48, width: 280 }
+    )
+    try {
+      await setup.flush()
+      expect(setup.captureCharFrame()).toContain('FILES TOUCHED')
+      act(() => { adjustPanelWidth(-40) })
+      await setup.flush()
+      expect(setup.captureCharFrame()).not.toContain('FILES TOUCHED')
+      act(() => setup.mockInput.pressEnter())
+      await setup.flush()
+      expect(setup.captureCharFrame()).toContain('FILES TOUCHED')
+      expect(setup.captureCharFrame()).toContain('Esc back to the list')
+    } finally {
+      act(() => setup.renderer.destroy())
+      resetPanelWidth()
+    }
+  })
+
+  it('folds completed agents until the summary is opened', async () => {
     // The row answers "which agent, how much, how long" and nothing else.
     // Policy, files, and live commentary moved into the inspector, where they
     // do not compete with the numbers you compare agents by.
@@ -118,8 +144,13 @@ describe('OpenTUI agent panel', () => {
 
     try {
       await setup.flush()
+      const initial = setup.captureCharFrame()
+      expect(initial).toContain('Completed · 1')
+      expect(initial).not.toContain('Policy Audit')
+      const y = initial.split('\n').findIndex(line => line.includes('Completed · 1'))
+      await act(async () => setup.mockMouse.click(5, y))
+      await setup.flush()
       const frame = setup.captureCharFrame()
-
       expect(frame).toContain('Policy Audit')
       expect(frame).toContain('12s · 1.5k tok')
       // The design puts the result sentence ON the review card — "review-ready
@@ -218,10 +249,10 @@ describe('OpenTUI agent panel', () => {
     }
   })
 
-  it('scrolls the inspector to the policy and files it keeps below the fold', async () => {
+  it.each([96, 160, 280])('scrolls the inspector to its own policy and files at %i columns', async width => {
     const setup = await testRender(
       <AgentPanelOverlay history={[]} liveAgents={[auditAgent()]} onClose={() => undefined} t={DEFAULT_THEME} />,
-      { height: 34, width: 96 }
+      { height: 34, width }
     )
 
     try {
@@ -277,7 +308,7 @@ describe('OpenTUI agent panel', () => {
 
       // An interrupted row is not "working": it lands in the needs-input
       // group, which is the whole point of the action ordering.
-      expect(frame).toContain('NEEDS INPUT · 1')
+      expect(frame).toContain('interrupted')
       expect(frame).not.toContain('live')
       expect(frame).toContain('interrupted')
     } finally {
@@ -424,7 +455,7 @@ describe('OpenTUI agent panel', () => {
 
       // Header bar with counts and the live/idle state on the right.
       expect(frame).toContain('✦ Agent View')
-      expect(frame).toContain('3 chats · 1 working')
+      expect(frame).toContain('3 agents · 1 working')
       expect(frame).toContain('live')
       // The action-order captions — unblock → monitor → review.
       expect(frame).toContain('NEEDS INPUT · 1')
@@ -443,26 +474,33 @@ describe('OpenTUI agent panel', () => {
     }
   })
 
-  it('centers the empty state inside the large panel instead of shrink-wrapping it', async () => {
+  it.each([[100, 30], [280, 80], [40, 16]])('fits the empty agent view to its content at %ix%i', async (width, height) => {
+    let closed = false
     const setup = await testRender(
-      <AgentPanelOverlay history={[]} liveAgents={[]} onClose={() => {}} t={DEFAULT_THEME} />,
-      { height: 30, width: 100 }
+      <AgentPanelOverlay history={[]} liveAgents={[]} onClose={() => { closed = true }} t={DEFAULT_THEME} />,
+      { height, width }
     )
-
     try {
       await setup.flush()
-      const rows = setup.captureCharFrame().split('\n')
-      const emptyRow = rows.findIndex(row => row.includes('No agents yet'))
-      const bottomFrame = rows.findIndex(row => row.includes('╰'))
-
-      // A shrink-wrapped box would put the placeholder near the top; the
-      // design's large panel centers it, with the frame reaching the bottom.
-      expect(emptyRow).toBeGreaterThan(8)
-      expect(bottomFrame).toBeGreaterThan(emptyRow + 4)
-      expect(rows[emptyRow + 1]).toContain('Delegated work appears here.')
-    } finally {
-      act(() => setup.renderer.destroy())
-    }
+      const frame = setup.captureCharFrame()
+      const rows = frame.split('\n')
+      const top = rows.findIndex(row => row.includes('╭'))
+      const bottom = rows.findIndex(row => row.includes('╰'))
+      expect(top).toBeGreaterThanOrEqual(0)
+      expect(bottom - top + 1).toBeLessThanOrEqual(11)
+      expect(rows[top]!.trim().length).toBeLessThanOrEqual(64)
+      expect(Math.abs(top - (height - bottom - 1))).toBeLessThanOrEqual(1)
+      expect(frame).toContain('No agents yet')
+      expect(frame).toContain('Delegated work appears here.')
+      expect(frame).toContain('F6 / Esc close')
+      expect(frame).not.toContain('chats')
+      expect(frame).not.toContain('retry')
+      expect(frame).not.toContain('Enter inspect')
+      act(() => setup.mockInput.pressEscape())
+      await act(async () => { await Bun.sleep(50) })
+      await setup.flush()
+      expect(closed).toBe(true)
+    } finally { act(() => setup.renderer.destroy()) }
   })
 
   it('prints the inspector cost once even when the daemon reports dollars', async () => {
@@ -530,7 +568,7 @@ describe('OpenTUI agent panel', () => {
       // Mockup 05 panel-foot: space/r/c/esc. The inspector must advertise
       // every key it actually binds — and only those.
       const frame = setup.captureCharFrame()
-      expect(frame).toContain('r retry · c cancel · Esc back to the list')
+      expect(frame).toContain('c cancel · Esc back to the list')
       expect(frame).not.toContain('space')
     } finally {
       act(() => setup.renderer.destroy())
@@ -639,4 +677,15 @@ describe('OpenTUI agent panel', () => {
       act(() => setup.renderer.destroy())
     }
   })
+})
+
+it('shows the assigned model, profile and reasoning effort in the agent inspector', async () => {
+  const setup = await testRender(<AgentPanelOverlay history={[]} liveAgents={[agent({ model: 'chosen-model', providerProfile: 'work-profile', reasoningEffort: 'high' })]} onClose={() => {}} t={DEFAULT_THEME} />, { width: 160, height: 40 })
+  try {
+    await setup.flush()
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain('chosen-model')
+    expect(frame).toContain('profile work-profile')
+    expect(frame).toContain('effort high')
+  } finally { act(() => setup.renderer.destroy()) }
 })

@@ -71,11 +71,24 @@ export interface PluginMeta {
 }
 
 export interface RegisteredPlugin {
+  readonly sourcePath?: string
   readonly channels: Map<string, unknown>
   readonly hooks: Map<string, HookCallback>
   readonly meta: RequiredPluginMeta
   provider: PluginLlmProviderFactory | undefined
   readonly tools: Map<string, PluginTool>
+}
+
+export interface PluginInventoryEntry {
+  readonly name: string
+  readonly description: string
+  readonly version: string
+  readonly source: { readonly kind: 'module'; readonly path: string } | { readonly kind: 'host-registration' }
+  readonly tools: readonly string[]
+  readonly hooks: readonly string[]
+  readonly channels: readonly string[]
+  readonly providers: readonly string[]
+  readonly dependencies: readonly string[]
 }
 
 interface RequiredPluginMeta {
@@ -133,6 +146,17 @@ export class PluginRegistry {
 
   get pluginNames(): string[] {
     return [...this.plugins.keys()]
+  }
+
+  /** Describe current registrations without invoking any plugin capability. */
+  inventory(): PluginInventoryEntry[] {
+    return [...this.plugins.values()].map(plugin => ({
+      name: plugin.meta.name, description: plugin.meta.description, version: plugin.meta.version,
+      source: plugin.sourcePath ? { kind: 'module' as const, path: plugin.sourcePath } : { kind: 'host-registration' as const },
+      tools: [...plugin.tools.keys()], hooks: [...plugin.hooks.keys()], channels: [...plugin.channels.keys()],
+      providers: [...this.providers].filter(([, entry]) => entry.owner === plugin.meta.name).map(([name]) => name),
+      dependencies: [...plugin.meta.dependencies],
+    }))
   }
 
   /** Formatted per-module errors captured during discovery, in discovery order. */
@@ -258,6 +282,7 @@ export class PluginRegistry {
     if (this.plugins.has(meta.name)) throw new PluginConflictError(meta.name, meta.name)
     this.activeDiscovery?.names.add(meta.name)
     const plugin: RegisteredPlugin = {
+      ...(this.activeDiscovery ? { sourcePath: resolve(this.activeDiscovery.path) } : {}),
       meta: normalizeMeta(meta), tools: new Map(), hooks: new Map(), channels: new Map(), provider: undefined,
     }
     this.plugins.set(meta.name, plugin)
@@ -281,6 +306,10 @@ export class PluginRegistry {
   }
 
   unregisterPlugin(name: string): void {
+    const discovery = this.activeDiscovery
+    if (discovery && this.plugins.has(name) && !discovery.names.has(name)) {
+      throw new Error(`Plugin module ${discovery.path} cannot unregister existing plugin '${name}' during registration`)
+    }
     if (!this.plugins.delete(name)) return
     for (const [tool, entry] of this.tools) if (entry.owner === name) this.tools.delete(tool)
     for (const [provider, entry] of this.providers) if (entry.owner === name) this.providers.delete(provider)

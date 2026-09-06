@@ -258,3 +258,47 @@ test('a throwing lease predicate skips the tick instead of running the shared st
     removeDirectory(directory)
   }
 })
+
+test('missed-run policies survive restart and skip without reporting an execution', async () => {
+  const directory = temporaryDirectory()
+  try {
+    const path = join(directory, 'jobs.json')
+    const store = new JobStore(path)
+    const occurrence = '2030-01-01T09:00:00.000Z'
+    store.add(new CronJob({ id: 'skip', prompt: 'skip', schedule: '0 9 * * *', nextRunAt: occurrence, missedRunPolicy: 'skip', misfireGraceSeconds: 60 }))
+    store.add(new CronJob({ id: 'once', prompt: 'once', oneshot: true, nextRunAt: occurrence, missedRunPolicy: 'skip', misfireGraceSeconds: 60 }))
+    store.add(new CronJob({ id: 'coalesce', prompt: 'coalesce', intervalSeconds: 30, nextRunAt: occurrence }))
+    const recovered = new JobStore(path)
+    const calls: string[] = []
+    const scheduler = new CronScheduler(recovered, async job => { calls.push(job.id); return 'done' })
+    await scheduler.tick(new Date('2030-01-02T10:00:00.000Z'))
+    expect(calls).toEqual(['coalesce'])
+    expect(recovered.get('skip')?.nextRunAt).toBe('2030-01-03T09:00:00.000Z')
+    expect(recovered.get('skip')?.lastRunAt).toBeUndefined()
+    expect(recovered.get('once')?.paused).toBe(true)
+    expect(recovered.get('once')?.metadata.last_missed_run).toMatchObject({ occurrence, policy: 'skip' })
+    await scheduler.tick(new Date('2030-01-03T09:00:30.000Z'))
+    expect(calls.filter(id => id === 'skip')).toHaveLength(1)
+    expect(calls.filter(id => id === 'once')).toHaveLength(0)
+  } finally { removeDirectory(directory) }
+})
+
+test('skip respects the exact grace boundary, clock rollback and recovered execution receipts', async () => {
+  const directory = temporaryDirectory()
+  try {
+    const store = new JobStore(join(directory, 'jobs.json'))
+    const nextRunAt = '2030-01-01T09:00:00.000Z'
+    store.add(new CronJob({ id: 'boundary', prompt: 'boundary', intervalSeconds: 30, nextRunAt, missedRunPolicy: 'skip', misfireGraceSeconds: 60 }))
+    store.add(new CronJob({ id: 'uncertain', prompt: 'uncertain', intervalSeconds: 30, nextRunAt, missedRunPolicy: 'skip', metadata: { execution_receipt: { state: 'running' } } }))
+    const calls: string[] = []
+    const scheduler = new CronScheduler(store, async job => { calls.push(job.id); return 'done' })
+    await scheduler.tick(new Date('2030-01-01T08:00:00Z'))
+    expect(calls).toEqual([])
+    expect(store.get('uncertain')?.metadata.execution_recovery_required).toBe(true)
+    await scheduler.tick(new Date('2030-01-01T09:01:00Z'))
+    expect(calls).toEqual(['boundary'])
+    expect(store.get('uncertain')?.paused).toBe(true)
+    expect(() => CronJob.fromRecord({ id: 'bad', prompt: 'bad', missed_run_policy: 'replay' })).toThrow('missedRunPolicy')
+    expect(() => CronJob.fromRecord({ id: 'bad', prompt: 'bad', misfire_grace_seconds: 0 })).toThrow('misfire_grace_seconds')
+  } finally { removeDirectory(directory) }
+})

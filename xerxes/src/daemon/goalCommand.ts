@@ -25,21 +25,26 @@ import {
   GoalError,
   pauseGoal,
   resumeGoal,
+  setGoalMilestone,
   type GoalPhase,
   type GoalRef,
   type GoalView,
 } from "../runtime/goalDomain.js";
 
 export const GOAL_USAGE =
-  "Usage: /goal [<objective>|clear|edit <objective>|pause|resume]";
+  "Usage: /goal [<objective>|clear|edit <objective>|pause|resume|milestone [<text>|clear]|--duration <Ns|Nm|Nh>|--tokens <count>]";
 
 export type GoalCommand =
   | { readonly kind: "show" }
   | { readonly kind: "create"; readonly objective: string }
   | { readonly kind: "edit"; readonly objective: string }
   | { readonly kind: "invalid-edit" }
+  | { readonly kind: "duration"; readonly value: string }
+  | { readonly kind: "tokens"; readonly value: string }
   | { readonly kind: "pause" }
   | { readonly kind: "resume" }
+  | { readonly kind: "milestone-show" }
+  | { readonly kind: "milestone"; readonly value: string | null }
   | { readonly kind: "clear" };
 
 export interface GoalCommandResult {
@@ -62,7 +67,12 @@ export function parseGoalCommand(rawInput: string): GoalCommand {
   if (control === "clear") return { kind: "clear" };
   if (control === "pause") return { kind: "pause" };
   if (control === "resume") return { kind: "resume" };
+  if (control === "milestone") return { kind: "milestone-show" };
+  if (/^milestone\s+clear$/iu.test(input)) return { kind: "milestone", value: null };
+  if (/^milestone\s/iu.test(input)) return { kind: "milestone", value: input.slice(9).trim() };
   if (control === "edit") return { kind: "invalid-edit" };
+  if (/^--duration(?:\s|$)/u.test(input)) return { kind: "duration", value: input.slice(10).trim() };
+  if (/^--tokens(?:\s|$)/u.test(input)) return { kind: "tokens", value: input.slice(8).trim() };
   if (/^edit\s/iu.test(input)) return { kind: "edit", objective: input.slice(4).trim() };
   return { kind: "create", objective: input };
 }
@@ -71,11 +81,11 @@ export function parseGoalCommand(rawInput: string): GoalCommand {
 function commandHint(goal: GoalView): string {
   if (goal.phase === "active") {
     return goal.activation === "armed"
-      ? "/goal edit <objective>, /goal pause, /goal clear"
-      : "/goal edit <objective>, /goal resume, /goal clear";
+      ? "/goal edit <objective>, /goal milestone, /goal pause, /goal clear"
+      : "/goal edit <objective>, /goal milestone, /goal resume, /goal clear";
   }
-  if (goal.phase === "complete") return "/goal <objective>, /goal clear";
-  return "/goal edit <objective>, /goal resume, /goal clear";
+  if (goal.phase === "complete") return "/goal <objective>, /goal milestone, /goal clear";
+  return "/goal edit <objective>, /goal milestone, /goal resume, /goal clear";
 }
 
 /**
@@ -96,7 +106,10 @@ function renderGoal(title: string, goal: GoalView): GoalCommandResult {
       `Status: ${goal.phase satisfies GoalPhase}`,
       ...blocker,
       `Objective: ${goal.objective}`,
+      ...(goal.currentMilestone === undefined ? [] : [`Milestone: ${goal.currentMilestone}`]),
       `Rounds: ${goal.roundsStarted}/${goal.maxGoalRounds}`,
+      ...(goal.maxTotalTokens === undefined ? [] : [`Total token admission cap: ${goal.maxTotalTokens}`]),
+      ...(goal.maxDurationMs === undefined ? [] : [`Wall-time limit: ${goal.maxDurationMs}ms from creation (includes pauses)`]),
       `Activation: ${goal.activation}`,
       "",
       `Commands: ${commandHint(goal)}`,
@@ -156,12 +169,34 @@ export function runGoalCommand(
           editGoal(metadata, sessionId, refOf(current), { objective: command.objective }, now),
         );
       }
+      case "duration": {
+        if (!current) return missingGoal("--duration");
+        const match = /^(\d+)(s|m|h)$/u.exec(command.value);
+        const duration = match ? Number(match[1]) * ({ s: 1000, m: 60_000, h: 3_600_000 }[match[2]!] ?? 0) : 0;
+        if (!Number.isSafeInteger(duration) || duration < 1) return { ok: false, text: `Use /goal --duration 30m (positive whole seconds, minutes or hours).` };
+        return renderGoal("Goal time limit updated", editGoal(metadata, sessionId, refOf(current), { maxDurationMs: duration }, now));
+      }
+      case "tokens": {
+        if (!current) return missingGoal("--tokens");
+        const count = /^\d+$/u.test(command.value) ? Number(command.value) : 0;
+        if (!Number.isSafeInteger(count) || count < 1) return { ok: false, text: 'Use /goal --tokens 100000 (a positive whole token count).' };
+        return renderGoal('Goal token cap updated', editGoal(metadata, sessionId, refOf(current), { maxTotalTokens: count }, now));
+      }
       case "pause":
         if (!current) return missingGoal("pause");
         return renderGoal("Goal paused", pauseGoal(metadata, sessionId, refOf(current), now));
       case "resume":
         if (!current) return missingGoal("resume");
         return renderGoal("Goal resumed", resumeGoal(metadata, sessionId, refOf(current), now));
+      case "milestone-show":
+        if (!current) return missingGoal("milestone");
+        return renderGoal("Goal", current);
+      case "milestone":
+        if (!current) return missingGoal("milestone");
+        return renderGoal(
+          command.value === null ? "Goal milestone cleared" : "Goal milestone updated",
+          setGoalMilestone(metadata, sessionId, refOf(current), command.value, now),
+        );
       case "clear":
         if (!current) return { ok: true, text: "No goal to clear." };
         clearGoal(metadata, sessionId, refOf(current), now);

@@ -84,11 +84,12 @@ describe('transcript spacing contract', () => {
   // These pin the renderer/estimator agreement that Phase 4 established.
   // They previously disagreed in four places, which only showed up as
   // scroll drift when jumping into rows that had never been mounted.
-  it('counts one leading blank row for a user turn, not two', () => {
+  it('counts the leading gap and padded user band', () => {
     const user = estimatedMsgHeight({ role: 'user', text: 'hello' }, 80, { compact: false, details: true })
     const bare = estimatedMsgHeight({ role: 'assistant', text: 'hello' }, 80, { compact: false, details: true })
 
-    expect(user - bare).toBe(1)
+    expect(user).toBe(4)
+    expect(bare).toBe(2) // Author header plus one prose row.
   })
 
   it('gives a diff its row from leadGap instead of a hardcoded pair', () => {

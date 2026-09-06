@@ -26,6 +26,8 @@ export interface ActivityItem {
 export type SubagentStatus = 'completed' | 'error' | 'failed' | 'interrupted' | 'queued' | 'running' | 'timeout'
 
 export interface SubagentProgress {
+  providerProfile?: string
+  reasoningEffort?: string
   agentType?: string
   name?: string
   title?: string

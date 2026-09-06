@@ -3,6 +3,7 @@
 
 import type { JsonObject } from '../types/toolCalls.js'
 import { MCPClient, type MCPToolCallOptions } from './client.js'
+import { parseMcpServerConfig } from './config.js'
 import {
   MCPReconnectError,
   mcpConfigSecrets,
@@ -42,7 +43,7 @@ export interface MCPClientPort {
 /** Factory boundary for hosts that own MCP transports or authentication. */
 export type MCPClientFactory = (config: MCPServerConfig) => MCPClientPort | Promise<MCPClientPort>
 
-export type MCPServerLifecycleOperation = 'connect' | 'disconnect' | 'reconnect'
+export type MCPServerLifecycleOperation = 'connect' | 'disconnect' | 'reconnect' | 'replace'
 
 /** A redacted lifecycle failure retained for diagnostics. */
 export interface MCPServerFailure {
@@ -53,6 +54,7 @@ export interface MCPServerFailure {
 }
 
 export interface MCPServerStatus {
+  readonly state?: 'disabled' | 'failed' | 'disconnected'
   readonly connected: boolean
   readonly lastError?: string
   readonly name: string
@@ -120,7 +122,11 @@ export class MCPManager {
   private readonly maxPendingOperationsPerServer: number
   private readonly onFailure: ((failure: MCPServerFailure) => void) | undefined
   private readonly reconnectOptions: ReconnectWithBackoffOptions | undefined
+  private readonly configurations = new Map<string, MCPServerConfig>()
+  private readonly registrationControllers = new Map<string, AbortController>()
   private readonly servers = new Map<string, MCPClientPort>()
+  private readonly replacements = new Set<string>()
+  private readonly replacementTokens = new Map<string, object>()
 
   constructor(options: MCPManagerOptions = {}) {
     this.clientFactory = options.clientFactory ?? (config => new MCPClient(config))
@@ -136,9 +142,11 @@ export class MCPManager {
   addServer(config: MCPServerConfig): Promise<boolean> {
     const normalized = normalizeConfig(config)
     return this.enqueueServer(normalized.name, async () => {
-      if (normalized.enabled === false || this.servers.has(normalized.name)) {
-        return false
-      }
+      if (this.servers.has(normalized.name)) return false
+      this.registrationControllers.get(normalized.name)?.abort()
+      this.registrationControllers.set(normalized.name, new AbortController())
+      this.configurations.set(normalized.name, normalized)
+      if (normalized.enabled === false) return false
       try {
         const client = await this.connectClient(normalized)
         this.servers.set(normalized.name, client)
@@ -156,6 +164,79 @@ export class MCPManager {
     return this.addServer(config)
   }
 
+  /** Validate and connect a replacement before retiring an existing registration.
+   * This changes live state only; the settings host owns durable persistence.
+   * Existing calls remain available during discovery. Concurrent lifecycle changes
+   * invalidate the candidate instead of resurrecting removed or newer state.
+   */
+  async replaceServer(value: unknown, signal?: AbortSignal, commit?: () => undefined): Promise<boolean> {
+    return this.stageSettings(value, false, signal, commit)
+  }
+
+  /** Admit a new name without publishing it until discovery and persistence succeed. */
+  async createServer(value: unknown, signal?: AbortSignal, commit?: () => undefined): Promise<boolean> {
+    return this.stageSettings(value, true, signal, commit)
+  }
+
+  private async stageSettings(value: unknown, create: boolean, signal?: AbortSignal, commit?: () => undefined): Promise<boolean> {
+    const parsed = parseMcpServerConfig(value)
+    if (!parsed.ok) throw new TypeError(parsed.error)
+    const config = parsed.config
+    const token = {}
+    const baseline = await this.enqueueServer(config.name, async () => {
+      const previousConfig = this.configurations.get(config.name)
+      if (create && previousConfig) throw new Error('MCP server name already exists')
+      if (!create && !previousConfig) throw new Error('MCP registration no longer exists; refresh settings')
+      if (this.replacements.has(config.name)) throw new Error('MCP configuration replacement already in progress')
+      this.replacements.add(config.name)
+      this.replacementTokens.set(config.name, token)
+      return { config: previousConfig, client: this.servers.get(config.name) }
+    }, signal)
+    const isCurrent = () => this.replacementTokens.get(config.name) === token && this.configurations.get(config.name) === baseline.config
+      && this.servers.get(config.name) === baseline.client
+    const secrets = [...mcpConfigSecrets(config), ...(baseline.config ? mcpConfigSecrets(baseline.config) : [])]
+    let candidate: MCPClientPort | undefined
+    let installed = false
+    const checkCancelled = () => {
+      if (signal?.aborted) throw new DOMException('MCP configuration replacement cancelled', 'AbortError')
+    }
+    try {
+      checkCancelled()
+      if (config.enabled !== false) candidate = await this.connectClient(config)
+      checkCancelled()
+      return await this.enqueueServer(config.name, async () => {
+        checkCancelled()
+        if (!isCurrent()) throw new Error('MCP registration changed; refresh settings before retrying')
+        // The settings host commits synchronously after successful discovery and
+        // before the in-memory swap. A failed commit leaves the old client intact.
+        commit?.()
+        this.registrationControllers.get(config.name)?.abort()
+        this.registrationControllers.set(config.name, new AbortController())
+        this.configurations.set(config.name, config)
+        if (candidate) this.servers.set(config.name, candidate)
+        else this.servers.delete(config.name)
+        installed = true
+        this.failures.delete(config.name)
+        try { await baseline.client?.disconnect() } catch (error) {
+          this.recordFailure(config.name, 'disconnect', error, undefined, secrets)
+        }
+        return true
+      }, signal)
+    } catch (error) {
+      if (isCurrent()) this.recordFailure(config.name, 'replace', error, undefined, secrets)
+      if (signal?.aborted) throw new DOMException('MCP configuration replacement cancelled', 'AbortError')
+      throw new Error(scrubCredentials(errorMessage(error), secrets))
+    } finally {
+      if (candidate && !installed) {
+        try { await candidate.disconnect() } catch (error) {
+          if (isCurrent()) this.recordFailure(config.name, 'disconnect', error, undefined, secrets)
+        }
+      }
+      this.replacements.delete(config.name)
+      if (this.replacementTokens.get(config.name) === token) this.replacementTokens.delete(config.name)
+    }
+  }
+
   /**
    * Disconnect and drop one server. A teardown failure is retained for
    * diagnostics, but the server is removed so stale tools cannot be routed.
@@ -163,9 +244,14 @@ export class MCPManager {
   removeServer(name: string): Promise<boolean> {
     const normalized = normalizeName(name)
     return this.enqueueServer(normalized, async () => {
+      this.replacementTokens.delete(normalized)
+      const configured = this.configurations.delete(normalized)
+      this.registrationControllers.get(normalized)?.abort()
+      this.registrationControllers.delete(normalized)
       const client = this.servers.get(normalized)
       if (!client) {
-        return false
+        this.failures.delete(normalized)
+        return configured
       }
       this.servers.delete(normalized)
       try {
@@ -184,7 +270,7 @@ export class MCPManager {
   }
 
   /**
-   * Replace an active server with a fresh client candidate, retrying failed
+   * Connect an enabled configuration with a fresh client candidate, retrying failed
    * connection attempts according to the configured backoff policy.
    *
    * Only the registry delete and swap are serialized through the lifecycle
@@ -194,32 +280,38 @@ export class MCPManager {
    */
   async reconnect(name: string): Promise<boolean> {
     const normalized = normalizeName(name)
-    const previous = await this.enqueueServer(normalized, () => {
+    const registration = await this.enqueueServer(normalized, () => {
+      const config = this.configurations.get(normalized)
+      if (!config || config.enabled === false) return Promise.resolve(undefined)
       const client = this.servers.get(normalized)
       if (client) {
         this.servers.delete(normalized)
       }
-      return Promise.resolve(client)
+      return Promise.resolve({ client, config, signal: this.registrationControllers.get(normalized)!.signal })
     })
-    if (!previous) {
+    if (!registration) {
       return false
     }
-    const config = previous.config
+    const { client: previous, config, signal } = registration
+    const isCurrent = () => this.configurations.get(normalized) === config
     const secrets = mcpConfigSecrets(config)
     try {
-      await previous.disconnect()
+      await previous?.disconnect()
     } catch (error) {
-      this.recordFailure(normalized, 'disconnect', error, undefined, secrets)
+      if (isCurrent()) this.recordFailure(normalized, 'disconnect', error, undefined, secrets)
     }
 
     let candidate: MCPClientPort
     try {
       candidate = await reconnectWithBackoff(
-        () => this.connectClient(config),
-        this.optionsForReconnect(normalized, secrets),
+        () => {
+          if (!isCurrent()) throw new Error('MCP registration was removed or replaced')
+          return this.connectClient(config)
+        },
+        this.optionsForReconnect(normalized, secrets, isCurrent, signal),
       )
     } catch (error) {
-      this.recordFailure(
+      if (isCurrent()) this.recordFailure(
         normalized,
         'reconnect',
         error,
@@ -230,15 +322,15 @@ export class MCPManager {
     }
 
     return this.enqueueServer(normalized, async () => {
-      if (this.servers.has(normalized)) {
+      if (!isCurrent() || this.servers.has(normalized)) {
         // A concurrent registration claimed the name while backoff ran; keep
         // the newer client and tear down this superseded candidate.
         try {
           await candidate.disconnect()
         } catch (error) {
-          this.recordFailure(normalized, 'disconnect', error, undefined, secrets)
+          if (isCurrent()) this.recordFailure(normalized, 'disconnect', error, undefined, secrets)
         }
-        return true
+        return isCurrent() && this.servers.has(normalized)
       }
       this.servers.set(normalized, candidate)
       this.failures.delete(normalized)
@@ -248,7 +340,7 @@ export class MCPManager {
 
   /** Disconnect every server and clear the active capability registry. */
   async disconnectAll(): Promise<void> {
-    const names = this.listServers()
+    const names = [...new Set([...this.listConfiguredServers(), ...this.replacements])]
     await Promise.all(names.map(name => this.removeServer(name)))
   }
 
@@ -267,14 +359,23 @@ export class MCPManager {
     return [...this.servers.keys()]
   }
 
+  /** Include enabled, disabled, and failed registrations in configuration order. */
+  listConfiguredServers(): string[] {
+    return [...this.configurations.keys()]
+  }
+
   /** Return lifecycle status without exposing launch arguments, headers, or environment values. */
   status(name: string): MCPServerStatus | undefined {
     const normalized = normalizeName(name)
     const client = this.servers.get(normalized)
-    if (!client) {
-      return undefined
-    }
     const failure = this.failures.get(normalized)
+    if (!client) {
+      const config = this.configurations.get(normalized)
+      if (!config) return undefined
+      return { name: normalized, connected: false, tools: 0, resources: 0, prompts: 0,
+        state: config.enabled === false ? 'disabled' : failure ? 'failed' : 'disconnected',
+        ...(failure ? { lastError: failure.error } : {}) }
+    }
     return {
       name: normalized,
       connected: client.connected ?? true,
@@ -285,9 +386,9 @@ export class MCPManager {
     }
   }
 
-  /** Return statuses for every active server in registration order. */
+  /** Return statuses for every configured server in registration order. */
   listStatus(): MCPServerStatus[] {
-    return this.listServers().flatMap(name => {
+    return this.listConfiguredServers().flatMap(name => {
       const status = this.status(name)
       return status === undefined ? [] : [status]
     })
@@ -354,19 +455,46 @@ export class MCPManager {
     options: MCPToolCallOptions = {},
   ): Promise<MCPToolCallResult> {
     const client = this.findTool(name)
-    return this.enqueueServer(client.config.name, () => client.callTool(name, arguments_, options))
+    return this.callServerTool(client.config.name, client, name, arguments_, options)
+  }
+
+  /** Route a namespaced runtime tool to its exact discovery client, never a replacement. */
+  async callServerTool(
+    server: string,
+    client: MCPClientPort,
+    name: string,
+    arguments_: JsonObject = {},
+    options: MCPToolCallOptions = {},
+  ): Promise<MCPToolCallResult> {
+    const normalized = normalizeName(server)
+    return this.enqueueServer(normalized, () => {
+      options.signal?.throwIfAborted()
+      if (this.servers.get(normalized) !== client || client.connected === false) {
+        throw new Error(`MCP server '${server}' changed or disconnected; refresh the tool inventory`)
+      }
+      if (!client.tools.some(tool => tool.name === name)) throw new MCPCapabilityNotFoundError('tool', name)
+      return client.callTool(name, arguments_, options)
+    }, options.signal)
   }
 
   /** Route a resource read to the active server that published its URI. */
   async readResource(uri: string): Promise<MCPResourceContentsResult> {
     const client = this.findResource(uri)
-    return this.enqueueServer(client.config.name, () => client.readResource(uri))
+    const name = normalizeName(client.config.name)
+    return this.enqueueServer(name, () => {
+      if (this.servers.get(name) !== client || client.connected === false) throw new Error('MCP server changed or disconnected; refresh the resource inventory')
+      return client.readResource(uri)
+    })
   }
 
   /** Route a prompt request to the first active server that published its name. */
   async getPrompt(name: string, arguments_: JsonObject = {}): Promise<MCPPromptResult> {
     const client = this.findPrompt(name)
-    return this.enqueueServer(client.config.name, () => client.getPrompt(name, arguments_))
+    const server = normalizeName(client.config.name)
+    return this.enqueueServer(server, () => {
+      if (this.servers.get(server) !== client || client.connected === false) throw new Error('MCP server changed or disconnected; refresh the prompt inventory')
+      return client.getPrompt(name, arguments_)
+    })
   }
 
   /** Return Python-compatible per-server counts for live MCP capabilities. */
@@ -397,26 +525,39 @@ export class MCPManager {
     }
   }
 
-  private optionsForReconnect(name: string, secrets: readonly string[]): ReconnectWithBackoffOptions {
+  private optionsForReconnect(name: string, secrets: readonly string[], isCurrent: () => boolean, signal: AbortSignal): ReconnectWithBackoffOptions {
     const configured = this.reconnectOptions
     return {
+      signal: configured?.signal ? AbortSignal.any([signal, configured.signal]) : signal,
       ...(configured?.policy === undefined ? {} : { policy: configured.policy }),
       ...(configured?.sleep === undefined ? {} : { sleep: configured.sleep }),
       onError: async (attempt, error) => {
+        if (!isCurrent()) return
         this.recordFailure(name, 'reconnect', error, attempt, secrets)
         await configured?.onError?.(attempt, error)
       },
     }
   }
 
-  private enqueueServer<T>(name: string, operation: () => Promise<T>): Promise<T> {
+  private enqueueServer<T>(name: string, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const cancelled = () => new DOMException('MCP operation cancelled before execution', 'AbortError')
+    if (signal?.aborted) return Promise.reject(cancelled())
     const count = this.pendingServerOperations.get(name) ?? 0
     if (count >= this.maxPendingOperationsPerServer) {
       return Promise.reject(new MCPServerQueueFullError(name, this.maxPendingOperationsPerServer))
     }
     this.pendingServerOperations.set(name, count + 1)
     const previous = this.serverOperations.get(name) ?? Promise.resolve()
-    const pending = previous.then(operation, operation)
+    let started = false
+    let rejectWaiting: ((reason: unknown) => void) | undefined
+    const abort = () => { if (!started) rejectWaiting?.(cancelled()) }
+    const run = () => {
+      started = true
+      signal?.removeEventListener('abort', abort)
+      if (signal?.aborted) throw cancelled()
+      return operation()
+    }
+    const pending = previous.then(run, run)
     const settled = pending.then(
       () => undefined,
       () => undefined,
@@ -430,7 +571,21 @@ export class MCPManager {
         this.serverOperations.delete(name)
       }
     })
-    return pending
+    if (!signal) return pending
+    // Cancel the caller's wait promptly, but retain the bounded queue slot until
+    // it is skipped. Releasing it early would permit unlimited cancelled nodes.
+    return new Promise<T>((resolve, reject) => {
+      rejectWaiting = reject
+      signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted) abort()
+      pending.then(value => {
+        signal.removeEventListener('abort', abort)
+        resolve(value)
+      }, error => {
+        signal.removeEventListener('abort', abort)
+        reject(error)
+      })
+    })
   }
 
   private findTool(name: string): MCPClientPort {
@@ -484,7 +639,9 @@ export class MCPManager {
 
 function normalizeConfig(config: MCPServerConfig): MCPServerConfig {
   const name = normalizeName(config.name)
-  return name === config.name ? config : { ...config, name }
+  // Each registration needs its own identity, even if a host reuses its config
+  // object after removal while an older reconnect is still pending.
+  return { ...config, name }
 }
 
 function normalizeName(name: string): string {

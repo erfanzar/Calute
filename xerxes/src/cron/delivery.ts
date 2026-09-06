@@ -3,6 +3,7 @@
 
 import { mkdir, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { DeliveryOutbox } from './outbox.js'
 
 export interface DeliveryTarget {
   readonly platform: string
@@ -21,6 +22,13 @@ export interface ArchiveOptions {
 }
 
 const DEFAULT_RETENTION = 50
+
+export class DeliveryError extends Error {
+  constructor(readonly archivePath: string, cause: unknown, readonly deliveryId?: string) {
+    super(`Output archived but delivery failed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause })
+    this.name = 'DeliveryError'
+  }
+}
 
 export async function archiveOutput(
   baseDirectory: string,
@@ -58,12 +66,14 @@ export async function routeOutput(
     new Date(),
     options.retention === undefined ? {} : { retention: options.retention },
   )
-  if (
-    target.platform !== 'none' &&
-    target.platform !== 'workspace' &&
-    options.sender
-  ) {
-    await options.sender(target.platform, target.recipient ?? '', content)
+  if (target.platform !== 'none' && target.platform !== 'workspace') {
+    let deliveryId: string | undefined;
+    try {
+      const outbox = new DeliveryOutbox(join(options.archiveDirectory, 'deliveries.sqlite'))
+      deliveryId = outbox.enqueue(options.jobId, target, content, path)
+      if (!options.sender) throw new Error('No delivery sender configured')
+      await outbox.send(options.jobId, deliveryId, options.sender)
+    } catch (error) { throw new DeliveryError(path, error, deliveryId) }
   }
   return path
 }

@@ -2,6 +2,8 @@
 // Licensed under the Apache License, Version 2.0.
 
 import type { AgentDefinition } from './definitions.js'
+import { captureModelCallScopes, serializeModelCallScopes, withCapturedModelCallScopes, type ModelCallBinding, type ModelCallScope } from '../llms/callBudget.js'
+import { WorktreeSetupError } from './worktreeOptions.js'
 import { ValidationError } from '../core/errors.js'
 import {
   MAX_AGENT_TITLE_LENGTH,
@@ -96,6 +98,12 @@ export interface SubAgentTaskSnapshot {
 }
 
 export interface SubAgentTaskOptions {
+  readonly modelCallBindings?: readonly ModelCallBinding[]
+  readonly providerProfile?: string
+  readonly reasoningEffort?: string
+  readonly providerRoute?: string
+  /** Absolute project root captured for this task before asynchronous setup. */
+  readonly workspace?: string
   readonly agentDefName?: string
   readonly creatorId?: string
   readonly depth?: number
@@ -113,6 +121,11 @@ export interface SubAgentTaskOptions {
 
 /** One delegated task plus the state exposed to its parent. */
 export class SubAgentTask {
+  readonly modelCallBindings: readonly ModelCallBinding[]
+  readonly providerProfile: string | undefined
+  readonly reasoningEffort: string | undefined
+  readonly providerRoute: string | undefined
+  readonly workspace: string | undefined
   readonly agentDefName: string
   readonly creatorId: string
   readonly depth: number
@@ -148,6 +161,11 @@ export class SubAgentTask {
   private readonly recentOutput: string[] = []
 
   constructor(options: SubAgentTaskOptions = {}) {
+    this.modelCallBindings = Object.freeze([...(options.modelCallBindings ?? [])])
+    this.providerProfile = options.providerProfile
+    this.reasoningEffort = options.reasoningEffort
+    this.providerRoute = options.providerRoute
+    this.workspace = options.workspace
     this.id = options.id ?? ''
     this.prompt = options.prompt ?? ''
     this.sourceId = options.sourceId?.trim() ?? ''
@@ -222,6 +240,8 @@ export interface SubagentWorktreePort {
   create(request: {
     readonly taskId: string
     readonly taskName: string
+    readonly config?: Readonly<Record<string, unknown>>
+    readonly signal?: AbortSignal
   }): Promise<SubagentWorktree>
   isClean(worktree: SubagentWorktree): Promise<boolean>
   remove(worktree: SubagentWorktree): Promise<void>
@@ -281,6 +301,8 @@ export type SubagentTaskRunner = (
 ) => Promise<SubagentTaskRunResult | string> | SubagentTaskRunResult | string
 
 export interface SubAgentEvent {
+  readonly providerProfile?: string
+  readonly reasoningEffort?: string
   readonly agent: string
   readonly agentType: string
   readonly apiCalls: number | undefined
@@ -379,6 +401,7 @@ export interface FilterSubagentToolsOptions<T extends Record<string, unknown>> {
 }
 
 interface TaskRuntime {
+  readonly modelCallScopes: readonly ModelCallScope[]
   readonly agentDefinition: AgentDefinition | undefined
   readonly config: Readonly<Record<string, unknown>>
   readonly isolation: string
@@ -407,6 +430,7 @@ interface TaskRuntime {
  * identity can be retried while its persisted conversation survives.
  */
 interface ArchivedSubagentTask {
+  readonly modelCallScopes: readonly ModelCallScope[]
   readonly agentDefinition: AgentDefinition | undefined
   readonly apiCalls: number | undefined
   readonly attempt: number
@@ -478,6 +502,7 @@ export class SubAgentManager {
   private readonly resets = new Map<string, Promise<SubAgentTask | undefined>>()
   /** Pre-handle worktree setup remains live for waits and spawn-budget accounting. */
   private readonly setups = new Map<string, Promise<void>>()
+  private readonly setupControllers = new Map<string, AbortController>()
   private readonly tasksByName = new Map<string, string>()
   private readonly textBurst = new Map<string, string[]>()
   private readonly thinkingBurst = new Map<string, ThinkingBurst>()
@@ -556,7 +581,19 @@ export class SubAgentManager {
     const model = options.model?.trim() || stringValue(config.model)
     const rules = options.rules ?? runtimePolicyRules(config, isolation)
     const toolsets = options.toolsets ?? configuredToolsets(config)
+    const modelCallScopes = captureModelCallScopes()
+    const workspace = stringValue(config._nativeSubagentWorkspace) || undefined
+    const providerProfile = typeof config.providerProfile === 'string' ? config.providerProfile : undefined
+    const reasoningEffort = typeof config.reasoningEffort === 'string' ? config.reasoningEffort : undefined
+    const providerRoute = typeof config._nativeSubagentProviderRoute === 'string'
+      ? config._nativeSubagentProviderRoute
+      : undefined
     const task = new SubAgentTask({
+      modelCallBindings: serializeModelCallScopes(modelCallScopes),
+      ...(providerProfile === undefined ? {} : { providerProfile }),
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+      ...(providerRoute === undefined ? {} : { providerRoute }),
+      ...(workspace === undefined ? {} : { workspace }),
       id: taskId,
       prompt: options.prompt,
       depth,
@@ -587,6 +624,24 @@ export class SubAgentManager {
       return task
     }
 
+    this.runtimes.set(task.id, {
+      modelCallScopes,
+      agentDefinition: options.agentDefinition,
+      config,
+      isolation,
+      originalPrompt: options.prompt,
+      originalSystemPrompt: options.systemPrompt ?? '',
+      systemPrompt,
+      toolInputs: new Map(),
+      worktree: undefined,
+      attempt: 0,
+      cleanup: undefined,
+      currentAttemptId: undefined,
+      emittedSpawn: false,
+      monitor: undefined,
+      run: undefined,
+    })
+
     let worktree: SubagentWorktree | undefined
     let setup: PromiseWithResolvers<void> | undefined
     let prompt = options.prompt
@@ -597,12 +652,18 @@ export class SubAgentManager {
       }
       setup = Promise.withResolvers<void>()
       this.setups.set(task.id, setup.promise)
+      const controller = new AbortController()
+      this.setupControllers.set(task.id, controller)
       try {
-        worktree = await this.worktree.create({ taskId: task.id, taskName: task.name })
+        worktree = await this.worktree.create({ taskId: task.id, taskName: task.name, config, signal: controller.signal })
         task.worktreePath = worktree.path
         task.worktreeBranch = worktree.branch
-        prompt = `${prompt}\n\n[Note: You are working in an isolated git worktree at ${worktree.path} (branch: ${worktree.branch}). Commit your changes before finishing so they can be reviewed and merged.]`
+        prompt = `${prompt}\n\n[Note: You are working in an isolated git worktree at ${worktree.path} (branch: ${worktree.branch}). Keep your changes available for review. Commit only when the user has authorized it.]`
       } catch (error) {
+        if (error instanceof WorktreeSetupError) {
+          task.worktreePath = error.worktree.path
+          task.worktreeBranch = error.worktree.branch
+        }
         if (!TERMINAL_STATUSES.has(task.status)) {
           await this.fail(task, `Failed to create worktree: ${errorMessage(error)}`)
         }
@@ -611,22 +672,7 @@ export class SubAgentManager {
       }
     }
 
-    this.runtimes.set(task.id, {
-      agentDefinition: options.agentDefinition,
-      config,
-      isolation,
-      originalPrompt: options.prompt,
-      originalSystemPrompt: options.systemPrompt ?? '',
-      systemPrompt,
-      toolInputs: new Map(),
-      worktree,
-      attempt: 0,
-      cleanup: undefined,
-      currentAttemptId: undefined,
-      emittedSpawn: false,
-      monitor: undefined,
-      run: undefined,
-    })
+    this.runtimes.get(task.id)!.worktree = worktree
     if (TERMINAL_STATUSES.has(task.status)) {
       await this.cleanupWorktree(task)
       if (setup !== undefined) this.finishSetup(task.id, setup)
@@ -736,7 +782,8 @@ export class SubAgentManager {
     const task = this.resolveTask(taskIdOrName)
     if (task === undefined || TERMINAL_STATUSES.has(task.status)) return false
     this.flushThinkingBurst(task)
-    if (this.runtimes.has(task.id)) this.handleManager.close(task.id)
+    this.setupControllers.get(task.id)?.abort(new Error('Subagent setup cancelled'))
+    if (this.handleManager.hasHandle(task.id)) this.handleManager.close(task.id)
     task.status = 'cancelled'
     task.result ??= '[Sub-agent was cancelled.]'
     task.lastActivityAt = this.now().valueOf()
@@ -786,7 +833,7 @@ export class SubAgentManager {
     const settling = runtime.run
     if (settling !== undefined) await settling.then(() => undefined, () => undefined)
     await this.cleanupWorktree(task)
-    return this.spawn({
+    return withCapturedModelCallScopes(runtime.modelCallScopes, () => this.spawn({
       prompt: newPrompt.trim() || runtime.originalPrompt,
       config: runtime.config,
       systemPrompt: runtime.originalSystemPrompt,
@@ -801,7 +848,7 @@ export class SubAgentManager {
       rules: task.rules,
       toolsets: task.toolsets,
       ...(runtime.agentDefinition === undefined ? {} : { agentDefinition: runtime.agentDefinition }),
-    })
+    }))
   }
 
   /**
@@ -817,10 +864,11 @@ export class SubAgentManager {
     let task = this.resolveTask(taskIdOrName)
     if (task === undefined) task = this.rebuildArchivedTask(taskIdOrName)
     if (task === undefined) return undefined
+    if (this.setups.has(task.id)) return task
     if (!TERMINAL_STATUSES.has(task.status)) return task
     const runtime = this.runtimes.get(task.id)
-    // Tasks that failed before their runtime was registered (depth ceiling,
-    // worktree setup) have nothing coherent to resume; say so honestly.
+    // Tasks rejected before runtime registration (for example by the depth
+    // ceiling) have nothing coherent to resume. Setup failures retain runtime.
     if (runtime === undefined) return undefined
     const previousError = task.error
     const previousResult = task.result
@@ -837,12 +885,18 @@ export class SubAgentManager {
     runtime.emittedSpawn = false
     const attempt = runtime.attempt
     const message = input.trim() || runtime.originalPrompt
+    const setup = Promise.withResolvers<void>()
+    const controller = new AbortController()
+    this.setups.set(task.id, setup.promise)
+    this.setupControllers.set(task.id, controller)
     try {
       // A cancelled attempt may still be settling its runner turn; two turns
       // of one identity must never write the same conversation concurrently.
       const settling = runtime.run
       if (settling !== undefined) await settling.then(() => undefined, () => undefined)
-      if (runtime.isolation === 'worktree') await this.recreateRetryWorktree(task, runtime)
+      controller.signal.throwIfAborted()
+      if (runtime.isolation === 'worktree') await this.recreateRetryWorktree(task, runtime, controller.signal)
+      controller.signal.throwIfAborted()
       const handle = this.handleManager.listHandles().find(candidate => candidate.id === task.id)
       if (handle === undefined) {
         // The handle manager lost this identity (for example after a process
@@ -871,11 +925,21 @@ export class SubAgentManager {
       this.postEvent(task, 'retry', { attempt, inputPreview: message.slice(0, 200) })
       return task
     } catch (error) {
+      if (controller.signal.aborted) {
+        await this.cleanupWorktree(task)
+        return task
+      }
+      if (error instanceof WorktreeSetupError) {
+        task.worktreePath = error.worktree.path
+        task.worktreeBranch = error.worktree.branch
+        await this.fail(task, errorMessage(error))
+        throw error
+      }
       task.status = previousStatus
       task.error = previousError
       task.result = previousResult
       throw error
-    }
+    } finally { this.finishSetup(task.id, setup) }
   }
 
   /** Resolve a live or evicted-but-archived terminal task by id or name. */
@@ -896,6 +960,19 @@ export class SubAgentManager {
     return [...this.tasks.values()]
   }
 
+  /** Retained retry identities include evicted tasks, without reactivating them. */
+  listRetryTasks(): readonly { readonly id: string; readonly name: string; readonly sourceAgentId: string; readonly workspace?: string }[] {
+    const live = this.listTasks().map(task => ({
+      id: task.id, name: task.name, sourceAgentId: task.sourceId,
+      ...(task.workspace === undefined ? {} : { workspace: task.workspace }),
+    }))
+    const retainedIds = new Set(live.map(task => task.id))
+    return [...live, ...[...this.archivedTerminalTasks.values()].filter(task => !retainedIds.has(task.id)).map(task => ({
+      id: task.id, name: task.name, sourceAgentId: task.sourceId,
+      ...(stringValue(task.config._nativeSubagentWorkspace) ? { workspace: stringValue(task.config._nativeSubagentWorkspace) } : {}),
+    }))]
+  }
+
   listSnapshots(): SubAgentTaskSnapshot[] {
     const now = this.now().valueOf()
     return this.listTasks().map(task => task.snapshot(now))
@@ -911,7 +988,10 @@ export class SubAgentManager {
 
   /** Append a bounded lifecycle event and notify asynchronous waiters. */
   postEvent(task: SubAgentTask, type: string, data: Readonly<Record<string, unknown>> = {}): void {
+    const config = this.runtimes.get(task.id)?.config ?? this.archivedTerminalTasks.get(task.id)?.config
     const event = Object.freeze({
+      ...(typeof config?.providerProfile === 'string' ? { providerProfile: config.providerProfile } : {}),
+      ...(typeof config?.reasoningEffort === 'string' ? { reasoningEffort: config.reasoningEffort } : {}),
       sequence: ++this.sequence,
       taskId: task.id,
       agent: task.name,
@@ -1059,7 +1139,8 @@ export class SubAgentManager {
 
   private runTaskInput(handleId: string, input: string, signal: AbortSignal): Promise<string> {
     const runtime = this.runtimes.get(handleId)
-    const promise = this.executeTaskInput(handleId, input, signal, runtime?.attempt ?? 0)
+    const promise = withCapturedModelCallScopes(runtime?.modelCallScopes ?? [],
+      () => this.executeTaskInput(handleId, input, signal, runtime?.attempt ?? 0))
     if (runtime !== undefined) {
       runtime.run = promise
       const clear = (): void => {
@@ -1284,6 +1365,7 @@ export class SubAgentManager {
       if (oldest !== undefined) this.archivedTerminalTasks.delete(oldest)
     }
     this.archivedTerminalTasks.set(task.id, {
+      modelCallScopes: runtime.modelCallScopes,
       agentDefinition: runtime.agentDefinition,
       apiCalls: task.apiCalls,
       attempt: task.attempt,
@@ -1329,6 +1411,11 @@ export class SubAgentManager {
     if (archived === undefined) return undefined
     this.archivedTerminalTasks.delete(archived.id)
     const task = new SubAgentTask({
+      modelCallBindings: serializeModelCallScopes(archived.modelCallScopes),
+      ...(typeof archived.config.providerProfile === 'string' ? { providerProfile: archived.config.providerProfile } : {}),
+      ...(typeof archived.config.reasoningEffort === 'string' ? { reasoningEffort: archived.config.reasoningEffort } : {}),
+      ...(typeof archived.config._nativeSubagentProviderRoute === 'string' ? { providerRoute: archived.config._nativeSubagentProviderRoute } : {}),
+      ...(stringValue(archived.config._nativeSubagentWorkspace) ? { workspace: stringValue(archived.config._nativeSubagentWorkspace) } : {}),
       id: archived.id,
       prompt: archived.originalPrompt,
       depth: archived.depth,
@@ -1357,6 +1444,7 @@ export class SubAgentManager {
     if (task.name) this.tasksByName.set(task.name, task.id)
     this.runtimes.set(task.id, {
       agentDefinition: archived.agentDefinition,
+      modelCallScopes: archived.modelCallScopes,
       config: archived.config,
       isolation: archived.isolation,
       originalPrompt: archived.originalPrompt,
@@ -1487,10 +1575,11 @@ export class SubAgentManager {
     this.thinkingBurst.clear()
   }
 
-  private async recreateRetryWorktree(task: SubAgentTask, runtime: TaskRuntime): Promise<void> {
+  private async recreateRetryWorktree(task: SubAgentTask, runtime: TaskRuntime, signal: AbortSignal): Promise<void> {
     if (this.worktree === undefined) throw new Error("isolation='worktree' requires a configured worktree port")
     if (runtime.cleanup !== undefined) await runtime.cleanup
-    const worktree = await this.worktree.create({ taskId: task.id, taskName: task.name })
+    signal.throwIfAborted()
+    const worktree = await this.worktree.create({ taskId: task.id, taskName: task.name, config: runtime.config, signal })
     runtime.worktree = worktree
     runtime.cleanup = undefined
     task.worktreePath = worktree.path
@@ -1498,7 +1587,7 @@ export class SubAgentManager {
   }
 
   private finishSetup(taskId: string, setup: PromiseWithResolvers<void>): void {
-    if (this.setups.get(taskId) === setup.promise) this.setups.delete(taskId)
+    if (this.setups.get(taskId) === setup.promise) { this.setups.delete(taskId); this.setupControllers.delete(taskId) }
     setup.resolve()
     this.notifyWaiters()
   }

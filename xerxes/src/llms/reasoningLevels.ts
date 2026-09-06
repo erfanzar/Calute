@@ -41,6 +41,8 @@ export interface ReasoningLevelSet {
   readonly shape: ReasoningShape
   /** `provider` when the model itself reported these, `fallback` otherwise. */
   readonly source: 'fallback' | 'provider'
+  /** Precise origin; source is retained for existing UI/protocol consumers. */
+  readonly provenance?: 'provider_reported' | 'bundled_catalog' | 'provider_fallback'
   /**
    * Whether `off` is a real choice. Models whose thinking-level map marks
    * `off: null` (always-on adaptive thinking, e.g. Kimi K3) cannot disable
@@ -138,7 +140,7 @@ export function fallbackReasoningLevels(providerName: ProviderName | undefined):
     defaultEffort: entry.defaultEffort,
     levels: entry.levels,
     shape: entry.shape,
-    source: 'fallback',
+    source: 'fallback', provenance: 'provider_fallback',
   }
 }
 
@@ -147,7 +149,7 @@ export function providerReasoningLevels(
   levels: readonly ReasoningLevel[],
   defaultEffort: string | undefined,
 ): ReasoningLevelSet {
-  return { defaultEffort, levels, shape: 'effort', source: 'provider' }
+  return { defaultEffort, levels, shape: 'effort', source: 'provider', provenance: 'provider_reported' }
 }
 
 /**
@@ -181,7 +183,7 @@ export function catalogReasoningLevels(
   const capabilities = piCatalogModelCapabilities(model, providerName)
   if (!capabilities) return undefined
   if (!capabilities.reasoning) {
-    return { defaultEffort: undefined, levels: [], shape: 'inherent', source: 'provider', canDisable: false }
+    return { defaultEffort: undefined, levels: [], shape: 'inherent', source: 'provider', provenance: 'bundled_catalog', canDisable: false }
   }
   const map = capabilities.thinkingLevelMap
   const canDisable = map?.off !== null
@@ -197,12 +199,12 @@ export function catalogReasoningLevels(
       ...(LEVEL_DESCRIPTIONS[effort] === undefined ? {} : { description: LEVEL_DESCRIPTIONS[effort] }),
     }))
   if (!levels.length) {
-    return { defaultEffort: undefined, levels: [], shape: 'inherent', source: 'provider', canDisable }
+    return { defaultEffort: undefined, levels: [], shape: 'inherent', source: 'provider', provenance: 'bundled_catalog', canDisable }
   }
   const defaultEffort = levels.some(level => level.effort === 'medium')
     ? 'medium'
     : levels[Math.floor((levels.length - 1) / 2)]?.effort
-  return { defaultEffort, levels, shape: 'effort', source: 'provider', canDisable }
+  return { defaultEffort, levels, shape: 'effort', source: 'provider', provenance: 'bundled_catalog', canDisable }
 }
 
 /** Every value the user may select, including the Xerxes-side off switch. */

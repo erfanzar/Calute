@@ -60,7 +60,7 @@ test('shadow snapshots never track the broader secret denylist', async () => {
   }
 })
 
-test('rollback removes ignored build outputs and captures a pre-rollback snapshot', async () => {
+test('rollback preserves unbacked ignored output and captures a pre-rollback snapshot', async () => {
   if (!Bun.which('git')) return
   const directory = mkdtempSync(join(tmpdir(), 'xerxes-snapshot-rollback-safety-'))
   const workspace = join(directory, 'workspace')
@@ -71,22 +71,21 @@ test('rollback removes ignored build outputs and captures a pre-rollback snapsho
     const manager = new SnapshotManager(workspace, { shadowRoot: join(directory, 'shadow') })
     const first = await manager.snapshot('first')
 
-    // Ignored build output created after the snapshot must not survive rollback.
+    // Ignored output has no backup: preserve it rather than losing user data.
     writeFileSync(join(workspace, 'build', 'output.js'), 'post-snapshot artifact', 'utf8')
     writeFileSync(join(workspace, 'a.txt'), 'dirty version', 'utf8')
     await manager.rollback(first.id)
 
     expect(readFileSync(join(workspace, 'a.txt'), 'utf8')).toBe('first version')
-    expect(existsSync(join(workspace, 'build', 'output.js'))).toBe(false)
+    expect(readFileSync(join(workspace, 'build', 'output.js'), 'utf8')).toBe('post-snapshot artifact')
 
     // The pre-rollback snapshot can itself restore the pre-rollback tree.
-    // (Ignored build output is never tracked by design, so only tracked
-    // files return; the second clean still removes the ignored artifact.)
+    // Ignored build output remains outside both restore operations.
     const preRollback = manager.list().at(-1)
     expect(preRollback?.label).toBe(`pre-rollback:${first.id}`)
     await manager.rollback(preRollback!.id)
     expect(readFileSync(join(workspace, 'a.txt'), 'utf8')).toBe('dirty version')
-    expect(existsSync(join(workspace, 'build', 'output.js'))).toBe(false)
+    expect(readFileSync(join(workspace, 'build', 'output.js'), 'utf8')).toBe('post-snapshot artifact')
   } finally {
     rmSync(directory, { recursive: true, force: true })
   }

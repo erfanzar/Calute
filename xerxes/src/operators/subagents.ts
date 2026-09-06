@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 import { ValidationError } from '../core/errors.js'
+import type { ModelCallBinding } from '../llms/callBudget.js'
 
 export const MAX_AGENT_TITLE_LENGTH = 48
 
@@ -23,6 +24,8 @@ export const DEFAULT_MAX_RETAINED_TERMINAL_HANDLES = 128
 export type SpawnedAgentStatus = 'cancelled' | 'closed' | 'completed' | 'error' | 'idle' | 'interrupted' | 'running'
 
 export interface SpawnedAgentDescriptor {
+  readonly providerProfile?: string
+  readonly reasoningEffort?: string
   readonly id: string
   readonly model?: string
   readonly name?: string
@@ -50,6 +53,10 @@ export type SubagentRunner = (
 ) => Promise<SubagentRunResponse | string>
 
 export interface SpawnedAgentSnapshot {
+  readonly providerProfile?: string
+  /** Nonsecret provider routing fingerprint used to validate recovered retries. */
+  readonly providerRoute?: string
+  readonly reasoningEffort?: string
   readonly agentId: string
   /** Zero-based execution generation, incremented for every identity-preserving retry. */
   readonly attempt?: number
@@ -70,6 +77,8 @@ export interface SpawnedAgentSnapshot {
   readonly lastInput?: string
   readonly lastOutput?: string
   readonly model?: string
+  /** Serializable model-call ownership retained across detached-agent recovery. */
+  readonly modelCallBindings?: readonly ModelCallBinding[]
   readonly name: string
   readonly outputTokens?: number
   readonly parentAgentId?: string
@@ -84,6 +93,8 @@ export interface SpawnedAgentSnapshot {
   readonly toolCalls?: number
   readonly toolsets?: readonly string[]
   readonly updatedAt: string
+  /** Absolute source project root used when retrying this child after restart. */
+  readonly workspace?: string
 }
 
 export interface SpawnedAgentManagerOptions {
@@ -97,6 +108,11 @@ export interface SpawnedAgentManagerOptions {
 }
 
 export interface SpawnAgentOptions {
+  /** Allocation cancellation only; never persisted or used as the child lifetime. */
+  readonly signal?: AbortSignal
+  readonly isolation?: 'worktree'
+  readonly worktreeRef?: string
+  readonly worktreeSource?: 'working-tree'
   readonly agent?: SpawnedAgentDescriptor
   readonly agentId?: string
   readonly creatorAgentId?: string
@@ -201,6 +217,7 @@ export class SpawnedAgentManager implements SpawnedAgentManagerPort {
   }
 
   async spawn(options: SpawnAgentOptions = {}): Promise<SpawnedAgentSnapshot> {
+    if (options.isolation || options.worktreeRef !== undefined || options.worktreeSource !== undefined) throw new ValidationError('isolation', 'requires a native host with a configured worktree adapter', options.isolation)
     const id = options.nickname?.trim() || this.idFactory()
     if (this.handles.has(id)) throw new ValidationError('nickname', 'already identifies a spawned agent', id)
     const sourceAgentId = options.sourceAgentId ?? options.agentId

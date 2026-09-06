@@ -21,6 +21,7 @@ export interface DaemonQuestion {
 }
 
 interface PendingPermission {
+  readonly description: string
   readonly abort: () => void
   readonly argsHash: string
   readonly resolve: (decision: PermissionDecision) => void
@@ -30,6 +31,7 @@ interface PendingPermission {
 }
 
 interface PendingQuestion {
+  readonly question: string
   readonly allowFreeform: boolean
   readonly abort: () => void
   readonly options: readonly string[]
@@ -108,6 +110,7 @@ export class DaemonInteractionBoard {
     return new Promise(resolve => {
       const abort = () => this.finishQuestion(requestId, '')
       this.questions.set(requestId, {
+        question,
         abort,
         allowFreeform: request.allowFreeform ?? true,
         options: [...(request.options ?? [])],
@@ -136,6 +139,16 @@ export class DaemonInteractionBoard {
         },
       })
     })
+  }
+
+  /** Read-only current waits; never exposes tool arguments or changes authority. */
+  pendingAttention(sessionId: string): { id: string; kind: 'approval' | 'question'; title: string }[] {
+    return [
+      ...[...this.permissions].filter(([, pending]) => pending.sessionId === sessionId)
+        .map(([id, pending]) => ({ id, kind: 'approval' as const, title: (pending.description || pending.toolName).slice(0, 240) })),
+      ...[...this.questions].filter(([, pending]) => pending.sessionId === sessionId)
+        .map(([id, pending]) => ({ id, kind: 'question' as const, title: pending.question.slice(0, 240) })),
+    ]
   }
 
   pendingPermissionIds(): readonly string[] {
@@ -245,6 +258,7 @@ export class DaemonInteractionBoard {
     return new Promise(resolve => {
       const abort = () => this.finishPermission(request.requestId, 'reject')
       this.permissions.set(request.requestId, {
+        description: request.description.slice(0, 240),
         abort,
         argsHash,
         resolve,

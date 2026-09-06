@@ -2,7 +2,9 @@
 // Licensed under the Apache License, Version 2.0.
 
 import type { PersistedSubagentDelivery } from '../agents/subagentPersistence.js'
+import { isAbsolute } from 'node:path'
 import type { SubAgentManager } from '../agents/subagentManager.js'
+import type { ModelCallBinding } from '../llms/callBudget.js'
 import type {
   SpawnedAgentSnapshot,
   SpawnedAgentStatus,
@@ -18,6 +20,9 @@ const TERMINAL_STATUSES = new Set<SpawnedAgentStatus>([
 
 const MAX_RECOVERED_OUTPUT_CHARS = 16_000
 const MAX_DELIVERED_GENERATIONS = 2_000
+const MAX_MODEL_CALL_BINDINGS = 64
+const MAX_MODEL_CALL_IDENTITY_CHARS = 256
+const PROVIDER_ROUTE_PATTERN = /^[a-f0-9]{64}$/
 
 const AGENT_TOOL_NAMES = new Set([
   'AgentTool',
@@ -373,6 +378,9 @@ function recoveredSnapshot(
     || stringValue(value.historySessionId)
     || previous?.historySessionId
   const model = stringValue(value.model) || previous?.model
+  const modelCallBindings = recoveredModelCallBindings(value, previous?.modelCallBindings)
+  const workspace = recoveredWorkspace(value, previous?.workspace)
+  const providerRoute = recoveredProviderRoute(value, previous?.providerRoute)
   const rules = stringArray(value.rules)
   const toolsets = stringArray(value.toolsets)
   const apiCalls = nonNegativeInteger(value.api_calls ?? value.apiCalls) ?? previous?.apiCalls
@@ -402,6 +410,11 @@ function recoveredSnapshot(
     ...(creatorAgentId ? { creatorAgentId } : {}),
     ...(parentAgentId ? { parentAgentId } : {}),
     ...(model ? { model } : {}),
+    ...(modelCallBindings === undefined ? {} : { modelCallBindings }),
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(providerRoute === undefined ? {} : { providerRoute }),
+    ...(stringValue(value.provider_profile) || previous?.providerProfile ? { providerProfile: stringValue(value.provider_profile) || previous!.providerProfile! } : {}),
+    ...(stringValue(value.reasoning_effort) || previous?.reasoningEffort ? { reasoningEffort: stringValue(value.reasoning_effort) || previous!.reasoningEffort! } : {}),
     ...(rules.length ? { rules } : previous?.rules === undefined ? {} : { rules: previous.rules }),
     ...(toolsets.length ? { toolsets } : previous?.toolsets === undefined ? {} : { toolsets: previous.toolsets }),
     ...(apiCalls === undefined ? {} : { apiCalls }),
@@ -421,6 +434,69 @@ function recoveredSnapshot(
     status,
     updatedAt: timestampValue(value.updated_at ?? value.updatedAt, previous?.updatedAt),
   })
+}
+
+function recoveredProviderRoute(
+  value: Readonly<Record<string, unknown>>,
+  previous: string | undefined,
+): string | undefined {
+  if (!('provider_route' in value) && !('providerRoute' in value)) return previous
+  const candidate = 'provider_route' in value ? value.provider_route : value.providerRoute
+  return typeof candidate === 'string' && PROVIDER_ROUTE_PATTERN.test(candidate) ? candidate : ''
+}
+
+function recoveredWorkspace(
+  value: Readonly<Record<string, unknown>>,
+  previous: string | undefined,
+): string | undefined {
+  if (!('workspace' in value)) return previous
+  const candidate = value.workspace
+  return typeof candidate === 'string' && isAbsolute(candidate) && candidate.trim() === candidate
+    ? candidate
+    : ''
+}
+
+function recoveredModelCallBindings(
+  value: Readonly<Record<string, unknown>>,
+  previous: readonly ModelCallBinding[] | undefined,
+): readonly ModelCallBinding[] | undefined {
+  if (!('model_call_bindings' in value) && !('modelCallBindings' in value)) return previous
+  const raw = 'model_call_bindings' in value ? value.model_call_bindings : value.modelCallBindings
+  if (!Array.isArray(raw) || raw.length > MAX_MODEL_CALL_BINDINGS) return Object.freeze([{ kind: 'unrecoverable' }])
+  const parsed: ModelCallBinding[] = []
+  let bindingKind: ModelCallBinding['kind'] | undefined
+  for (const candidate of raw) {
+    if (!isRecord(candidate) || typeof candidate.kind !== 'string') {
+      return Object.freeze([{ kind: 'unrecoverable' }])
+    }
+    if (bindingKind !== undefined && candidate.kind !== bindingKind) {
+      return Object.freeze([{ kind: 'unrecoverable' }])
+    }
+    bindingKind = candidate.kind as ModelCallBinding['kind']
+    if (candidate.kind === 'unrecoverable') {
+      parsed.push({ kind: 'unrecoverable' })
+      continue
+    }
+    if (candidate.kind !== 'goal') return Object.freeze([{ kind: 'unrecoverable' }])
+    const sessionId = bindingIdentity(candidate, 'session_id', 'sessionId')
+    const goalId = bindingIdentity(candidate, 'goal_id', 'goalId')
+    if (sessionId === undefined || goalId === undefined) return Object.freeze([{ kind: 'unrecoverable' }])
+    parsed.push({ kind: 'goal', sessionId, goalId })
+  }
+  return Object.freeze(parsed)
+}
+
+function bindingIdentity(
+  value: Readonly<Record<string, unknown>>,
+  snakeKey: string,
+  camelKey: string,
+): string | undefined {
+  const snake = value[snakeKey]
+  const camel = value[camelKey]
+  if (snake !== undefined && camel !== undefined && snake !== camel) return undefined
+  const candidate = snake ?? camel
+  if (typeof candidate !== 'string' || candidate.trim() !== candidate || candidate.length === 0 || candidate.length > MAX_MODEL_CALL_IDENTITY_CHARS) return undefined
+  return candidate
 }
 
 function decodedToolContent(value: unknown): unknown {

@@ -1,6 +1,7 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { parseTerminalOutputCursor } from '../runtime/terminalOutput.js'
 import { stat } from 'node:fs/promises'
 
 import { ValidationError } from '../core/errors.js'
@@ -16,6 +17,8 @@ import {
   MAX_CHECK_WAIT_MS,
 } from './backgroundCommands.js'
 import { BoundedOutputBuffer, capOutput, drainStream, type StreamDrain } from './processOutput.js'
+
+export type CommandCompletionWatch = (owner: string, terminalId: string) => { readonly id: string; readonly expiresAt: number }
 
 const DEFAULT_TIMEOUT_MS = 30_000
 const DEFAULT_MAX_OUTPUT_CHARS = 20_000
@@ -52,7 +55,7 @@ export const EXEC_COMMAND_DEFINITION: ToolDefinition = {
       + 'tools, where the host enables them. For work you KNOW will outlast the timeout, pass '
       + 'run_in_background:true to background it immediately; anything that merely outlives the timeout by surprise '
       + 'is backgrounded automatically at the ceiling. Either way, never use `&` or nohup: that output goes nowhere '
-      + 'you can read and its failure is invisible.',
+      + 'you can read and its failure is invisible. When asked to report when background work finishes, set notify_on_completion:true; on supported hosts this schedules one bounded follow-up without polling.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -74,6 +77,10 @@ export const EXEC_COMMAND_DEFINITION: ToolDefinition = {
           type: 'integer',
           default: DEFAULT_MAX_OUTPUT_CHARS,
           description: 'Maximum characters returned per output stream.',
+        },
+        notify_on_completion: {
+          type: 'boolean', default: false,
+          description: 'Arrange one model follow-up if this command backgrounds, including timeout adoption. Requires a completion-capable host. The watch expires after 24 hours; the follow-up is limited to 60 seconds. Foreground completion returns normally. Inspect completion_watch or completion_watch_error in the result.',
         },
         run_in_background: {
           type: 'boolean',
@@ -188,7 +195,20 @@ export function registerProcessTools(
   paths: WorkspacePathResolver,
   backgroundManager?: BackgroundCommandManager,
   terminals?: TerminalRegistry,
+  completionWatch?: CommandCompletionWatch,
 ): void {
+  if (terminals) registry.register({ type: 'function', function: {
+    name: 'read_terminal_output',
+    description: 'Read incremental retained output from an owned terminal without consuming another reader’s buffer. Pass the returned cursor to get only subsequent output. droppedChars reports retention gaps. Use run:<run_id> for archived terminals from Runs. This does not wait: use a completion watch instead of polling in a loop.',
+    parameters: { type: 'object', additionalProperties: false, required: ['terminal_id'], properties: {
+      terminal_id: { type: 'string' }, max_output_chars: { type: 'integer', minimum: 1, maximum: 200000, default: 20000 },
+      cursor: { type: 'object', additionalProperties: false, required: ['streamId', 'offset'], properties: {
+        streamId: { type: 'string' }, offset: { type: 'integer', minimum: 0 },
+      } },
+    } },
+  } }, (inputs, context) => terminals.readOutput(requiredOwnerSessionId(context.sessionId), requiredString(inputs, 'terminal_id'),
+    parseTerminalOutputCursor(inputs.cursor), optionalInteger(inputs, 'max_output_chars', 20000)),
+  'default', { concurrencySafe: true, destructive: false, openWorld: false, readOnly: true })
   const background = backgroundManager ?? new BackgroundCommandManager(new ProcessRegistry(), terminals)
   // Deciding concurrency by tool NAME alone would make every shell call a
   // barrier, and the shipped prompt tells the model to batch independent calls —
@@ -198,14 +218,23 @@ export function registerProcessTools(
   // still runs alone.
   registry.register(
     EXEC_COMMAND_DEFINITION,
-    (inputs, context, signal) => executeCommand(
-      inputs,
-      paths,
-      signal,
-      background,
-      terminals,
-      requiredOwnerSessionId(context.sessionId),
-    ),
+    async (inputs, context, signal) => {
+      const owner = requiredOwnerSessionId(context.sessionId)
+      const notify = optionalBoolean(inputs, 'notify_on_completion', false)
+      if (notify && context.metadata.goal_turn_human !== true) throw new ValidationError('notify_on_completion', 'requires a direct user turn')
+      if (notify && !completionWatch) throw new ValidationError('notify_on_completion', 'is not enabled by this host')
+      const result = await executeCommand(inputs, paths, signal, background, terminals, owner)
+      if (!notify || !('procId' in result)) return result
+      try {
+        signal?.throwIfAborted()
+        const watch = completionWatch!(owner, result.procId)
+        return { ...result, completion_watch: { id: watch.id, expires_at: watch.expiresAt } }
+      } catch (error) {
+        // The process already exists. Preserve its handle so callers can inspect
+        // or stop it instead of retrying the command after a watch error.
+        return { ...result, completion_watch_error: error instanceof Error ? error.message : 'Completion watch could not be created' }
+      }
+    },
     'default',
     { concurrencySafe: false, defer: false, destructive: true, openWorld: true, readOnly: false },
     // Co-located usage policy for the one tool whose shape models most often

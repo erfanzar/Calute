@@ -102,6 +102,16 @@ export interface OverlayState {
   copyPicker: CopyPickerState | null
   diff: boolean
   goal: boolean
+  loops: boolean
+  schedules: boolean
+  agentSettings: boolean
+  lspSettings: boolean
+  mcpSettings: boolean
+  contextInspector: boolean
+  monitors: boolean
+  runs: boolean
+  snapshots: boolean
+  workspaces: boolean
   machinePicker: boolean
   modelPicker: boolean
   reasoningPicker: boolean
@@ -316,7 +326,7 @@ export interface GatewayEventHandlerContext {
     // respawn resumes that session instead of forging a fresh one.
     recoverSidRef?: MutableRefObject<null | string>
     resetSession: () => void
-    resumeById: (id: string) => void
+    resumeById: (id: string, options?: { keepCurrent?: boolean }) => void
     setCatalog: StateSetter<null | SlashCatalog>
   }
   submission: {
@@ -365,7 +375,7 @@ export interface SlashHandlerContext {
     newLiveSession: (msg?: string, title?: string) => void
     newSession: (msg?: string, title?: string, agentPreset?: string) => void
     resetVisibleHistory: (info?: null | SessionInfo) => void
-    resumeById: (id: string) => void
+    resumeById: (id: string, options?: { keepCurrent?: boolean }) => void
     setSessionStartedAt: StateSetter<number>
   }
   slashFlightRef: MutableRefObject<number>
@@ -400,7 +410,7 @@ export interface AppLayoutActions {
   newPromptSession: (prompt: string, modelArg?: string) => void
   onModelSelect: (value: string) => void
   onReasoningSelect: (value: string) => void
-  resumeById: (id: string) => void
+  resumeById: (id: string, options?: { keepCurrent?: boolean }) => void
   setStickyPrompt: (value: string) => void
   sys: (text: string) => void
 }

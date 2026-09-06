@@ -570,7 +570,7 @@ test('the Codex catalog is discovered live and plan-scoped, not hard-coded', asy
   )
 
   // The catalog route is gated on client_version; omitting it is a 400.
-  expect(seenUrl).toContain('/models?client_version=')
+  expect(new URL(seenUrl).searchParams.get('client_version')).toBe('1.0.0')
   expect(seenHeaders['chatgpt-account-id']).toBe('acct-6')
   expect(catalog).toEqual([
     {
@@ -805,6 +805,21 @@ test('every model the plan returns is selectable, harness-flagged or not', async
     excludeHarnessModels: true,
   })
   expect(filtered.map(model => model.id)).toEqual(['gpt-5.5', 'gpt-5.4-mini'])
+})
+
+test('catalog discovery requests the version that exposes Astra without a static model entry', async () => {
+  const catalog = await fetchCodexModelCatalog(
+    { accessToken: 'tok', accountId: 'account', planType: 'pro' },
+    {
+      fetchImplementation: (async (url: string) => Response.json({
+        models: new URL(String(url)).searchParams.get('client_version') === '1.0.0'
+          ? [{ slug: 'gpt-6-astra', supported_reasoning_levels: [{ effort: 'high' }] }]
+          : [],
+      })) as never,
+    },
+  )
+  expect(catalog.map(model => model.id)).toEqual(['gpt-6-astra'])
+  expect(catalog[0]?.reasoningLevels).toEqual([{ effort: 'high', description: undefined }])
 })
 
 test('harness detection keys on capability flags, not on model names', async () => {

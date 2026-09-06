@@ -6,6 +6,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseAgentIntelligenceConfig } from "./agents/intelligence.js";
+import { getActiveSession } from "./runtime/sessionContext.js";
 import { AcpAgentRunner } from "./acp/runner.js";
 import {
   ACP_HELP,
@@ -41,7 +43,8 @@ import { InMemoryDaemonRuntime } from "./daemon/runtime.js";
 import { daemonBuildIdForEntry } from "./daemon/sourceBuild.js";
 import { compactionCompletionPort } from "./daemon/server.js";
 import { DaemonSubagentEventBus } from "./daemon/subagentEvents.js";
-import { createNativeSubagentHost, subagentRetryWirePayload } from "./daemon/subagentHost.js";
+import { nativeSubagentWorktrees } from "./runtime/subagentWorktrees.js";
+import { createNativeSubagentHost, subagentRetryWirePayload, type NativeSubagentHostOptions } from "./daemon/subagentHost.js";
 import { AgentTurnRunner, formatSubagentResults } from "./daemon/turnRunner.js";
 import {
   defaultSkillDiscoveryRoots,
@@ -49,8 +52,9 @@ import {
   trustedHashWorkspaceSkills,
 } from "./extensions/skills.js";
 import { DeclarativeToolForge } from "./extensions/declarativeForge.js";
-import { HookRunner } from "./extensions/hooks.js";
-import { loadShellHookConfigSync, registerShellHooks } from "./extensions/shellHooks.js";
+import { agentProviderResolver, agentProviderRouteResolver, providerRouteIdentity } from "./daemon/agentProvider.js";
+import { AgentSettingsStore } from "./agents/settingsStore.js";
+import { workspaceShellHooks } from "./extensions/workspaceHooks.js";
 import {
   ToolRegistry,
   type ToolExecutionContext,
@@ -84,9 +88,31 @@ import { CliWriter, createCliStyle, detectColorDepth } from "./runtime/cliStyle.
 import { resolveTuiEntry } from "./runtime/distribution.js";
 import { registerInteractionModeTool } from "./runtime/interactionModeTool.js";
 import { goalPolicyPrompt, registerGoalTools } from "./runtime/goalTools.js";
+import { findGoalEvidenceExecution } from './runtime/goalEvidence.js';
 import { extractAgentOption, extractOutputFormatOption, parseValueOptions, type OutputFormat } from "./runtime/commandOptions.js";
 import { ProcessRegistry } from "./runtime/processRegistry.js";
 import { TerminalRegistry } from "./runtime/terminalRegistry.js";
+import { ReactionMailbox } from "./runtime/reactionMailbox.js";
+import { RunHistory } from "./runtime/runHistory.js";
+import { GoalTokenLedger } from './runtime/goalTokenLedger.js';
+import { restoreRecoveredModelCallScopes } from './runtime/recoveredModelCallScopes.js';
+import { resolveSubagentRetryRequest } from './daemon/subagentRetryOwnership.js';
+import { TerminalMonitors } from "./runtime/terminalMonitors.js";
+import { registerScheduleTools, type ScheduleToolHost } from "./tools/scheduleTools.js";
+import { inheritedSelectionValidator, profileInventoryHost, profileSelectionValidator } from './runtime/profileInventory.js';
+import { addModelInventoryToBuiltinAgents, type ModelInventoryHost } from './tools/modelInventoryTools.js';
+import { registerMonitorTools } from "./tools/monitorTools.js";
+import { nativeFileMonitorSource } from "./runtime/fileMonitorSource.js";
+import { nativeWebSocketMonitorSource } from "./runtime/websocketMonitorSource.js";
+import { addMcpToolsToBuiltinAgents, registerMcpTools } from "./tools/mcpTools.js";
+import { MCPManager } from "./mcp/manager.js";
+import { EditFeedback } from "./runtime/editFeedback.js";
+import { LspSettingsStore } from "./lsp/settingsStore.js";
+import { lspSettingsView, saveLspSettings } from "./lsp/settings.js";
+import { loadConfiguredLsp } from "./lsp/configured.js";
+import { addLspToolToBuiltinAgents, registerConfiguredLspTool } from "./tools/lspTools.js";
+import { startConfiguredMcpServers } from "./mcp/configured.js";
+import { McpSettingsStore } from "./mcp/settingsStore.js";
 import { PtySessionManager } from "./operators/pty.js";
 import { BackgroundCommandManager } from "./tools/backgroundCommands.js";
 import { DaemonTranscriptStore } from "./session/daemonTranscript.js";
@@ -179,7 +205,9 @@ const HELP_GROUPS: readonly {
       ["xerxes skill <skill> [arguments]", "run a bundled skill"],
       ["xerxes setup [--provider <p>] [--model <m>] [--api-key <k>] [--permission-mode <mode>]", "create an initial provider configuration"],
       ["xerxes workspace create|exec|read|write|destroy --id <id>", "manage a local sandbox workspace"],
-      ["xerxes schedule create|fire|list --id <id> --schedule <spec>", "manage durable scheduled triggers"],
+      ["xerxes schedule create|fire|list --project-dir <path> [--socket <path>]", "manage jobs in the running project's /schedules daemon"],
+      ["xerxes schedule create --schedule 'interval:600' --objective <prompt>", "create an enabled job; --timezone <IANA> and --paused true are optional"],
+      ["xerxes schedule inspect|disable|enable|remove|fire|cancel --id <job-id>", "inspect, pause, resume, remove, run, or cancel a schedule"],
       ["xerxes memory record|review|classify|correct|expire|list", "manage governed memory records"],
       ["xerxes capability register|unregister|list|diff --id <id>", "manage capability manifests"],
       ["xerxes telemetry record|list|benchmark|inject", "record events, benchmark, or inject failures"],
@@ -522,9 +550,11 @@ if (argument === "--help" || argument === "-h") {
     action !== "enable" &&
     action !== "remove" &&
     action !== "fire" &&
+    action !== "inspect" &&
+    action !== "cancel" &&
     action !== "list"
   ) {
-    reportCommandUsageError(new Error("schedule requires action: create|disable|enable|remove|fire|list"), "xerxes schedule --help")
+    reportCommandUsageError(new Error("schedule requires action: create|disable|enable|remove|fire|inspect|cancel|list"), "xerxes schedule --help")
   }
   const options = parseValueOptions(argumentsAfterCommand.slice(1), "schedule", [
     "--id",
@@ -533,15 +563,27 @@ if (argument === "--help" || argument === "-h") {
     "--objective",
     "--delivery-id",
     "--directory",
+    "--project-dir",
+    "--socket",
+    "--timezone",
+    "--paused",
   ]);
+  const paused = options.get("--paused");
+  if (paused !== undefined && paused !== "true" && paused !== "false") {
+    reportCommandUsageError(new Error("--paused must be true or false"), "xerxes schedule --help");
+  }
   const result = await runScheduleCommand({
     action,
+    ...(paused === undefined ? {} : { paused: paused === "true" }),
     ...optionalOptions(options, {
       id: "--id",
       owner: "--owner",
       schedule: "--schedule",
       objective: "--objective",
       deliveryId: "--delivery-id",
+      projectDirectory: "--project-dir",
+      socketPath: "--socket",
+      timezone: "--timezone",
     }),
     ...optionalOptions(options, { directory: "--directory" }),
   })
@@ -961,6 +1003,8 @@ async function runDaemon(
     },
   });
   const browserManager = new BrowserManager();
+  const mcpManager = new MCPManager();
+  let stopping = false;
   const skillRegistry = new SkillRegistry({ workspaceTrust: trustedHashWorkspaceSkills() });
   await skillRegistry.refresh(...defaultSkillDiscoveryRoots({
     cwd: projectDirectory ?? config.projectDirectory,
@@ -972,7 +1016,27 @@ async function runDaemon(
   // Shared by the tool registry that starts the processes and the RPC surface
   // that lists them. One instance is the whole point: a second registry would
   // be a second, permanently empty view of the same shells.
-  const terminals = new TerminalRegistry();
+  const runHistory = new RunHistory(join(xerxesHome(), "runs", "history.sqlite"));
+  const goalTokenLedger = new GoalTokenLedger(join(xerxesHome(), 'runs', 'goal-tokens.sqlite'));
+  const goalTokenOwner = crypto.randomUUID();
+  const reactionMailbox = new ReactionMailbox(join(xerxesHome(), "runs", "reactions.sqlite"));
+  const terminals = new TerminalRegistry({ runHistory });
+  let announceMonitorEvent: ConstructorParameters<typeof TerminalMonitors>[2];
+  const monitors = new TerminalMonitors(terminals, runHistory, (monitor, event) => announceMonitorEvent?.(monitor, event), undefined, reactionMailbox, {
+    source: nativeFileMonitorSource,
+    resolveWorkspace: (owner) => {
+      const session = runtime.listSessions().find(candidate => candidate.id === owner);
+      if (!session) throw new Error('File monitor owner session is unavailable');
+      return session.cwd;
+    },
+  }, {
+    source: nativeWebSocketMonitorSource,
+    resolveWorkspace: owner => {
+      const session = runtime.listSessions().find(candidate => candidate.id === owner);
+      if (!session) throw new Error('WebSocket monitor owner session is unavailable');
+      return session.cwd;
+    },
+  });
   const buildId = await daemonBuildIdForEntry(
     import.meta.dir,
     fileURLToPath(import.meta.url),
@@ -991,9 +1055,17 @@ async function runDaemon(
       ...(buildId ? { buildId } : {}),
       onSessionModeChange: (sessionId) => announceModeChange?.(sessionId),
       skillRegistry,
+      mcpManager,
       declarativeForge,
       agentPresetRoster,
       terminals,
+      runHistory,
+      goalTokenLedger,
+      goalTokenOwner,
+      monitors,
+      schedules: (sessionId, action, params, signal) => daemon.scheduleToolRequest(sessionId, action, params, signal, true),
+      validateProviderSelection: (profile, model, effort, signal) => daemon.validateAgentProviderSelection(profile, model, effort, signal),
+      modelInventory: (sessionId, params, signal) => daemon.modelInventoryToolRequest(sessionId, params, signal),
     },
   );
   const channelManager = createDaemonChannelManager(config, runtime, {
@@ -1009,50 +1081,17 @@ async function runDaemon(
   const daemonLifetime = new Promise<void>((resolveLifetime) => {
     finishDaemon = resolveLifetime;
   });
-  const finish = () => finishDaemon?.();
+  const finish = () => { stopping = true; finishDaemon?.(); };
   // MCP: connect the servers configured in ~/.xerxes/mcp.json so their
   // status is real (session.status.mcp_status) and /reload-mcp works.
   // Per-server failures are recorded on the manager and logged — one broken
   // server must not stop the daemon.
-  const { MCPManager } = await import("./mcp/manager.js");
-  const { loadMcpConfig } = await import("./mcp/config.js");
-  const mcpConfig = loadMcpConfig(join(xerxesHome(), "mcp.json"));
-  for (const warning of mcpConfig.warnings) console.error(`mcp: ${warning}`);
-  // Project-scoped MCP (Claude Code `.mcp.json` parity): a repo can ship its
-  // own servers. They execute arbitrary commands, so they load ONLY behind
-  // the workspace-config trust opt-in — otherwise the file is noted and
-  // ignored. Project servers never shadow user-configured names.
-  const mcpServers = [...mcpConfig.servers];
-  const workspaceTrusted = process.env.XERXES_ALLOW_WORKSPACE_CONFIG === "1"
-    || /^true|yes|on$/i.test(process.env.XERXES_ALLOW_WORKSPACE_CONFIG ?? "");
-  const projectRoot = projectDirectory ?? config.projectDirectory;
-  const projectMcpPath = join(projectRoot, ".mcp.json");
-  if (existsSync(projectMcpPath)) {
-    if (!workspaceTrusted) {
-      console.error("mcp: project .mcp.json found but workspace config is not trusted — ignored (set XERXES_ALLOW_WORKSPACE_CONFIG=1 to enable)");
-    } else {
-      const projectMcp = loadMcpConfig(projectMcpPath);
-      for (const warning of projectMcp.warnings) console.error(`mcp: ${warning}`);
-      const known = new Set(mcpServers.map((server) => server.name));
-      for (const server of projectMcp.servers) {
-        if (known.has(server.name)) {
-          console.error(`mcp: project server '${server.name}' ignored — a user server with that name exists`);
-          continue;
-        }
-        mcpServers.push(server);
-      }
-    }
-  }
-  const mcpManager = new MCPManager();
-  for (const server of mcpServers) {
-    void mcpManager
-      .addServer(server)
-      .then((connected) => {
-        if (!connected) console.error(`mcp: server '${server.name}' not connected (disabled or duplicate)`);
-      })
-      .catch((error) => console.error(`mcp: server '${server.name}' failed: ${errorMessage(error)}`));
-  }
+  void startConfiguredMcpServers(mcpManager, {
+    ...mcpHostOptions(projectDirectory ?? config.projectDirectory),
+    onConnected: () => { if (!stopping) runtime.reload({}); },
+  }).catch(error => console.error(`mcp: ${errorMessage(error)}`));
   const daemon = new DaemonServer({
+    agentSettingsDefaults: config.runtime.agent_intelligence,
     socketPath,
     runtime,
     // Sessions created without an explicit project_dir belong to THIS
@@ -1061,13 +1100,19 @@ async function runDaemon(
     interactions,
     browserManager,
     terminalRegistry: terminals,
+    reactionMailbox,
+    runHistory,
+    goalTokenLedger,
+    goalTokenOwner,
+    monitors,
     profileStore,
     autoDiscoverModelCapabilities: true,
     skillRegistry,
     declarativeForge,
     agentPresetRoster,
-    ...(mcpServers.length ? { mcpManager } : {}),
+    mcpManager,
     onRestart: finish,
+    mcpSettingsStore: new McpSettingsStore(join(xerxesHome(), "mcp.json")),
     onShutdown: finish,
     // Only a process-owning host may claim uncaughtException/unhandledRejection,
     // which is why the server leaves them off by default. This IS that host, and
@@ -1081,12 +1126,15 @@ async function runDaemon(
     ...(pidPath ? { pidPath } : {}),
   });
   announceModeChange = (sessionId) => daemon.notifySessionModeChanged(sessionId);
+  announceMonitorEvent = (monitor, event) => daemon.notifyMonitorEvent(monitor, event);
   try {
     await daemon.start();
     await channelManager.startConfigured();
   } catch (error) {
+    stopping = true;
     await channelManager.stopAll();
     await daemon.stop();
+    await mcpManager.disconnectAll();
     throw error;
   }
   console.error("Xerxes Bun daemon listening on " + socketPath);
@@ -1100,7 +1148,12 @@ async function runDaemon(
   } finally {
     process.off("SIGINT", finish);
     process.off("SIGTERM", finish);
+    stopping = true;
     await daemon.stop();
+    await mcpManager.disconnectAll();
+    reactionMailbox.close();
+    runHistory.close();
+    goalTokenLedger.close();
   }
 }
 
@@ -1548,6 +1601,14 @@ function optionalOptions<K extends string>(
   return result;
 }
 
+function mcpHostOptions(workspace: string) {
+  return {
+    home: xerxesHome(), workspace,
+    allowWorkspace: /^(1|true|yes|on)$/i.test(process.env.XERXES_ALLOW_WORKSPACE_CONFIG ?? ''),
+    report: (message: string) => console.error(`mcp: ${message}`),
+  };
+}
+
 function daemonRuntime(
   config: DaemonConfig,
   projectDirectory: string | undefined,
@@ -1559,27 +1620,28 @@ function daemonRuntime(
     /** Announce a model-driven interaction-mode change to attached clients. */
     readonly onSessionModeChange?: (sessionId: string, mode: string) => void;
     readonly skillRegistry?: SkillRegistry;
+    readonly mcpManager?: MCPManager;
     readonly declarativeForge?: DeclarativeToolForge;
     readonly agentPresetRoster?: AgentPresetRoster;
     readonly terminals?: TerminalRegistry;
+    readonly runHistory?: RunHistory;
+    readonly goalTokenLedger?: GoalTokenLedger;
+    readonly goalTokenOwner?: string;
+    readonly monitors?: TerminalMonitors;
+    readonly schedules?: ScheduleToolHost;
+    readonly modelInventory?: ModelInventoryHost;
+    readonly validateProviderSelection?: NativeSubagentHostOptions['validateProviderSelection'];
   } = {},
 ): InMemoryDaemonRuntime {
   const workspaceRoot = projectDirectory ?? config.projectDirectory;
-  // User shell hooks (Claude Code settings.json parity): one runner for the
-  // whole daemon, shared by every turn. Without this the loop's hook points
-  // never fired in production — nothing passed a HookRunner down before.
-  // Workspace hooks load only behind the workspace-config trust opt-in.
-  const hookRunner = new HookRunner();
-  {
-    const hookLoad = loadShellHookConfigSync({
-      allowWorkspace: process.env.XERXES_ALLOW_WORKSPACE_CONFIG === "1"
-        || /^true|yes|on$/i.test(process.env.XERXES_ALLOW_WORKSPACE_CONFIG ?? ""),
-      home: xerxesHome(),
-      workspaceRoot,
-    });
-    for (const error of hookLoad.errors) console.error(`hooks: ${error}`);
-    registerShellHooks(hookRunner, hookLoad.hooks, { cwd: workspaceRoot });
-  }
+  const lspManager = loadConfiguredLsp(xerxesHome());
+  const lspSettingsStore = new LspSettingsStore(join(xerxesHome(), "lsp.json"));
+  const hooksForWorkspace = workspaceShellHooks({
+    home: xerxesHome(),
+    allowWorkspace: process.env.XERXES_ALLOW_WORKSPACE_CONFIG === "1"
+      || /^(true|yes|on)$/i.test(process.env.XERXES_ALLOW_WORKSPACE_CONFIG ?? ""),
+    reportError: error => console.error(`hooks: ${error}`),
+  });
   const home = xerxesHome();
   const transcriptStore = new DaemonTranscriptStore({
     currentProjectDirectory: workspaceRoot,
@@ -1656,6 +1718,7 @@ function daemonRuntime(
   const ptySessions = new PtySessionManager({
     ...(host.terminals === undefined ? {} : { terminals: host.terminals }),
     workspaceRoot,
+    activeWorkspaceRoot: () => getActiveSession<{ cwd: string }>()?.cwd,
   });
   // Both process-owning managers share the daemon teardown contract; the
   // runtime accepts one lifecycle object, so compose them here.
@@ -1705,12 +1768,22 @@ function daemonRuntime(
       ...config.runtime,
       ...settings,
     });
+    if (host.monitors) registerMonitorTools(tools, host.monitors);
+    const mcpTools = host.mcpManager ? registerMcpTools(tools, host.mcpManager) : [];
+    registerConfiguredLspTool(tools, lspManager, () => getActiveSession<{ cwd: string }>()?.cwd ?? workspaceRoot);
+    if (host.schedules) registerScheduleTools(tools, host.schedules);
     registerCoreTools(tools, {
+      ...(host.modelInventory ? { modelInventory: host.modelInventory } : {}),
       workspaceRoot,
+      activeWorkspaceRoot: () => getActiveSession<{ cwd: string }>()?.cwd,
       backgroundCommands,
       ptySessions,
       generateImageTool: generateImageToolOptions(workspaceRoot),
       ...(host.terminals === undefined ? {} : { terminals: host.terminals }),
+      ...(host.monitors ? { completionWatch: (owner: string, terminalId: string) => host.monitors!.start(owner, {
+        terminalId, trigger: "completion", durationMs: 86_400_000, maxEvents: 1,
+        reaction: { maxReactions: 1, maxDurationMs: 60_000 },
+      }) } : {}),
       ...(computerUseTool === undefined ? {} : { computerUseTool }),
       agentMemoryTools: {
         resolveMemory: (context) => {
@@ -1752,6 +1825,14 @@ function daemonRuntime(
         typeof context.metadata.goal_turn_round === "number"
           ? context.metadata.goal_turn_round
           : undefined,
+      evidenceExecution: (context, toolCallId) => findGoalEvidenceExecution(runtime?.listSessions().find(session => session.id === context.sessionId)?.toolExecutions ?? [], toolCallId),
+      goalCreated: (context, goal) => host.goalTokenLedger?.initialize(String(context.sessionId ?? ''), goal.id, true),
+      tokenUsage: (context, goal) => host.goalTokenLedger?.inspect(String(context.sessionId ?? ''), goal.id) ?? null,
+      validateResume: (context, goal) => {
+        if (goal.maxTotalTokens === undefined) return;
+        if (!host.goalTokenLedger || !host.goalTokenOwner) throw new Error('Goal token ledger is unavailable');
+        host.goalTokenLedger.assertAdmission(String(context.sessionId ?? ''), goal.id, host.goalTokenOwner, goal.maxTotalTokens);
+      },
     });
     registerInteractionModeTool(tools, {
       async setMode({ context, mode }) {
@@ -1777,11 +1858,14 @@ function daemonRuntime(
       },
     });
     const agentDefinitions = loadAgentDefinitions({ cwd: workspaceRoot });
+    addMcpToolsToBuiltinAgents(agentDefinitions, mcpTools);
+    addLspToolToBuiltinAgents(agentDefinitions, lspManager);
+    if (host.modelInventory) addModelInventoryToBuiltinAgents(agentDefinitions);
     const llm = createLlmClient(connection.model, {
       ...(connection.apiKey ? { api_key: connection.apiKey } : {}),
       ...(connection.baseUrl ? { base_url: connection.baseUrl } : {}),
       ...(connection.provider ? { provider: connection.provider } : {}),
-      ...(connection.responsesApi ? { responsesApi: true } : {}),
+      ...(connection.responsesApi ? { responses_api: true } : {}),
     });
     // Fallback model chain (Claude Code fallback-model parity): configured via
     // XERXES_FALLBACK_MODEL or runtime.fallback_model; the fallback client
@@ -1791,6 +1875,24 @@ function daemonRuntime(
       || (typeof fallbackSetting === "string" ? fallbackSetting.trim() : "")
       || undefined;
     const subagentOptions = {
+      resolveSourceWorkspace: (sourceId: string): string => {
+        const session = runtime?.listSessions().find(candidate => candidate.id === sourceId);
+        if (!session) throw new Error('Subagent source session is unavailable; reopen the parent chat');
+        return session.cwd;
+      },
+      restoreModelCallScopes: (snapshot: SpawnedAgentSnapshot) =>
+        restoreRecoveredModelCallScopes(snapshot.modelCallBindings, snapshot.sourceAgentId, {
+          readSession: (id) => runtime?.listSessions().find(session => session.id === id),
+          ledger: host.goalTokenLedger,
+          ownerId: host.goalTokenOwner,
+        }),
+      worktreeForWorkspace: nativeSubagentWorktrees,
+      validateInheritedSelection: inheritedSelectionValidator(connection),
+      ...(host.validateProviderSelection ? { validateProviderSelection: host.validateProviderSelection } : {}),
+      resolveProviderProfile: agentProviderResolver(profileStore),
+      resolveProviderRoute: agentProviderRouteResolver(profileStore),
+      inheritedProviderRoute: providerRouteIdentity(connection.model, connection),
+      ...(host.runHistory ? { runHistory: host.runHistory } : {}),
       agentDefinitions,
       contextLimit: (model: string) => resolvedProfileContextLimit(profileStore.active(), model),
       cwd: workspaceRoot,
@@ -1825,6 +1927,7 @@ function daemonRuntime(
       subagentHost = createNativeSubagentHost(subagentOptions);
     }
     registerClaudeAgentTools(tools, {
+      intelligence: new AgentSettingsStore(join(xerxesHome(), "daemon", "agent-settings.sqlite")).read().settings ?? parseAgentIntelligenceConfig(config.runtime.agent_intelligence),
       backgroundAgents: subagentHost.turnCoordinator,
       manager: subagentHost.managerPort,
     });
@@ -1872,14 +1975,14 @@ function daemonRuntime(
           ...(runnerTools === undefined ? {} : { tools: runnerTools }),
         }).then((result) => result.systemPrompt),
       llm,
-      hookRunner,
+      hookRunnerForSession: session => hooksForWorkspace(session.cwd),
       ...(fallbackModel === undefined ? {} : {
         fallbackModel,
         createLlmForModel: (candidate: string) => createLlmClient(candidate, {
           ...(connection.apiKey ? { api_key: connection.apiKey } : {}),
           ...(connection.baseUrl ? { base_url: connection.baseUrl } : {}),
           ...(connection.provider ? { provider: connection.provider } : {}),
-          ...(connection.responsesApi ? { responsesApi: true } : {}),
+          ...(connection.responsesApi ? { responses_api: true } : {}),
         }),
       }),
       ...(maxTokens === undefined ? {} : { maxTokens }),
@@ -1914,12 +2017,14 @@ function daemonRuntime(
       // The daemon is the one host where a per-edit typecheck earns its cost:
       // it turns "the change compiles" from a claim into a reported fact.
       editDiagnostics: process.env.XERXES_EDIT_DIAGNOSTICS?.trim() !== "0",
+      createEditFeedback: cwd => new EditFeedback(cwd, undefined, lspManager.configured ? lspManager.forWorkspace(cwd) : undefined),
       ...(auditEmitter ? { auditEmitter } : {}),
       // Compaction as a mid-turn recovery, not only a between-turn chore: the
       // loop can retry an overflowed round once, but only if something is
       // willing to shrink the history for it.
       reduceContext: async (messages) => {
         // PreCompact hook before any message is dropped (Claude Code parity).
+        const hookRunner = hooksForWorkspace(getActiveSession<{ cwd: string }>()?.cwd ?? workspaceRoot);
         if (hookRunner.hasHooks("on_compact")) {
           await hookRunner.run("on_compact", {
             message_count: messages.length,
@@ -1955,6 +2060,10 @@ function daemonRuntime(
     });
   };
   runtime = new InMemoryDaemonRuntime(undefined, {
+    lspSettings: () => lspSettingsView(lspSettingsStore.read()),
+    saveLspSettings: (request, signal) => saveLspSettings(lspManager, lspSettingsStore, request, signal),
+    lspHealth: cwd => lspManager.health(cwd),
+    releaseLsp: (cwd, name) => lspManager.release(cwd, name),
     ...(host.buildId ? { buildId: host.buildId } : {}),
     currentProjectDirectory: workspaceRoot,
     runtimeSettings: initialSettings,
@@ -1971,15 +2080,17 @@ function daemonRuntime(
     }),
     backgroundCommands: processLifecycle,
     shutdown: async () => {
+      host.monitors?.close();
       // Children first: their final events still belong in this session's
       // audit log, so the audit sink is only closed after they settle.
-      await subagentHost?.manager.shutdown();
-      // Durability barrier for queued audit records: holds process shutdown
-      // (daemon stop, SIGINT/SIGTERM finish, resumed one-shot finally) until
-      // every buffered record reached the JSONL sink.
-      await auditEmitter?.close();
+      try { await subagentHost?.manager.shutdown(); }
+      finally {
+        try { await lspManager.close(); }
+        finally { await auditEmitter?.close(); }
+      }
     },
     onSessionEvict: sessionId => {
+      host.monitors?.disposeOwner(sessionId);
       subagentHost?.cancelSource(sessionId);
       memoryToolContext.prune(sessionId);
     },
@@ -1997,7 +2108,7 @@ function daemonRuntime(
     // (`subagent.retry` RPC, `/agents retry`, agents-panel `r` key). The host
     // continues the persisted conversation when one survives; without an
     // active provider connection there is no runner to resume with.
-    subagentRetry: async ({ task, message }) => {
+    subagentRetry: async (request) => {
       const host = subagentHost;
       if (!host) {
         return {
@@ -2007,7 +2118,8 @@ function daemonRuntime(
         };
       }
       try {
-        const snapshot = await host.retry(task, message ? { message } : {});
+        const owned = resolveSubagentRetryRequest(request, key => runtime?.sessionStatus(key));
+        const snapshot = await host.retry(owned.task, owned.options);
         return { ok: true, agent: subagentRetryWirePayload(snapshot) };
       } catch (error) {
         return { ok: false, error: errorMessage(error) };
@@ -2020,7 +2132,7 @@ function daemonRuntime(
     // spawned with. Children are reclaimed only when their owning session
     // is evicted (above) or the daemon shuts down.
     turnRunnerFactory: runnerFactory,
-    hookRunner,
+    hookRunnerForSession: session => hooksForWorkspace(session.cwd),
     ...(interactions ? { interactions } : {}),
   });
   return runtime;
@@ -2117,13 +2229,21 @@ async function acpServer(
     );
   }
   const workspaceRoot = projectDirectory ?? config.projectDirectory;
+  const mcpManager = new MCPManager();
+  const lspManager = loadConfiguredLsp(xerxesHome());
+  try {
+  await startConfiguredMcpServers(mcpManager, mcpHostOptions(workspaceRoot));
   const tools = new ToolRegistry();
+  const mcpTools = registerMcpTools(tools, mcpManager);
+  registerConfiguredLspTool(tools, lspManager, () => getActiveSession<{ cwd: string }>()?.cwd ?? workspaceRoot);
   const skillRegistry = new SkillRegistry({ workspaceTrust: trustedHashWorkspaceSkills() });
   await skillRegistry.refresh(...defaultSkillDiscoveryRoots({ cwd: workspaceRoot }));
   const memoryToolContext = memoryToolContextResolver();
   const acpComputerUseTool = createMacOSComputerUseToolOptions(config.runtime);
   registerCoreTools(tools, {
+    modelInventory: profileInventoryHost(profileStore, new AgentSettingsStore(join(xerxesHome(), 'daemon', 'agent-settings.sqlite'))),
     workspaceRoot,
+    activeWorkspaceRoot: () => getActiveSession<{ cwd: string }>()?.cwd,
     generateImageTool: generateImageToolOptions(workspaceRoot),
     ...(acpComputerUseTool === undefined ? {} : { computerUseTool: acpComputerUseTool }),
     agentMemoryTools: {
@@ -2137,6 +2257,9 @@ async function acpServer(
   registerAgentPresetTools(tools, new AgentPresetRoster({ projectDirectory: workspaceRoot }));
   registerClaudeSkillTool(tools, skillRegistry);
   const definitions = loadAgentDefinitions({ cwd: workspaceRoot });
+  addMcpToolsToBuiltinAgents(definitions, mcpTools);
+  addLspToolToBuiltinAgents(definitions, lspManager);
+  addModelInventoryToBuiltinAgents(definitions);
   const agent = definitions.get("default");
   const agentId = agent?.name ?? "default";
   const selfMemory = getAgentSelfMemory(agentId);
@@ -2149,9 +2272,15 @@ async function acpServer(
     ...(connection.apiKey ? { api_key: connection.apiKey } : {}),
     ...(connection.baseUrl ? { base_url: connection.baseUrl } : {}),
     ...(connection.provider ? { provider: connection.provider } : {}),
-    ...(connection.responsesApi ? { responsesApi: true } : {}),
+    ...(connection.responsesApi ? { responses_api: true } : {}),
   });
   const subagentHost = createNativeSubagentHost({
+    worktreeForWorkspace: nativeSubagentWorktrees,
+    resolveProviderProfile: agentProviderResolver(profileStore),
+    resolveProviderRoute: agentProviderRouteResolver(profileStore),
+    inheritedProviderRoute: providerRouteIdentity(connection.model, connection),
+    validateProviderSelection: profileSelectionValidator(profileStore),
+    validateInheritedSelection: inheritedSelectionValidator(connection),
     agentDefinitions: definitions,
     contextLimit: candidate => resolvedProfileContextLimit(profileStore.active(), candidate),
     cwd: workspaceRoot,
@@ -2171,6 +2300,7 @@ async function acpServer(
     ...(connection.topP === undefined ? {} : { topP: connection.topP }),
   });
   registerClaudeAgentTools(tools, {
+    intelligence: new AgentSettingsStore(join(xerxesHome(), "daemon", "agent-settings.sqlite")).read().settings ?? parseAgentIntelligenceConfig(config.runtime.agent_intelligence),
     backgroundAgents: subagentHost.turnCoordinator,
     manager: subagentHost.managerPort,
   });
@@ -2188,6 +2318,7 @@ async function acpServer(
     await selfMemory.systemPromptAddendum(),
   );
   const runner = new AcpAgentRunner({
+    ...(process.env.XERXES_EDIT_DIAGNOSTICS?.trim() === "0" ? {} : { createEditFeedback: (cwd: string) => new EditFeedback(cwd, undefined, lspManager.configured ? lspManager.forWorkspace(cwd) : undefined) }),
     llm,
     model,
     agentId,
@@ -2205,8 +2336,15 @@ async function acpServer(
   });
   return {
     server: new AcpServer({ runner, onSessionClose: sessionId => subagentHost.cancelSource(sessionId) }),
-    shutdown: () => subagentHost.manager.shutdown(),
+    shutdown: async () => {
+      try { await subagentHost.manager.shutdown(); }
+      finally { try { await lspManager.close(); } finally { await mcpManager.disconnectAll(); } }
+    },
   };
+  } catch (error) {
+    try { await lspManager.close(); } finally { await mcpManager.disconnectAll(); }
+    throw error;
+  }
 }
 
 async function runAcp(args: readonly string[]): Promise<void> {
@@ -2275,14 +2413,22 @@ async function runOneShot(
     );
   }
   const workspaceRoot = config.projectDirectory;
+  const mcpManager = new MCPManager();
+  const lspManager = loadConfiguredLsp(xerxesHome());
+  try {
+  await startConfiguredMcpServers(mcpManager, mcpHostOptions(workspaceRoot));
   const tools = new ToolRegistry();
+  const mcpTools = registerMcpTools(tools, mcpManager);
+  registerConfiguredLspTool(tools, lspManager, () => getActiveSession<{ cwd: string }>()?.cwd ?? workspaceRoot);
   const skillRegistry = new SkillRegistry({ workspaceTrust: trustedHashWorkspaceSkills() });
   await skillRegistry.refresh(...defaultSkillDiscoveryRoots({ cwd: workspaceRoot }));
   const memoryToolContext = memoryToolContextResolver();
   const agentMemory = new AgentMemory({ projectRoot: workspaceRoot });
   const computerUseTool = createMacOSComputerUseToolOptions(config.runtime);
   registerCoreTools(tools, {
+    modelInventory: profileInventoryHost(profileStore, new AgentSettingsStore(join(xerxesHome(), 'daemon', 'agent-settings.sqlite'))),
     workspaceRoot,
+    activeWorkspaceRoot: () => getActiveSession<{ cwd: string }>()?.cwd,
     generateImageTool: generateImageToolOptions(workspaceRoot),
     ...(computerUseTool === undefined ? {} : { computerUseTool }),
     agentMemoryTools: {
@@ -2296,6 +2442,9 @@ async function runOneShot(
   registerAgentPresetTools(tools, new AgentPresetRoster({ projectDirectory: workspaceRoot }));
   registerClaudeSkillTool(tools, skillRegistry);
   const definitions = loadAgentDefinitions({ cwd: workspaceRoot });
+  addMcpToolsToBuiltinAgents(definitions, mcpTools);
+  addLspToolToBuiltinAgents(definitions, lspManager);
+  addModelInventoryToBuiltinAgents(definitions);
   // An explicit --agent reference swaps the session's persona, tool surface,
   // and model for the named catalog entry or the referenced YAML/Markdown file;
   // without one the catalog's "default" agent keeps its historical role.
@@ -2316,9 +2465,15 @@ async function runOneShot(
     ...(connection.apiKey ? { api_key: connection.apiKey } : {}),
     ...(connection.baseUrl ? { base_url: connection.baseUrl } : {}),
     ...(connection.provider ? { provider: connection.provider } : {}),
-    ...(connection.responsesApi ? { responsesApi: true } : {}),
+    ...(connection.responsesApi ? { responses_api: true } : {}),
   });
   const subagentHost = createNativeSubagentHost({
+    worktreeForWorkspace: nativeSubagentWorktrees,
+    resolveProviderProfile: agentProviderResolver(profileStore),
+    resolveProviderRoute: agentProviderRouteResolver(profileStore),
+    inheritedProviderRoute: providerRouteIdentity(connection.model, connection),
+    validateProviderSelection: profileSelectionValidator(profileStore),
+    validateInheritedSelection: inheritedSelectionValidator(connection),
     agentDefinitions: definitions,
     contextLimit: candidate => resolvedProfileContextLimit(profileStore.active(), candidate),
     cwd: workspaceRoot,
@@ -2338,6 +2493,7 @@ async function runOneShot(
     ...(connection.topP === undefined ? {} : { topP: connection.topP }),
   });
   registerClaudeAgentTools(tools, {
+    intelligence: new AgentSettingsStore(join(xerxesHome(), "daemon", "agent-settings.sqlite")).read().settings ?? parseAgentIntelligenceConfig(config.runtime.agent_intelligence),
     backgroundAgents: subagentHost.turnCoordinator,
     manager: subagentHost.managerPort,
   });
@@ -2355,6 +2511,7 @@ async function runOneShot(
     await agentMemory.toPromptSection(),
     await selfMemory.systemPromptAddendum(),
   );
+  const feedback = process.env.XERXES_EDIT_DIAGNOSTICS?.trim() === "0" ? undefined : new EditFeedback(workspaceRoot, undefined, lspManager.configured ? lspManager.forWorkspace(workspaceRoot) : undefined);
   const sessionId = `oneshot-${crypto.randomUUID()}`;
   const state = createAgentState();
   const subagentCohort = subagentHost.turnCoordinator.begin(sessionId);
@@ -2398,7 +2555,7 @@ async function runOneShot(
           pendingAgentEventSnapshots = [];
         },
         llm,
-        toolExecutor: tools,
+        toolExecutor: feedback ? feedback.wrap(tools) : tools,
       },
     )) {
       if (event.type === "text") {
@@ -2426,6 +2583,13 @@ async function runOneShot(
     subagentCohort.close();
     await subagentHost.manager.shutdown();
   }
+  const diagnosticReport = await feedback?.report();
+  if (diagnosticReport) {
+    const text = "\n\n" + diagnosticReport;
+    if (outputFormat === "json") bufferedText += text;
+    else if (outputFormat === "stream-json") writeStreamJson({ type: "text", text });
+    else { process.stdout.write(text); wroteText = true; }
+  }
   if (outputFormat === "json") {
     writeStreamJson({
       is_error: terminalProviderError !== undefined,
@@ -2450,6 +2614,9 @@ async function runOneShot(
   // A terminal provider failure still yields a text event, so scripts and CI
   // must learn about it through the exit code rather than stdout alone.
   if (terminalProviderError !== undefined) process.exitCode = 1;
+  } finally {
+    try { await lspManager.close(); } finally { await mcpManager.disconnectAll(); }
+  }
 }
 
 /**
@@ -2465,6 +2632,9 @@ async function runResumedOneShot(
 ): Promise<void> {
   const projectDirectory = resolve(process.cwd());
   const config = loadSystemDaemonConfig({ projectDirectory });
+  const mcpManager = new MCPManager();
+  try {
+  await startConfiguredMcpServers(mcpManager, mcpHostOptions(projectDirectory));
   const runtime = daemonRuntime(
     config,
     projectDirectory,
@@ -2472,6 +2642,7 @@ async function runResumedOneShot(
     undefined,
     undefined,
     {
+      mcpManager,
       declarativeForge: new DeclarativeToolForge(),
       agentPresetRoster: new AgentPresetRoster({ projectDirectory }),
     },
@@ -2511,6 +2682,9 @@ async function runResumedOneShot(
   // Turn failures surface as error-level notification events only; without a
   // failing exit code a broken resumed run looks successful to scripts.
   if (turnFailed) process.exitCode = 1;
+  } finally {
+    await mcpManager.disconnectAll();
+  }
 }
 
 function agentToolDefinitions(

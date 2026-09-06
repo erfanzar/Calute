@@ -571,10 +571,11 @@ export interface CodexModel {
  *
  * The backend gates the catalog on this: an omitted value is a 400, and a
  * value it considers too old can return a reduced list. It is intentionally a
- * plain constant rather than Xerxes' own version, which the backend has never
- * heard of.
+ * plain constant rather than Xerxes' own version. Match Hermes' discovery
+ * version: 0.144.4 omits GPT-6 Astra even for an entitled account, while 1.0.0
+ * returns it with the same credentials.
  */
-export const CODEX_CLIENT_VERSION = '0.144.4'
+export const CODEX_CLIENT_VERSION = '1.0.0'
 
 export interface CodexModelCatalogOptions {
   readonly baseUrl?: string

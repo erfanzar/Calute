@@ -6,6 +6,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { RunHistory } from '../src/runtime/runHistory.js'
 import { TerminalRegistry } from '../src/runtime/terminalRegistry.js'
 import { BackgroundCommandManager } from '../src/tools/backgroundCommands.js'
 import { WorkspacePathResolver } from '../src/tools/pathSafety.js'
@@ -135,4 +136,122 @@ test('writing to a terminal that has no input channel fails with the reason', as
 
   await expect(terminals.write(OWNER, 'no-stdin', 'hi')).rejects.toThrow(/does not accept input/)
   await expect(terminals.write(OWNER, 'nope', 'hi')).rejects.toThrow(/unknown terminal/)
+})
+
+test('terminal run history preserves output without consuming the live mirror and restores F8 inspection', async () => {
+  const { RunHistory } = await import('../src/runtime/runHistory.js')
+  await inTemporaryWorkspace(async root => {
+    const path = join(root, 'runs.sqlite')
+    const history = new RunHistory(path)
+    try {
+      const terminals = new TerminalRegistry({ runHistory: history, mirrorCapacity: 64 })
+      const handle = terminals.open({ id: 'build', kind: 'background', command: 'bun test', cwd: root, ownerSessionId: OWNER })
+      handle.append('old'.repeat(30) + 'final output')
+      await Bun.sleep(300)
+      const active = history.list(OWNER)[0]!
+      expect(active.state).toBe('running')
+      expect(active.output).toContain('final output')
+      expect(terminals.inspect(OWNER, 'build')?.output).toContain('final output')
+      handle.close(1)
+      expect(history.inspect(OWNER, active.id)).toMatchObject({ state: 'failed', unread: true, outputTruncated: true })
+      handle.close(0)
+      expect(history.inspect(OWNER, active.id)?.state).toBe('failed')
+      const reopened = new TerminalRegistry({ runHistory: history })
+      const archived = reopened.list(OWNER)[0]!
+      expect(archived.canKill).toBe(false)
+      expect(reopened.inspect(OWNER, archived.id)?.output).toContain('final output')
+      expect(reopened.inspect('another-owner', archived.id)).toBeUndefined()
+      await expect(reopened.kill(OWNER, archived.id)).rejects.toThrow('unknown terminal')
+      const foreground = terminals.open({ id: 'quick', kind: 'foreground', command: 'pwd', cwd: root, ownerSessionId: OWNER })
+      foreground.close(0)
+      expect(history.list(OWNER, { unreadOnly: true })).toHaveLength(1)
+    } finally { history.close() }
+  })
+})
+
+test('independent output cursors survive archive/reopen and report durable retention gaps', async () => {
+  await inTemporaryWorkspace(async root => {
+    const path = join(root, 'runs.sqlite')
+    const history = new RunHistory(path)
+    const terminals = new TerminalRegistry({ runHistory: history })
+    const terminal = terminals.open({ ownerSessionId: OWNER, id: 'process', cwd: root, kind: 'background', command: 'test' })
+    terminal.append('a'.repeat(70_000))
+    const first = terminals.readOutput(OWNER, 'process', undefined, 10)
+    expect(first.text).toBe('a'.repeat(10))
+    expect(terminals.readOutput(OWNER, 'process', undefined, 10)).toEqual(first)
+    expect(terminals.readOutput(OWNER, 'process', first.cursor, 10).cursor.offset).toBe(20)
+    expect(() => terminals.readOutput('another', 'process', first.cursor)).toThrow('Unknown terminal')
+    terminal.close(0)
+    const runId = history.list(OWNER)[0]!.id
+    expect(first.cursor.streamId).toBe(runId)
+    history.close()
+    const reopened = new RunHistory(path)
+    try {
+      const restored = new TerminalRegistry({ runHistory: reopened })
+      const page = restored.readOutput(OWNER, `run:${runId}`, first.cursor, 10)
+      expect(page).toMatchObject({ text: 'a'.repeat(10), droppedChars: 5990, hasMore: true, running: false })
+      expect(page.cursor.offset).toBe(6010)
+      expect(() => restored.readOutput('another', `run:${runId}`, first.cursor)).toThrow('Unknown terminal')
+      expect(() => restored.readOutput(OWNER, `run:${runId}`, { streamId: runId, offset: 70001 })).toThrow('Invalid output cursor')
+      const end = restored.readOutput(OWNER, `run:${runId}`, { streamId: runId, offset: 70000 })
+      expect(end).toMatchObject({ text: '', droppedChars: 0, hasMore: false })
+    } finally { reopened.close() }
+  })
+})
+
+test('terminal reuse rejects prior cursors and live overflow exposes the lost character count', () => {
+  const terminals = new TerminalRegistry({ mirrorCapacity: 4 })
+  const options = { ownerSessionId: OWNER, id: 'reused', cwd: '/repo', kind: 'background' as const, command: 'test' }
+  const handle = terminals.open(options)
+  handle.append('abcdef')
+  const page = terminals.readOutput(OWNER, 'reused', undefined, 2)
+  expect(page).toMatchObject({ text: 'cd', droppedChars: 2, hasMore: true })
+  handle.close(0)
+  terminals.open(options)
+  expect(() => terminals.readOutput(OWNER, 'reused', page.cursor)).toThrow('Invalid output cursor')
+  expect(() => terminals.readOutput(OWNER, 'reused', undefined, -1)).toThrow('Invalid output page limit')
+})
+
+test('an acknowledged live cursor survives abrupt owner death before the periodic checkpoint', async () => {
+  await inTemporaryWorkspace(async root => {
+    const path = join(root, 'runs.sqlite')
+    const script = join(root, 'cursor-owner.ts')
+    await Bun.write(script, `
+      import { RunHistory } from ${JSON.stringify(join(import.meta.dir, '../src/runtime/runHistory.ts'))};
+      import { TerminalRegistry } from ${JSON.stringify(join(import.meta.dir, '../src/runtime/terminalRegistry.ts'))};
+      const history = new RunHistory(${JSON.stringify(path)});
+      const terminals = new TerminalRegistry({ runHistory: history });
+      const terminal = terminals.open({ ownerSessionId: 'owner', id: 'process', cwd: ${JSON.stringify(root)}, kind: 'background', command: 'test' });
+      terminal.append('observed output');
+      console.log(JSON.stringify(terminals.readOutput('owner', 'process')));
+      // Block only this disposable fixture to prevent its periodic checkpoint.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);
+    `)
+    const child = Bun.spawn([process.execPath, script], { stdout: 'pipe', stderr: 'pipe', timeout: 6000 })
+    try {
+      const reader = child.stdout.getReader()
+      const chunk = await reader.read()
+      reader.releaseLock()
+      const page = JSON.parse(new TextDecoder().decode(chunk.value))
+      expect(page.text).toBe('observed output')
+      child.kill('SIGKILL')
+      await child.exited
+      const recovered = new RunHistory(path)
+      try {
+        const after = recovered.terminalOutput('owner', page.cursor.streamId, page.cursor)
+        expect(after).toMatchObject({ text: '', running: false, droppedChars: 0 })
+        expect(recovered.inspect('owner', page.cursor.streamId)).toMatchObject({ state: 'interrupted', output: 'observed output' })
+      } finally { recovered.close() }
+    } finally { child.kill('SIGKILL'); await child.exited }
+  })
+})
+
+test('incremental reads fail rather than acknowledge an unpersisted cursor when storage fails', () => {
+  const history = new RunHistory(':memory:')
+  const terminals = new TerminalRegistry({ runHistory: history, onPersistenceError: () => {} })
+  const handle = terminals.open({ ownerSessionId: OWNER, id: 'failed-store', kind: 'background', command: 'test', cwd: '/repo' })
+  handle.append('pending')
+  history.close()
+  expect(() => terminals.readOutput(OWNER, 'failed-store')).toThrow()
+  handle.close(null)
 })

@@ -5,24 +5,79 @@ import { afterEach, expect, test } from 'bun:test'
 
 import { ToolRegistry } from '../src/executors/toolRegistry.js'
 import type { JsonObject } from '../src/types/toolCalls.js'
-import { resetGoalActivations } from '../src/runtime/goalDomain.js'
+import { resetGoalActivations, getGoal, recordGoalEvidence } from '../src/runtime/goalDomain.js'
 import { goalPolicyPrompt, registerGoalTools, type GoalToolHost } from '../src/runtime/goalTools.js'
 import { admitGoalRound } from '../src/runtime/goalDomain.js'
 
 afterEach(() => resetGoalActivations())
 
+test('human tools configure goal wall-time limits and autonomous rounds cannot raise them', async () => {
+  const h = harness()
+  const created = await h.call('create_goal', { objective: 'bounded work', max_duration_ms: 60_000 })
+  expect(created.goal.maxDurationMs).toBe(60_000)
+  expect(created.goal.deadlineAt).toBe(61_000)
+  h.enterRound()
+  await expect(h.call('update_goal', { ...await h.ref(), action: 'edit', max_duration_ms: 120_000 })).rejects.toThrow()
+  h.setTurn({ human: true })
+  const edited = await h.call('update_goal', { ...await h.ref(), action: 'edit', max_duration_ms: 120_000 })
+  expect(edited.goal.deadlineAt).toBe(121_000)
+})
+
+test('goal tools expose token caps and restrict edits to human turns', async () => {
+  const h = harness()
+  const created = await h.call('create_goal', { objective: 'bounded work', max_total_tokens: 1000 })
+  expect(created.goal.maxTotalTokens).toBe(1000)
+  h.enterRound()
+  await expect(h.call('update_goal', { ...await h.ref(), action: 'edit', max_total_tokens: 2000 })).rejects.toThrow()
+  h.setTurn({ human: true })
+  expect((await h.call('update_goal', { ...await h.ref(), action: 'edit', max_total_tokens: 2000 })).goal.maxTotalTokens).toBe(2000)
+})
+
 interface Harness {
   registry: ToolRegistry
   metadata: Record<string, unknown>
   call: (name: string, inputs?: JsonObject) => Promise<any>
-  setTurn: (turn: { human?: boolean; round?: number; evidence?: boolean }) => void
+  setTurn: (turn: { human?: boolean; round?: number | undefined; evidence?: boolean }) => void
   /** The live compare-and-set ref, as the tools require it. */
   ref: () => Promise<{ goal_id: string; revision: number }>
   /** Admit real rounds, then open the turn as the latest one — as production does. */
   enterRound: (count?: number) => void
 }
 
-function harness(options: { blockedAfter?: number } = {}): Harness {
+test('milestones are visible and can advance during the current goal round without changing the objective', async () => {
+  const h = harness()
+  const initial = await h.call('create_goal', { objective: 'ship with evidence', current_milestone: 'Map the runtime',
+    criteria: [{ id: 'verified', description: 'Run the required checks' }] })
+  expect(initial.goal.currentMilestone).toBe('Map the runtime')
+  h.enterRound()
+  const before = await h.ref()
+  const updated = await h.call('update_goal', { ...before, action: 'milestone', current_milestone: 'Verify restart recovery' })
+  expect(updated.goal).toMatchObject({ objective: 'ship with evidence', phase: 'active', roundsStarted: 1,
+    currentMilestone: 'Verify restart recovery', criteria: [{ id: 'verified', description: 'Run the required checks' }] })
+  expect(updated.goal.revision).toBe(before.revision + 1)
+  expect((await h.call('update_goal', { ...before, action: 'milestone', current_milestone: 'stale' })).ok).toBe(false)
+  expect((await h.call('update_goal', { ...await h.ref(), action: 'complete' })).ok).toBe(false)
+  const cleared = await h.call('update_goal', { ...await h.ref(), action: 'milestone', current_milestone: null })
+  expect(cleared.goal.currentMilestone).toBeUndefined()
+})
+
+test('milestone tool updates cannot smuggle objective edits or use background authority', async () => {
+  const h = harness()
+  await h.call('create_goal', { objective: 'keep the requirement' })
+  const before = await h.ref()
+  await expect(h.call('update_goal', { ...before, action: 'milestone', current_milestone: 'next', objective: 'replace it' })).rejects.toThrow()
+  await expect(h.call('update_goal', { ...before, action: 'milestone' })).rejects.toThrow('current_milestone')
+  h.setTurn({ human: false, round: undefined })
+  await expect(h.call('update_goal', { ...before, action: 'milestone', current_milestone: 'unrelated scheduled job' })).rejects.toThrow()
+  h.enterRound()
+  h.setTurn({ round: 99 })
+  await expect(h.call('update_goal', { ...await h.ref(), action: 'milestone', current_milestone: 'stale worker' })).rejects.toThrow()
+  h.setTurn({ human: true, round: undefined })
+  expect((await h.call('update_goal', { ...await h.ref(), action: 'milestone', current_milestone: 'x'.repeat(1001) })).ok).toBe(false)
+  expect((await h.call('get_goal')).goal.currentMilestone).toBeUndefined()
+})
+
+function harness(options: { blockedAfter?: number; executions?: readonly unknown[] } = {}): Harness {
   const metadata: Record<string, unknown> = {}
   let turn = { human: true, round: undefined as number | undefined, evidence: true }
   const host: GoalToolHost = {
@@ -30,6 +85,7 @@ function harness(options: { blockedAfter?: number } = {}): Harness {
     metadata: () => metadata,
     isHumanTurn: () => turn.human,
     currentRound: () => turn.round,
+    evidenceExecution: (_context, id) => options.executions?.find(record => !!record && typeof record === 'object' && (record as Record<string, unknown>).toolCallId === id),
     now: () => 1_000,
   }
   const registry = new ToolRegistry()
@@ -102,7 +158,42 @@ test('creating, editing, pausing and resuming require a direct human turn', asyn
   await expect(h.call('create_goal', { objective: 'a second goal' })).rejects.toThrow('requires a direct human turn')
 })
 
-test('completion is not gated on mechanically detected evidence', async () => {
+test('declared criteria need host-resolved successful evidence without a command whitelist', async () => {
+  const executions = [
+    { toolCallId: 'cmp', name: 'ExecCommand', permitted: true, result: '{"exit_code":0}' },
+    { toolCallId: 'failed', name: 'ExecCommand', permitted: true, result: '{"exit_code":1}' },
+    { toolCallId: 'pending', name: 'ExecCommand', permitted: true, result: '{"session_id":123,"exit_code":null}' },
+    { toolCallId: 'denied', name: 'ReadFile', permitted: false, result: 'denied' },
+  ]
+  const h = harness({ executions })
+  await h.call('create_goal', { objective: 'ship', criteria: [{ id: 'matches', description: 'Output matches the expected artifact' }] })
+  expect((await h.call('update_goal', { ...(await h.ref()), action: 'complete' })).ok).toBe(false)
+  for (const id of ['missing', 'failed', 'pending', 'denied']) {
+    const before = await h.ref()
+    expect((await h.call('update_goal', { ...before, action: 'record_evidence', criterion_id: 'matches', tool_call_id: id, evidence_summary: 'These match' })).ok).toBe(false)
+    expect(await h.ref()).toEqual(before)
+  }
+  const recorded = await h.call('update_goal', { ...(await h.ref()), action: 'record_evidence', criterion_id: 'matches', tool_call_id: 'cmp', evidence_summary: 'cmp returned zero for the two artifacts' })
+  expect(recorded.goal.criteria[0].evidence.toolCallId).toBe('cmp')
+  expect((await h.call('update_goal', { ...(await h.ref()), action: 'complete' })).goal.phase).toBe('complete')
+})
+
+test('model tools can read a human decision but cannot create one', async () => {
+  const h = harness()
+  await h.call('create_goal', { objective: 'ship', criteria: [{ id: 'visual', description: 'User accepts the layout' }] })
+  const before = await h.ref()
+  await expect(h.call('update_goal', { ...before, action: 'user-decision', criterion_id: 'visual',
+    evidence_summary: 'The user accepted it' })).rejects.toThrow()
+  expect(await h.ref()).toEqual(before)
+  const goal = getGoal(h.metadata, 'session-1')!
+  recordGoalEvidence(h.metadata, 'session-1', goal, 'visual', {
+    kind: 'user-decision', decisionId: 'trusted-host-decision', summary: 'I accept the layout.', recordedAt: 1000,
+  }, 1000)
+  expect((await h.call('get_goal')).goal.criteria[0].evidence).toMatchObject({ kind: 'user-decision', decisionId: 'trusted-host-decision' })
+  expect((await h.call('update_goal', { ...await h.ref(), action: 'complete' })).goal.phase).toBe('complete')
+})
+
+test('legacy goals without declared criteria are not gated on mechanically detected evidence', async () => {
   const h = harness()
   await h.call('create_goal', { objective: 'ship' })
   h.enterRound(5)

@@ -34,10 +34,8 @@ describe('native OpenTUI semantic parity', () => {
     expect(shouldShowStartupWelcome({ ...idle, transcriptEmpty: false })).toBe(false)
   })
 
-  it('uses the full session width minus gutters at every terminal size', () => {
-    // Responsive by design: no desktop cap. The measure is the session width
-    // (sidebar already subtracted by useMainApp) minus a 2-column gutter per
-    // side, so a 220-column terminal reads at 216 and an 80-column one at 76.
+  it('fills the conversation pane while preserving narrow-terminal gutters', () => {
+    // Match the welcome, transcript, and composer at every width.
     expect(contentColumnWidth(40)).toBe(36)
     expect(contentColumnWidth(80)).toBe(76)
     expect(contentColumnWidth(160)).toBe(156)
@@ -74,7 +72,7 @@ describe('native OpenTUI semantic parity', () => {
       {
         role: 'assistant',
         text: 'The flow starts in auth.ts.',
-        tools: ['Read File("{\"path\":\"src/auth.ts\"}") ✓', 'Grep Tool("{\"pattern\":\"token\"}") ✓']
+        tools: ['Read File("src/auth.ts") ✓', 'Grep Tool("token") ✓']
       },
       { role: 'system', text: 'resumed session' }
     ])
@@ -166,7 +164,7 @@ describe('transcript reading measure', () => {
     // The old 104-column desktop cap is gone: at 200 columns the body is the
     // session width minus gutters and the rail gutter.
     expect(transcriptBodyWidth(200, 'assistant', '❯')).toBe(contentColumnWidth(200) - 3)
-    expect(transcriptBodyWidth(200, 'assistant', '❯')).toBeGreaterThan(150)
+    expect(transcriptBodyWidth(200, 'assistant', '❯')).toBe(193)
   })
 
   it('leaves narrow mobile panes uncapped', () => {

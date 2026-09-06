@@ -70,6 +70,7 @@ const DEFAULT_TIMEOUT_MS = 60_000
 const MAX_HOOK_OUTPUT_BYTES = 64 * 1024
 
 export interface ShellHookConfigLoad {
+  readonly sources: readonly string[]
   readonly errors: readonly string[]
   readonly hooks: ShellHookMap
 }
@@ -92,6 +93,7 @@ export async function loadShellHookConfig(options: {
   readonly workspaceRoot?: string
 }): Promise<ShellHookConfigLoad> {
   const errors: string[] = []
+  const sources: string[] = []
   let merged: ShellHookMap = {}
 
   const readHooksSection = async (paths: readonly string[], origin: string): Promise<ShellHookMap> => {
@@ -102,6 +104,7 @@ export async function loadShellHookConfig(options: {
       } catch {
         continue
       }
+      sources.push(path)
       let document: unknown
       try {
         document = path.endsWith('.json') ? JSON.parse(text) : Bun.YAML.parse(text)
@@ -135,7 +138,7 @@ export async function loadShellHookConfig(options: {
     merged = mergeShellHookMaps(merged, workspace)
   }
 
-  return { errors: Object.freeze(errors), hooks: merged }
+  return { errors: Object.freeze(errors), sources: Object.freeze(sources), hooks: merged }
 }
 
 /** Synchronous variant for daemon startup, which boots synchronously. */
@@ -145,6 +148,7 @@ export function loadShellHookConfigSync(options: {
   readonly workspaceRoot?: string
 }): ShellHookConfigLoad {
   const errors: string[] = []
+  const sources: string[] = []
   let merged: ShellHookMap = {}
 
   const readHooksSection = (paths: readonly string[], origin: string): ShellHookMap => {
@@ -155,6 +159,7 @@ export function loadShellHookConfigSync(options: {
       } catch {
         continue
       }
+      sources.push(path)
       let document: unknown
       try {
         document = path.endsWith('.json') ? JSON.parse(text) : Bun.YAML.parse(text)
@@ -184,7 +189,7 @@ export function loadShellHookConfigSync(options: {
       readHooksSection(['xerxes.yaml', 'xerxes.yml', 'xerxes.json'].map(name => `${options.workspaceRoot}/${name}`), 'workspace config'),
     )
   }
-  return { errors: Object.freeze(errors), hooks: merged }
+  return { errors: Object.freeze(errors), sources: Object.freeze(sources), hooks: merged }
 }
 
 function mergeShellHookMaps(base: ShellHookMap, extra: ShellHookMap): ShellHookMap {
@@ -220,7 +225,7 @@ export function parseShellHookConfig(raw: unknown, origin: string): ShellHookMap
   return map
 }
 
-function resolveHookPoint(event: string, origin: string): HookPoint {
+export function resolveHookPoint(event: string, origin: string): HookPoint {
   if ((HOOK_POINTS as readonly string[]).includes(event)) return event as HookPoint
   const alias = EVENT_ALIASES[event]
   if (alias) return alias
@@ -260,6 +265,13 @@ export interface ShellHookRunnerOptions {
   readonly cwd?: string
   /** Injectable spawn for tests; defaults to Bun.spawn against the platform shell. */
   readonly run?: ShellHookExecutor
+}
+
+export class ShellHookExecutionError extends Error {
+  constructor(message: string, readonly kind: 'timeout' | 'exit', readonly exitCode?: number) {
+    super(message)
+    this.name = 'ShellHookExecutionError'
+  }
 }
 
 /** Runs one hook command; returns exit code and captured output. */
@@ -306,7 +318,7 @@ function shellHookCallback(point: HookPoint, spec: ShellHookSpec, execute: Shell
         return { allow: false, reason: stderr.trim() || `denied by hook: ${spec.command}`, source: 'shell_hook' }
       }
       if (code !== 0) {
-        throw new Error(`permission hook '${spec.command}' exited ${code}: ${stderr.trim() || 'no output'}`)
+        throw new ShellHookExecutionError(`permission hook '${spec.command}' exited ${code}: ${stderr.trim() || 'no output'}`, 'exit', code)
       }
       const verdict = parseJson(stdout)
       if (verdict !== undefined && typeof verdict.allow === 'boolean') {
@@ -320,7 +332,7 @@ function shellHookCallback(point: HookPoint, spec: ShellHookSpec, execute: Shell
     }
 
     if (code !== 0) {
-      throw new Error(`hook '${spec.command}' exited ${code}: ${stderr.trim() || 'no output'}`)
+      throw new ShellHookExecutionError(`hook '${spec.command}' exited ${code}: ${stderr.trim() || 'no output'}`, 'exit', code)
     }
     const field = MUTATION_FIELDS[point]
     if (field !== undefined) {
@@ -348,43 +360,68 @@ function parseJson(stdout: string): Record<string, unknown> | undefined {
 
 function defaultShellHookExecutor(cwd?: string): ShellHookExecutor {
   return async (command, input, timeoutMs) => {
-    const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh'
-    const args = process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-c', command]
+    const grouped = process.platform !== 'win32'
+    const shell = grouped ? '/bin/sh' : 'cmd.exe'
+    const args = grouped ? ['-c', command] : ['/d', '/s', '/c', command]
     const proc = Bun.spawn([shell, ...args], {
-      cwd: cwd ?? process.cwd(),
-      stdin: 'pipe',
-      stdout: 'pipe',
-      stderr: 'pipe',
+      cwd: cwd ?? process.cwd(), stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+      ...(grouped ? { detached: true } : {}),
     })
-    proc.stdin.write(input)
-    proc.stdin.end()
-    const killer = setTimeout(() => proc.kill(), timeoutMs)
-    try {
-      const readCapped = async (stream: ReadableStream<Uint8Array>): Promise<string> => {
-        const reader = stream.getReader()
-        const chunks: Uint8Array[] = []
-        let total = 0
+    const readers = [proc.stdout.getReader(), proc.stderr.getReader()]
+    const readCapped = async (reader: ReadableStreamDefaultReader<Uint8Array>): Promise<string> => {
+      const chunks: Uint8Array[] = []
+      let total = 0
+      try {
         for (;;) {
           const { done, value } = await reader.read()
           if (done) break
-          if (value === undefined) continue
           const remaining = MAX_HOOK_OUTPUT_BYTES - total
           if (remaining <= 0) continue
-          chunks.push(value.byteLength > remaining ? value.subarray(0, remaining) : value)
-          total += value.byteLength
+          const chunk = value.subarray(0, remaining)
+          chunks.push(chunk)
+          total += chunk.byteLength
         }
-        return new TextDecoder().decode(
-          chunks.length === 1 ? chunks[0] : Uint8Array.from(chunks.flatMap(chunk => [...chunk])),
-        )
-      }
-      const [stdout, stderr, code] = await Promise.all([
-        readCapped(proc.stdout),
-        readCapped(proc.stderr),
-        proc.exited,
-      ])
-      return { code, stderr, stdout }
-    } finally {
-      clearTimeout(killer)
+        const bytes = new Uint8Array(total)
+        let offset = 0
+        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+        return new TextDecoder().decode(bytes)
+      } finally { reader.releaseLock() }
     }
+    const errors: string[] = []
+    const signal = (name: 'SIGTERM' | 'SIGKILL') => {
+      try {
+        if (grouped) process.kill(-proc.pid, name)
+        else proc.kill(name)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') errors.push(String(error))
+      }
+    }
+    let timedOut = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true
+        signal('SIGTERM')
+        // A shell or descendant may ignore TERM. Bound cleanup as well as execution.
+        setTimeout(() => {
+          signal('SIGKILL')
+          for (const reader of readers) void reader.cancel().catch(() => {})
+          reject(new ShellHookExecutionError(`hook timed out after ${timeoutMs}ms${errors.length ? '; cleanup: ' + errors.join('; ') : ''}`, 'timeout'))
+        }, 200)
+      }, timeoutMs)
+    })
+    try {
+      proc.stdin.write(input)
+      proc.stdin.end()
+      const result = Promise.all([readCapped(readers[0]!), readCapped(readers[1]!), proc.exited])
+        .then(([stdout, stderr, code]) => timedOut ? timeout : { code, stderr, stdout })
+      return await Promise.race([result, timeout])
+    } catch (error) {
+      if (!timedOut) {
+        signal('SIGKILL')
+        for (const reader of readers) void reader.cancel().catch(() => {})
+      }
+      throw error
+    } finally { clearTimeout(timer) }
   }
 }

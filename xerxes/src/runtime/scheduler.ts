@@ -1,7 +1,8 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
-import { appendFile, mkdir, readFile } from 'node:fs/promises'
+import { Database } from 'bun:sqlite'
+import { appendFile, mkdir, readFile, realpath } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import { parseJsonlEventLog, truncateTornTail } from '../core/jsonlEventLog.js'
@@ -41,6 +42,7 @@ export interface ScheduledTrigger {
   readonly schedule: TriggerSchedule
   readonly payload: DurableTaskDefinition
   readonly lastFiredAt?: number
+  readonly migratedTo?: string
 }
 
 export interface SchedulerState {
@@ -82,6 +84,8 @@ export class Scheduler {
   }
 
   async createTrigger(options: CreateTriggerOptions): Promise<ScheduledTrigger> {
+    return this.mutate(async current => {
+    if (current.triggers.get(options.id)?.migratedTo) throw new Error('Trigger has been migrated')
     await this.append({ type: 'trigger_created', trigger: {
       id: options.id,
       owner: options.owner,
@@ -93,18 +97,37 @@ export class Scheduler {
     const trigger = state.triggers.get(options.id)
     if (trigger === undefined) throw new Error('trigger creation failed')
     return trigger
+    })
   }
 
   async disableTrigger(id: string): Promise<void> {
-    await this.append({ type: 'trigger_disabled', id })
+    await this.mutate(async () => this.append({ type: 'trigger_disabled', id }))
   }
 
   async enableTrigger(id: string): Promise<void> {
-    await this.append({ type: 'trigger_enabled', id })
+    await this.mutate(async state => {
+      if (state.triggers.get(id)?.migratedTo) throw new Error('Trigger has been migrated')
+      await this.append({ type: 'trigger_enabled', id })
+    })
   }
 
   async removeTrigger(id: string): Promise<void> {
-    await this.append({ type: 'trigger_removed', id })
+    await this.mutate(async state => {
+      if (state.triggers.get(id)?.migratedTo) throw new Error('Migrated trigger is retained as a recovery record')
+      await this.append({ type: 'trigger_removed', id })
+    })
+  }
+
+  /** Fence the source before transfer. Retrying the same destination is safe. */
+  async migrateTrigger(id: string, destination: string, transfer: (trigger: ScheduledTrigger) => Promise<void>): Promise<void> {
+    if (!destination) throw new Error('Migration destination is required')
+    await this.mutate(async state => {
+      const trigger = state.triggers.get(id)
+      if (!trigger) throw new Error('Unknown trigger')
+      if (trigger.migratedTo && trigger.migratedTo !== destination) throw new Error('Trigger already migrated to another destination')
+      if (!trigger.migratedTo) await this.append({ type: 'trigger_migrated', id, destination })
+      await transfer(trigger)
+    })
   }
 
   /**
@@ -160,9 +183,21 @@ export class Scheduler {
     const current = new Promise<void>(resolve => { release = resolve })
     schedulerWrites.set(this.logPath, current)
     await previous.catch(() => undefined)
+    let lock: Database | undefined
     try {
-      return await operation(await this.load())
+      await mkdir(dirname(this.logPath), { recursive: true })
+      lock = new Database(join(await realpath(dirname(this.logPath)), 'scheduler.writer.sqlite'), { create: true })
+      lock.exec('PRAGMA busy_timeout=0; BEGIN IMMEDIATE')
+      try {
+        const result = await operation(await this.load())
+        lock.exec('COMMIT')
+        return result
+      } catch (error) {
+        lock.exec('ROLLBACK')
+        throw error
+      }
     } finally {
+      lock?.close()
       release()
       if (schedulerWrites.get(this.logPath) === current) schedulerWrites.delete(this.logPath)
     }
@@ -195,7 +230,7 @@ export class Scheduler {
     // Repair a tail torn by an earlier crash before adding to it; appending
     // onto a partial record fuses the two into one malformed middle line.
     await truncateTornTail(this.logPath)
-    await appendFile(this.logPath, JSON.stringify({ ...event, timestamp: this.now() }) + '\n', 'utf8')
+    await appendFile(this.logPath, JSON.stringify({ timestamp: this.now(), ...event }) + '\n', 'utf8')
   }
 
   private async readEvents(): Promise<readonly SchedulerEvent[]> {
@@ -222,13 +257,14 @@ function project(events: readonly SchedulerEvent[], now: () => number): Schedule
   for (const event of events) {
     switch (event.type) {
       case 'trigger_created': {
+        if (triggers.get(event.trigger.id)?.migratedTo) break
         const created: ScheduledTrigger = { ...event.trigger }
         triggers.set(event.trigger.id, created)
         break
       }
       case 'trigger_enabled': {
         const t = triggers.get(event.id)
-        if (t !== undefined) triggers.set(event.id, { ...t, enabled: true })
+        if (t !== undefined && !t.migratedTo) triggers.set(event.id, { ...t, enabled: true })
         break
       }
       case 'trigger_disabled': {
@@ -237,7 +273,12 @@ function project(events: readonly SchedulerEvent[], now: () => number): Schedule
         break
       }
       case 'trigger_removed': {
-        triggers.delete(event.id)
+        if (!triggers.get(event.id)?.migratedTo) triggers.delete(event.id)
+        break
+      }
+      case 'trigger_migrated': {
+        const t = triggers.get(event.id)
+        if (t) triggers.set(event.id, { ...t, enabled: false, migratedTo: event.destination })
         break
       }
       case 'delivery_recorded': {
@@ -261,12 +302,15 @@ type SchedulerEvent =
   | { readonly type: 'trigger_enabled'; readonly id: string }
   | { readonly type: 'trigger_disabled'; readonly id: string }
   | { readonly type: 'trigger_removed'; readonly id: string }
+  | { readonly type: 'trigger_migrated'; readonly id: string; readonly destination: string }
   | { readonly type: 'delivery_recorded'; readonly triggerId: string; readonly deliveryId: string; readonly taskId: string; readonly timestamp: number }
   | { readonly type: 'trigger_fired'; readonly triggerId: string; readonly timestamp: number }
 
 function isSchedulerEvent(value: unknown): value is SchedulerEvent {
   if (!isRecord(value) || typeof value.type !== 'string') return false
   switch (value.type) {
+    case 'trigger_migrated':
+      return typeof value.id === 'string' && typeof value.destination === 'string' && Boolean(value.destination)
     case 'trigger_created':
       return isRecord(value.trigger) && typeof value.trigger.id === 'string'
     case 'trigger_enabled':

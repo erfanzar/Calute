@@ -172,7 +172,7 @@ PY
 
 ## Typical Workflow
 
-1. **Confirm auth.** `curl -s -o /dev/null -w "%{http_code}\n" https://api.airtable.com/v0/meta/bases -H "Authorization: Bearer $AIRTABLE_API_KEY"` — expect `200`.
+1. **Confirm auth.** Request the list-bases endpoint using the authenticated request pattern above and check for HTTP `200`. Keep credentials out of diagnostic output.
 2. **Find the base.** List bases, or ask the user for the `app...` ID directly if the token lacks `schema.bases:read`.
 3. **Inspect the schema.** `GET /v0/meta/bases/$BASE_ID/tables` — note the exact field names and primary-field name before mutating anything.
 4. **Read before you write.** For "update X where Y", `filterByFormula` first to resolve the `rec...` ID, then `PATCH`. Never guess record IDs.

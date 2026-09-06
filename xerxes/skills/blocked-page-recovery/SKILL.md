@@ -77,9 +77,10 @@ rate-limit HTML that looks like success to a size check alone.
 `r.jina.ai` re-renders the live page in a real browser server-side and returns
 markdown. Anonymous access is dead (401 → Turnstile); a key is required:
 
-```bash
-curl -s -H "Authorization: Bearer $JINA_API_KEY" "https://r.jina.ai/{URL}"
-```
+Use an explicitly configured Jina integration that supplies authentication at
+the host boundary. Do not construct a shell command containing the credential.
+If no authenticated integration is available, skip this route and continue
+with the other recovery options.
 
 Handles JS SPAs that archives can't. Skip this route entirely when the env
 var is unset.

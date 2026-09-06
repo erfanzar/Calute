@@ -1,8 +1,9 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 /** @jsxImportSource @opentui/react */
-// Quiet session chrome: mode/title above the transcript and workspace below.
-// Context and model metadata live with the composer, where they are actionable.
+// Compact workspace and session chrome above the transcript.
+// Model, mode, and permission metadata stay with the composer.
+import { useTerminalDimensions } from '@opentui/react'
 import type { SessionTab } from '../app/interfaces.js'
 import type { LiveSessionStatus } from '../gatewayTypes.js'
 import { GLYPH } from '../domain/nocturne.js'
@@ -13,6 +14,7 @@ import { branchLabel, type RepoPulse } from '../lib/repoPulse.js'
 import type { Theme } from '../theme.js'
 
 import { Box, Span, Text } from './primitives.js'
+import { SessionFollowups } from './sessionFollowups.js'
 
 const TAB_STATUS_GLYPH: Record<LiveSessionStatus, string> = {
   // ○ reads as "nothing pending" — the ring is the v2 idle shape. The other
@@ -72,6 +74,7 @@ export function SessionHeader({
   sessionTitle?: null | string
   t: Theme
 }) {
+  const { height } = useTerminalDimensions()
   const title = sessionTitle?.trim()
   const id = sessionId?.trim()
   // A short handle, not the whole id: enough to tell two chats apart at a
@@ -87,7 +90,9 @@ export function SessionHeader({
       flexShrink={0}
       overflow="hidden"
       paddingX={2}
-      paddingY={1}
+      paddingY={0}
+      borderSides={height >= 30 ? ['bottom'] : undefined}
+      borderColor={t.ds.hairline}
       width="100%"
     >
       <Box flexDirection="row" flexShrink={0} gap={2} justifyContent="space-between" overflow="hidden" width="100%">
@@ -128,6 +133,7 @@ export function SessionHeader({
           </Text>
         </Box>
       </Box>
+      <SessionFollowups t={t} sessionId={sessionId} />
       {goal ? (
         <Box flexDirection="row" flexShrink={0} marginTop={1} overflow="hidden" width="100%">
           <Box onClick={() => patchOverlayState({ goal: true })}>
@@ -315,6 +321,7 @@ export function SessionTabStrip({
  * bar, not facts.
  */
 export function WorkspaceFooter({
+  onPanel,
   cwdLabel,
   providerModel,
   pulse,
@@ -322,6 +329,7 @@ export function WorkspaceFooter({
   t
 }: {
   cwdLabel: string
+  onPanel?: (panel: 'agents' | 'diff' | 'terminals' | 'tools' | 'goal') => void
   /** Provider health input; undefined hides the segment (info not loaded yet). */
   providerModel?: string
   /** Working-tree state. Omitted before the first `git` answer lands. */
@@ -329,15 +337,13 @@ export function WorkspaceFooter({
   rightLabel?: string
   t: Theme
 }) {
+  const { width } = useTerminalDimensions()
   const showProvider = providerModel !== undefined
   const modelConfigured = Boolean(providerModel?.trim())
   const branch = pulse ? branchLabel(pulse) : ''
-  // Amber appears here for exactly one reason and nowhere else on the bar:
-  // uncommitted work is unreviewed work, and unreviewed is the same "a human
-  // is required" the agents screen means by it. A clean tree earns the done
-  // green instead, so the bar is never amber when nothing is outstanding.
+  // Working-tree changes are neutral information; amber is reserved for prompts.
   const tree = pulse?.dirty ? `● ${pulse.dirty} dirty` : branch ? '✓ clean' : ''
-  const treeColor = pulse?.dirty ? t.color.warn : t.color.statusGood
+  const treeColor = t.ds.secondary
 
   if (!cwdLabel && !rightLabel && !showProvider) {
     return null
@@ -353,6 +359,7 @@ export function WorkspaceFooter({
       gap={2}
       justifyContent="space-between"
       overflow="hidden"
+      paddingTop={1}
       paddingBottom={1}
       paddingX={2}
       width="100%"
@@ -364,7 +371,7 @@ export function WorkspaceFooter({
       <Box flexDirection="row" flexShrink={0} minWidth={0} overflow="hidden">
         {cwdLabel ? (
           <Text color={t.ds.secondary} wrap="truncate-end">
-            <Span color={t.color.brandGold}>{`${GLYPH.brand} `}</Span>
+            <Span bold color={t.color.brandGold}>{`${GLYPH.brand} XERXES  `}</Span>
             {cwdLabel}
             {branch ? (
               <>
@@ -378,11 +385,13 @@ export function WorkspaceFooter({
       </Box>
       {rightLabel || showProvider ? (
         <Box flexDirection="row" flexShrink={1} gap={1} justifyContent="flex-end" minWidth={0} overflow="hidden">
-          {rightLabel ? (
-            <Text color={t.ds.caption} wrap="truncate-end">
-              {rightLabel}
-            </Text>
-          ) : null}
+          {onPanel && width >= 120 ? (
+            <Box gap={2} flexShrink={0}>
+              {([['agents', 'F6 agents'], ['diff', 'F7 changes'], ['terminals', 'F8 terminal'], ['tools', 'F9 tools'], ['goal', 'F10 goals']] as const).map(([panel, label]) => (
+                <Box key={panel} onClick={() => onPanel(panel)}><Text color={t.ds.caption}>{label}</Text></Box>
+              ))}
+            </Box>
+          ) : rightLabel ? <Text color={t.ds.caption} wrap="truncate-end">{rightLabel}</Text> : null}
           {showProvider ? (
             modelConfigured ? (
               // A green dot vouches that the next ⏎ will actually reach a model.

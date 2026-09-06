@@ -154,8 +154,11 @@ test('the goal subsystem is reachable end to end, not just importable', async ()
   expect(runner).toMatch(/goalPolicy:/)
   expect(assembly).toContain("name: 'goal_policy'")
   expect(server).toMatch(/nextGoalRound\(/)
-  // The round has to be submitted as a turn, not merely computed.
-  expect(server).toMatch(/admitGoalRound\(sessionKey\)[\s\S]{0,900}submitTurn\(/)
+  // The queued admission submits the regenerated round through the tracked
+  // turn path. Socket tests in goalRoundIntegration prove actual execution,
+  // claim persistence, priority and cancellation across this boundary.
+  expect(server).toMatch(/submitTrackedTurn\(sessionKey, round\.prompt, emit, owner/)
+  expect(server).toMatch(/claimGoalWake\(live\.metadata, live\.id, wake\.id/)
   // And a person must be able to see and steer it.
   expect(server).toMatch(/"session\.goal"/)
 })

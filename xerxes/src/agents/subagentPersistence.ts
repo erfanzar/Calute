@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 import type { SpawnedAgentSnapshot } from '../operators/subagents.js'
+import type { ModelCallBinding } from '../llms/callBudget.js'
 
 export const SUBAGENT_SNAPSHOT_METADATA_KEY = 'xerxes_subagent_snapshots_v1'
 export const SUBAGENT_DELIVERY_METADATA_KEY = 'xerxes_subagent_deliveries_v1'
@@ -93,6 +94,12 @@ function archivedSnapshotWire(snapshot: SpawnedAgentSnapshot): Record<string, un
     creator_id: snapshot.creatorAgentId ?? null,
     parent_id: snapshot.parentAgentId ?? null,
     model: snapshot.model ?? null,
+    ...(snapshot.modelCallBindings === undefined ? {} : {
+      model_call_bindings: snapshot.modelCallBindings.map(archivedModelCallBinding),
+    }),
+    ...(snapshot.providerRoute === undefined ? {} : { provider_route: snapshot.providerRoute }),
+    ...(snapshot.providerProfile ? { provider_profile: snapshot.providerProfile } : {}),
+    ...(snapshot.reasoningEffort ? { reasoning_effort: snapshot.reasoningEffort } : {}),
     rules: snapshot.rules ?? [],
     toolsets: snapshot.toolsets ?? [],
     ...(snapshot.apiCalls === undefined ? {} : { api_calls: snapshot.apiCalls }),
@@ -109,6 +116,7 @@ function archivedSnapshotWire(snapshot: SpawnedAgentSnapshot): Record<string, un
     history_session_id: snapshot.historySessionId ?? null,
     created_at: snapshot.createdAt,
     updated_at: snapshot.updatedAt,
+    ...(snapshot.workspace === undefined ? {} : { workspace: snapshot.workspace }),
     prompt_profile: snapshot.promptProfile,
     source_agent_id: snapshot.sourceAgentId ?? null,
     last_input: boundedText(snapshot.lastInput, MAX_ARCHIVED_TEXT_CHARS) ?? null,
@@ -117,6 +125,12 @@ function archivedSnapshotWire(snapshot: SpawnedAgentSnapshot): Record<string, un
     queue_size: snapshot.queueSize,
     closed: snapshot.closed,
   }
+}
+
+function archivedModelCallBinding(binding: ModelCallBinding): Record<string, unknown> {
+  return binding.kind === 'goal'
+    ? { kind: 'goal', session_id: binding.sessionId, goal_id: binding.goalId }
+    : { kind: 'unrecoverable' }
 }
 
 function boundedText(value: string | undefined, limit: number): string | undefined {

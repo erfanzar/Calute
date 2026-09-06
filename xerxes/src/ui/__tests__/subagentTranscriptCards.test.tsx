@@ -89,9 +89,9 @@ describe('spawn fleet roster', () => {
       const frame = setup.captureCharFrame()
       // Archived verdicts survive turn end: done green cube, failed red cube,
       // and the agent that never reported keeps its muted dot-matrix marker.
-      expect(frame).toContain('⣿ alpha: completed')
-      expect(frame).toContain('⣿ beta: failed')
-      expect(frame).toContain('⠿ gamma: queued')
+      expect(frame).toContain('⣿ alpha  · completed')
+      expect(frame).toContain('⣿ beta  · failed')
+      expect(frame).toContain('⠿ gamma  · queued')
     } finally {
       act(() => setup.renderer.destroy())
     }
@@ -130,7 +130,7 @@ describe('spawn fleet roster', () => {
       const frame = setup.captureCharFrame()
       expect(frame).toContain('Spawn Agents')
       for (const [index, name] of names.entries()) {
-        expect(frame).toContain(`${name}: working on ${name.replace('-analyzer', '')} [${20 + index}s]`)
+        expect(frame).toContain(`${name}  · running [${20 + index}s]`)
       }
     } finally {
       act(() => setup.renderer.destroy())
@@ -188,11 +188,11 @@ describe('spawn fleet roster', () => {
       await setup.flush()
       const frame = setup.captureCharFrame()
       expect(frame).toContain('4 tools')
-      expect(frame).toContain('⣿ structure-analyzer: completed')
-      expect(frame).toContain('⣿ security-analyzer: failed')
+      expect(frame).toContain('⣿ structure-analyzer  · completed')
+      expect(frame).toContain('⣿ security-analyzer  · failed')
       const activeGlyph = frame.match(/([⡿⣿⢿⣻⣽⣾⣷⣯]) test-analyzer/u)?.[1]
       expect(activeGlyph).toBeTruthy()
-      expect(frame).toContain('test-analyzer: running focused tests [20s]')
+      expect(frame).toContain('test-analyzer  · running [20s]')
       expect(frame).not.toContain('{"agents"')
 
       await act(async () => {

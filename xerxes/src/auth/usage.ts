@@ -45,6 +45,8 @@ export interface ProviderUsageReport {
 }
 
 export interface UsageRequestOptions {
+  /** Model-facing reports reject ambiguous units and malformed percentages. */
+  readonly strictUnits?: boolean
   readonly fetchImplementation?: UsageFetch
   readonly environment?: Readonly<Record<string, string | undefined>>
   readonly signal?: AbortSignal
@@ -76,21 +78,50 @@ async function fetchJson(
   headers: Record<string, string>,
   options: UsageRequestOptions,
 ): Promise<Record<string, unknown>> {
-  const fetcher = options.fetchImplementation ?? (globalThis.fetch as UsageFetch)
-  const response = await fetcher(url, {
-    headers,
-    method: 'GET',
-    ...(options.signal ? { signal: options.signal } : {}),
-  })
-  if (!response.ok) {
-    const body = (await response.text()).slice(0, 256)
-    throw new ConfigurationError(
-      provider,
-      `${provider} usage request failed (${response.status}): ${body || response.statusText}`,
-    )
+  options.signal?.throwIfAborted()
+  const deadline = new AbortController()
+  const timer = setTimeout(() => deadline.abort(new Error('Usage request timed out')), 10000)
+  const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal
+  try {
+    const fetcher = options.fetchImplementation ?? (globalThis.fetch as UsageFetch)
+    const response = await fetcher(url, { headers, method: 'GET', redirect: 'error', signal })
+    signal.throwIfAborted()
+    if (!response.ok) {
+      await response.body?.cancel()
+      throw new ConfigurationError(provider, provider + ' usage request failed (' + response.status + ')')
+    }
+    const text = await usageResponseText(response, signal)
+    signal.throwIfAborted()
+    return recordOf(JSON.parse(text))
+  } finally { clearTimeout(timer) }
+}
+
+export const MAX_USAGE_RESPONSE_BYTES = 262144
+async function usageResponseText(response: Response, signal: AbortSignal): Promise<string> {
+  if (Number(response.headers.get('content-length')) > MAX_USAGE_RESPONSE_BYTES) {
+    await response.body?.cancel()
+    throw new Error('Usage response exceeds size limit')
   }
-  const parsed: unknown = await response.json()
-  return recordOf(parsed)
+  if (!response.body) throw new Error('Usage response has no body')
+  const reader = response.body.getReader(), decoder = new TextDecoder('utf-8', { fatal: true })
+  let bytes = 0, text = ''
+  const abort = () => { void reader.cancel(signal.reason).catch(() => {}) }
+  signal.addEventListener('abort', abort, { once: true })
+  try {
+    signal.throwIfAborted()
+    for (;;) {
+      const chunk = await reader.read()
+      signal.throwIfAborted()
+      if (chunk.done) break
+      bytes += chunk.value.byteLength
+      if (bytes > MAX_USAGE_RESPONSE_BYTES) throw new Error('Usage response exceeds size limit')
+      text += decoder.decode(chunk.value, { stream: true })
+    }
+    return text + decoder.decode()
+  } catch (error) {
+    try { await reader.cancel(error) } catch { /* Preserve the original transport/parse failure. */ }
+    throw error
+  } finally { signal.removeEventListener('abort', abort); reader.releaseLock() }
 }
 
 const percentFromFraction = (value: number): number =>
@@ -134,8 +165,9 @@ export async function fetchClaudeUsage(
   return { provider: 'claude', windows, fetchedAt: Date.now() }
 }
 
-function codexWindow(window: Record<string, unknown>, fallbackLabel: string, detail?: string): UsageWindow | undefined {
+function codexWindow(window: Record<string, unknown>, fallbackLabel: string, detail?: string, strict = false): UsageWindow | undefined {
   const usedPercent = finite(window.used_percent)
+  if (strict && Object.keys(window).length && (usedPercent === undefined || usedPercent < 0 || usedPercent > 100)) throw new ConfigurationError('codex', 'Invalid explicit usage percentage')
   if (usedPercent === undefined) return undefined
   const seconds = finite(window.limit_window_seconds)
   const label = seconds === 18_000 ? '5-hour'
@@ -161,8 +193,8 @@ export async function fetchCodexUsage(
   const body = await fetchJson('codex', url, headers, options)
   const rateLimit = recordOf(body.rate_limit)
   const windows = [
-    codexWindow(recordOf(rateLimit.primary_window), '5-hour'),
-    codexWindow(recordOf(rateLimit.secondary_window), 'weekly'),
+    codexWindow(recordOf(rateLimit.primary_window), options.strictUnits ? 'primary' : '5-hour', undefined, options.strictUnits),
+    codexWindow(recordOf(rateLimit.secondary_window), options.strictUnits ? 'secondary' : 'weekly', undefined, options.strictUnits),
   ].filter((window): window is UsageWindow => window !== undefined)
   // Model-specific limits (e.g. Codex Spark) ride a side list with their own
   // 5-hour/weekly pair; tag them so they do not read as the plan's totals.
@@ -172,8 +204,8 @@ export async function fetchCodexUsage(
     const name = stringOf(record.limit_name)
     const nested = recordOf(record.rate_limit)
     for (const window of [
-      codexWindow(recordOf(nested.primary_window), '5-hour', name),
-      codexWindow(recordOf(nested.secondary_window), 'weekly', name),
+      codexWindow(recordOf(nested.primary_window), options.strictUnits ? 'primary' : '5-hour', name, options.strictUnits),
+      codexWindow(recordOf(nested.secondary_window), options.strictUnits ? 'secondary' : 'weekly', name, options.strictUnits),
     ]) {
       if (window) windows.push(window)
     }
@@ -200,7 +232,7 @@ export async function fetchKimiUsage(
 ): Promise<ProviderUsageReport> {
   const url = options.environment?.XERXES_KIMI_USAGE_URL?.trim() || KIMI_USAGE_URL
   const body = await fetchJson('kimi', url, { Authorization: `Bearer ${accessToken}` }, options)
-  const windows = kimiWindows(body)
+  const windows = kimiWindows(body, options.strictUnits)
   if (!windows.length) {
     throw new ConfigurationError(
       'kimi',
@@ -216,7 +248,7 @@ export async function fetchKimiUsage(
   }
 }
 
-function kimiWindows(body: Record<string, unknown>): UsageWindow[] {
+function kimiWindows(body: Record<string, unknown>, strict = false): UsageWindow[] {
   const windows: UsageWindow[] = []
   // Tolerant across the shapes the coding subscription has returned: a
   // top-level list of scope-tagged rows, or keyed five-hour/weekly records.
@@ -225,17 +257,22 @@ function kimiWindows(body: Record<string, unknown>): UsageWindow[] {
     : []
   for (const row of rows) {
     const record = recordOf(row)
+    if (strict && (finite(record.used_percent) === undefined || (record.used_percent as number) < 0 || (record.used_percent as number) > 100)) throw new ConfigurationError('kimi', 'Usage row has no valid explicit percentage')
     const used = finite(record.used_percent) ?? finite(record.percentage)
     const scope = (stringOf(record.scope) ?? stringOf(record.type) ?? '').toLowerCase()
     if (used === undefined || !scope) continue
     const resetsAt = epochMs(record.reset_at ?? record.resets_at)
     windows.push({
-      label: scope.includes('week') ? 'weekly' : scope.includes('5') ? '5-hour' : scope,
-      usedPercent: Math.max(0, Math.min(100, percentFromFraction(used))),
+      label: strict ? scope : scope.includes('week') ? 'weekly' : scope.includes('5') ? '5-hour' : scope,
+      usedPercent: Math.max(0, Math.min(100, finite(record.used_percent) !== undefined ? used : percentFromFraction(used))),
       ...(resetsAt !== undefined ? { resetsAt } : {}),
     })
   }
   for (const [key, label] of [['five_hour', '5-hour'], ['weekly', 'weekly'], ['seven_day', 'weekly']] as const) {
+    if (strict && body[key] !== undefined) {
+      const percent = finite(recordOf(body[key]).utilization)
+      if (percent === undefined || percent < 0 || percent > 100) throw new ConfigurationError('kimi', 'Usage window has no valid percentage')
+    }
     const window = claudeWindow(key, body, label)
     if (window) windows.push(window)
   }
@@ -260,10 +297,11 @@ export async function fetchZaiUsage(
   const windows = limits.flatMap(limit => {
     const record = recordOf(limit)
     const used = finite(record.percentage)
+    if (options.strictUnits && (used === undefined || used < 0 || used > 100)) throw new ConfigurationError('zai', 'Usage window has no valid percentage')
     if (used === undefined) return []
     const type = stringOf(record.type) ?? 'quota'
     const unit = finite(record.unit)
-    const label = type === 'TOKENS_LIMIT' ? (unit === 5 ? '5-hour' : 'weekly')
+    const label = options.strictUnits ? type.toLowerCase() : type === 'TOKENS_LIMIT' ? (unit === 5 ? '5-hour' : 'weekly')
       : type === 'TIME_LIMIT' ? '5-hour'
       : type.toLowerCase()
     const nextReset = epochMs(record.nextResetTime)
@@ -272,7 +310,7 @@ export async function fetchZaiUsage(
       label,
       usedPercent: Math.max(0, Math.min(100, used)),
       ...(nextReset !== undefined ? { resetsAt: nextReset } : {}),
-      detail: remaining !== undefined ? `${remaining} remaining` : type.toLowerCase(),
+      detail: options.strictUnits ? type.toLowerCase() : remaining !== undefined ? `${remaining} remaining` : type.toLowerCase(),
     }]
   })
   if (!windows.length) {

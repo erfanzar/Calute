@@ -180,3 +180,31 @@ test('Xerxes facade reports an actionable typed error instead of choosing a mode
   )
   expect(() => new Xerxes({ coreTools: false })).toThrow(ConfigurationError)
 })
+
+test('embedded facade exposes host-owned model discovery through core tool composition', async () => {
+  const seen: unknown[] = []
+  const client: LlmClient = {
+    async *stream(request) {
+      if (request.messages.at(-1)?.role === 'tool') {
+        expect(request.messages.at(-1)?.content).toContain('host-model')
+        yield { content: 'Inventory received.' }
+      } else {
+        expect(request.tools?.some(tool => tool.function.name === 'list_available_models')).toBe(true)
+        yield { toolCalls: [{ id: 'models', type: 'function', function: { name: 'list_available_models', arguments: { provider_profile: 'host-provider' } } }] }
+      }
+    },
+  }
+  const xerxes = new Xerxes({ llm: client, model: 'fixture', permissionMode: 'accept-all', coreTools: {
+    modelInventory: async (sessionId, params) => { seen.push({ sessionId, params }); return { ok: true, entries: [{ model: 'host-model' }] } },
+  } })
+  const result = await xerxes.run('Discover worker models')
+  expect(result.output).toBe('Inventory received.')
+  expect(seen).toHaveLength(1)
+  expect(seen[0]).toMatchObject({ sessionId: expect.any(String), params: { provider_profile: 'host-provider' } })
+  await xerxes.run('Inspect left', { sessionId: 'left' })
+  await xerxes.run('Inspect right', { sessionId: 'right' })
+  await xerxes.run('Inspect left again', { sessionId: 'left' })
+  expect(seen.slice(1)).toEqual(['left', 'right', 'left'].map(sessionId => ({ sessionId, params: { provider_profile: 'host-provider' } })))
+  const isolated = new Xerxes({ llm: client, model: 'fixture', coreTools: {} })
+  expect(isolated.toolRegistry.definitions().some(tool => tool.function.name === 'list_available_models')).toBe(false)
+})

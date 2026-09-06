@@ -587,15 +587,18 @@ test('file storage refreshes its lock during a long transaction so it is not sto
       workerPath,
       `
       import { FileStorage } from ${JSON.stringify(storageModule)}
+      import { writeFileSync } from 'node:fs'
       const [root] = process.argv.slice(2)
       const storage = new FileStorage(root, { lockTimeoutMs: 2_000, staleLockMs: 100 })
       const lock = (storage as any).withIndexLock.bind(storage)
       lock((touchLock: () => void) => {
+        process.stdout.write('locked\\n')
         const end = Date.now() + 350
         while (Date.now() < end) {
           touchLock()
           Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
         }
+        writeFileSync(root + '/holder-completed', 'complete')
       })
     `,
       'utf8',
@@ -605,12 +608,14 @@ test('file storage refreshes its lock during a long transaction so it is not sto
       [process.execPath, 'run', workerPath, root],
       { stdout: 'pipe', stderr: 'pipe' },
     )
-    await Bun.sleep(50)
-
-    const before = Date.now()
+    const readiness = worker.stdout.getReader()
+    try {
+      const { value, done } = await readiness.read()
+      expect(done).toBe(false)
+      expect(new TextDecoder().decode(value)).toContain('locked')
+    } finally { readiness.releaseLock() }
     expect(storage.save('key', 1)).toBeTrue()
-    const elapsed = Date.now() - before
-    expect(elapsed).toBeGreaterThanOrEqual(250)
+    expect(nodeFs.existsSync(join(root, 'holder-completed'))).toBeTrue()
 
     const [stderr, exitCode] = await Promise.all([
       new Response(worker.stderr).text(),

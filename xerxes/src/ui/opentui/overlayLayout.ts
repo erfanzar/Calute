@@ -96,7 +96,7 @@ export const OVERLAY_PANEL_SPECS = {
   // full height minus the standard gutter and diff-width, so a long grouped
   // list and the inspector both get the room the design gives them.
   agents: { maxWidth: 120, minWidth: 48 },
-  diff: { maxWidth: 120, minWidth: 60 },
+  diff: { maxWidth: 240, minWidth: 60 },
   info: { maxWidth: 90, minWidth: 42 },
   pager: { maxWidth: 110, minWidth: 48 },
   terminals: { maxWidth: 140, minWidth: 60 }

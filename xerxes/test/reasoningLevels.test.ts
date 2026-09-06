@@ -5,6 +5,7 @@ import { expect, test } from 'bun:test'
 
 import {
   catalogReasoningLevels,
+  providerReasoningLevels,
   clampEffort,
   fallbackReasoningLevels,
   resolveEffort,
@@ -69,4 +70,10 @@ test('resolveEffort stays strict; clamping is the explicit second step', () => {
   expect(gpt51.canDisable).toBe(true)
   expect(selectableEfforts(gpt51)[0]).toBe('off')
   expect(resolveEffort(gpt51, 'off')).toBe('off')
+})
+
+test('reasoning provenance distinguishes bundled data from live provider declarations', () => {
+  expect(catalogReasoningLevels('gpt-5', 'openai')?.provenance).toBe('bundled_catalog')
+  expect(fallbackReasoningLevels('kimi').provenance).toBe('provider_fallback')
+  expect(providerReasoningLevels([{ effort: 'high' }], 'high').provenance).toBe('provider_reported')
 })

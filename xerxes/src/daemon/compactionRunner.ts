@@ -12,7 +12,12 @@ import {
 import { DEFAULT_COMPACTION_SUMMARY_MAX_TOKENS } from "../context/compactionProvisioner.js";
 import type { ContextMessage } from "../context/compressor.js";
 import { estimateContextTokens } from "../context/windowUsage.js";
-import { closeLlmClient, completeLlm, type LlmClient } from "../llms/client.js";
+import {
+  closeLlmClient,
+  completeLlm,
+  CompletionDeadlineError,
+  type LlmClient,
+} from "../llms/client.js";
 import { classifyError, ErrorKind } from "../runtime/errorClassifier.js";
 
 /** Auto-compact once the estimated context usage reaches this fraction of the prompt budget. */
@@ -87,10 +92,14 @@ export function compactionCompletionPort(
   model: string,
   /** Wall-clock deadline for the completion call; omit for the default. */
   timeoutMs: number = COMPACTION_COMPLETION_TIMEOUT_MS,
+  /** External cancellation owned by the command or turn invoking compaction. */
+  signal?: AbortSignal,
 ): CompactionCompletionPort {
   return async (request) => {
-    const result = await withCompletionDeadline(
-      completeLlm(
+    throwIfCancelled(signal)
+    const completionSignal = combinedCompletionSignal(timeoutMs, signal)
+    const completion = isFiniteDeadline(timeoutMs)
+      ? completeLlm(
         client,
         {
           model,
@@ -98,10 +107,35 @@ export function compactionCompletionPort(
           maxTokens: request.maxTokens,
           temperature: request.temperature,
         },
-        deadlineSignal(timeoutMs),
-      ),
-      timeoutMs,
-    );
+        completionSignal,
+        { timeoutMs },
+      )
+      : completeLlm(
+        client,
+        {
+          model,
+          messages: [{ role: "user", content: request.prompt }],
+          maxTokens: request.maxTokens,
+          temperature: request.temperature,
+        },
+        completionSignal,
+      )
+    let result: Awaited<typeof completion>;
+    try {
+      result = await withCompletionDeadline(
+        completion,
+        timeoutMs,
+        signal,
+      );
+    } catch (error) {
+      // Keep the compaction port's established timeout contract even when
+      // completeLlm's internal deadline wins the race.
+      if (error instanceof CompletionDeadlineError) {
+        throw compactionTimeoutError(timeoutMs);
+      }
+      throw error;
+    }
+    throwIfCancelled(signal)
     return result.content;
   };
 }
@@ -110,6 +144,14 @@ export function compactionCompletionPort(
 function deadlineSignal(timeoutMs: number): AbortSignal | undefined {
   if (!isFiniteDeadline(timeoutMs)) return undefined;
   return AbortSignal.timeout(timeoutMs);
+}
+
+/** Combine the compaction deadline with host cancellation before entering the provider. */
+function combinedCompletionSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal | undefined {
+  const deadline = deadlineSignal(timeoutMs)
+  if (deadline === undefined) return signal
+  if (signal === undefined) return deadline
+  return AbortSignal.any([deadline, signal])
 }
 
 /**
@@ -121,17 +163,37 @@ function deadlineSignal(timeoutMs: number): AbortSignal | undefined {
 async function withCompletionDeadline<T>(
   promise: Promise<T>,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<T> {
-  if (!isFiniteDeadline(timeoutMs)) return promise;
+  if (!isFiniteDeadline(timeoutMs) && signal === undefined) return promise;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   try {
     return await new Promise<T>((resolve, reject) => {
-      timer = setTimeout(() => reject(compactionTimeoutError(timeoutMs)), timeoutMs);
+      if (isFiniteDeadline(timeoutMs)) {
+        timer = setTimeout(() => reject(compactionTimeoutError(timeoutMs)), timeoutMs);
+      }
+      if (signal !== undefined) {
+        onAbort = () => reject(compactionAbortError());
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }
       promise.then(resolve, reject);
     });
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    if (signal !== undefined && onAbort !== undefined) signal.removeEventListener("abort", onAbort);
   }
+}
+
+function throwIfCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw compactionAbortError();
+}
+
+function compactionAbortError(): Error {
+  const error = new Error("compaction completion cancelled");
+  error.name = "AbortError";
+  return error;
 }
 
 function isFiniteDeadline(timeoutMs: number): boolean {
@@ -169,6 +231,8 @@ export function lazyCompactionCompletionPort(
   model: string,
   /** Wall-clock deadline forwarded to every completion; omit for the default. */
   timeoutMs: number = COMPACTION_COMPLETION_TIMEOUT_MS,
+  /** External cancellation owned by the command or turn invoking compaction. */
+  signal?: AbortSignal,
 ): LazyCompactionPort {
   type Resolved =
     | { readonly error: unknown; readonly ok: false }
@@ -176,6 +240,7 @@ export function lazyCompactionCompletionPort(
   let resolved: Resolved | undefined;
   return {
     port: async (request) => {
+      throwIfCancelled(signal)
       if (resolved === undefined) {
         try {
           resolved = { ok: true, client: createClient() };
@@ -184,7 +249,8 @@ export function lazyCompactionCompletionPort(
         }
       }
       if (!resolved.ok) throw resolved.error;
-      return compactionCompletionPort(resolved.client, model, timeoutMs)(request);
+      throwIfCancelled(signal)
+      return compactionCompletionPort(resolved.client, model, timeoutMs, signal)(request);
     },
     // Closing has to be the port's job rather than the caller's, because the
     // caller can no longer see whether a client was ever built. A port that was

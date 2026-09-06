@@ -2,62 +2,58 @@
 // Licensed under the Apache License, Version 2.0.
 
 import { expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { runScheduleCommand, type ScheduleCommandRequest } from '../src/runtime/scheduleCommand.js'
+import type { JsonRpcPayload } from '../src/protocol/jsonRpc.js'
 
-import { runScheduleCommand } from '../src/runtime/scheduleCommand.js'
+const job = { id: 'generated', paused: false, next_run_at: '2030-01-01T00:00:00.000Z' }
 
-test('schedule command creates, fires, and lists triggers', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'xerxes-schedule-cmd-'))
-  try {
-    const createResult = await runScheduleCommand({
-      action: 'create',
-      id: 'cmd-trigger',
-      owner: 'user',
-      schedule: 'webhook:/hooks/build',
-      objective: 'run build',
-      directory,
-    })
-    expect(createResult.ok).toBeTrue()
-    expect(createResult.message).toContain('created trigger cmd-trigger')
-
-    const listResult = await runScheduleCommand({ action: 'list', directory })
-    expect(listResult.ok).toBeTrue()
-    expect(listResult.message).toContain('cmd-trigger')
-
-    const fireResult = await runScheduleCommand({ action: 'fire', id: 'cmd-trigger', deliveryId: 'delivery-1', directory })
-    expect(fireResult.ok).toBeTrue()
-
-    const duplicateFire = await runScheduleCommand({ action: 'fire', id: 'cmd-trigger', deliveryId: 'delivery-1', directory })
-    expect(duplicateFire.ok).toBeFalse()
-  } finally {
-    await rm(directory, { recursive: true, force: true })
+test('schedule commands use unified daemon actions with an explicit project assertion', async () => {
+  const calls: Array<{ method: string; params: JsonRpcPayload }> = []
+  const request: ScheduleCommandRequest = async (method, params) => {
+    calls.push({ method, params })
+    return method === 'schedule.list' ? { ok: true, jobs: [job] }
+      : method === 'schedule.remove' ? { ok: true, schedule_id: job.id, removed: true }
+      : method === 'schedule.cancel' ? { ok: true, job, requested: false }
+      : { ok: true, job, output: 'execution evidence' }
+  }
+  const create = await runScheduleCommand({ action: 'create', schedule: 'interval:60', objective: 'work', projectDirectory: '/tmp', request })
+  expect(create).toMatchObject({ ok: true })
+  expect(create.message).toContain('Created schedule generated · enabled')
+  expect(calls[0]).toMatchObject({ method: 'schedule.create', params: { interval_seconds: 60, prompt: 'work', paused: false } })
+  expect(calls[0]?.params.expected_project_directory).toBeDefined()
+  for (const [action, method] of [['disable', 'pause'], ['enable', 'resume'], ['remove', 'remove'], ['fire', 'run'], ['inspect', 'inspect'], ['cancel', 'cancel'], ['list', 'list']] as const) {
+    const result = await runScheduleCommand({ action, id: job.id, request })
+    expect(result.ok).toBe(true)
+    expect(calls.at(-1)?.method).toBe(`schedule.${method}`)
+    if (action === 'cancel') expect(result.message).toContain('No active local run')
+    if (action === 'fire') expect(result.message).toContain('Completed schedule generated\nexecution evidence')
   }
 })
 
-test('malformed cron schedules are rejected instead of silently mis-scheduling', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'xerxes-schedule-cron-validate-'))
-  try {
-    const create = (schedule: string) => runScheduleCommand({
-      action: 'create', directory, id: `t-${schedule}`, owner: 'user', objective: 'run job', schedule,
-    })
-
-    // `Number('')` is 0, so a blank field used to become "minute 0" — a real,
-    // hourly job the user never asked for.
-    expect(await create('cron:')).toMatchObject({ ok: false })
-    expect(await create('cron:  ')).toMatchObject({ ok: false })
-    // Out of range parses fine and then matches no clock, so the job simply
-    // never runs and nothing reports why.
-    expect(await create('cron:99')).toMatchObject({ ok: false })
-    expect(await create('cron:0/25')).toMatchObject({ ok: false })
-    expect(await create('cron:abc')).toMatchObject({ ok: false })
-
-    // Valid shapes still work.
-    for (const schedule of ['cron:5/14', 'cron:*/15', 'cron:0,30', 'cron:0-30', 'cron:*']) {
-      expect(await create(schedule)).toMatchObject({ ok: true })
-    }
-  } finally {
-    await rm(directory, { recursive: true, force: true })
+test('standard cron steps stay intact and ambiguous legacy or unsupported sources never reach the daemon', async () => {
+  const calls: JsonRpcPayload[] = []
+  const request: ScheduleCommandRequest = async (_method, params) => { calls.push(params); return { ok: true, job } }
+  const create = (schedule: string) => runScheduleCommand({ action: 'create', schedule, objective: 'work', request })
+  expect((await create('cron:*/5 * * * *')).ok).toBe(true)
+  expect(calls.at(-1)?.schedule).toBe('*/5 * * * *')
+  expect((await create('cron:5/14')).ok).toBe(true)
+  expect(calls.at(-1)?.schedule).toBe('5 14 * * *')
+  for (const value of ['cron:', 'cron:99', 'cron:0/25', 'cron:*/15', 'cron:0/0/1/1', 'interval:Infinity', 'interval:1.5', 'interval:86401', 'event:build', 'webhook:/build']) {
+    expect((await create(value)).ok).toBe(false)
   }
+  expect(calls).toHaveLength(2)
+})
+
+test('legacy options, daemon rejection and uncertain transport failures never report success or retry', async () => {
+  let calls = 0
+  const request: ScheduleCommandRequest = async () => { calls++; throw new Error('connection closed; outcome unknown') }
+  for (const legacy of [{ directory: '/tmp/legacy' }, { owner: 'user' }, { deliveryId: 'delivery' }]) {
+    expect((await runScheduleCommand({ action: 'list', ...legacy, request })).ok).toBe(false)
+  }
+  expect(calls).toBe(0)
+  expect(await runScheduleCommand({ action: 'fire', id: job.id, request })).toMatchObject({ ok: false, error: 'connection closed; outcome unknown' })
+  expect(calls).toBe(1)
+  expect(await runScheduleCommand({ action: 'list', request: async () => ({ ok: true, jobs: [{}] }) })).toMatchObject({ ok: false })
+  expect(await runScheduleCommand({ action: 'remove', id: job.id, request: async () => ({ ok: true }) })).toMatchObject({ ok: false })
+  expect(await runScheduleCommand({ action: 'list', request: async () => ({ ok: false, error: 'wrong project' }) })).toMatchObject({ ok: false, error: 'wrong project' })
 })

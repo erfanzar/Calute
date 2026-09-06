@@ -168,3 +168,47 @@ test('concurrent fires of one delivery id produce exactly one task', async () =>
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test('markFired preserves an explicit occurrence time instead of replacing it with the clock', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'scheduler-occurrence-'))
+  try {
+    const scheduler = new Scheduler({ directory, now: () => 100000 })
+    await scheduler.createTrigger({ id: 'interval', owner: 'user', schedule: { kind: 'interval', intervalSeconds: 10 }, payload: taskPayload('interval') })
+    await scheduler.markFired('interval', 95000)
+    expect((await scheduler.load()).triggers.get('interval')?.lastFiredAt).toBe(95000)
+    expect(await scheduler.evaluate(104999)).toEqual([])
+    expect((await scheduler.evaluate(105000)).map(trigger => trigger.id)).toEqual(['interval'])
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('trigger configuration changes serialize with delivery deduplication across instances', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'scheduler-mutation-'))
+  try {
+    const first = new Scheduler({ directory })
+    const second = new Scheduler({ directory })
+    await first.createTrigger({ id: 'event', owner: 'user', schedule: { kind: 'event', topic: 'build' }, payload: taskPayload('event') })
+    const [disabled, fired] = await Promise.all([first.disableTrigger('event'), second.fire('event', 'delivery')])
+    expect(disabled).toBeUndefined()
+    expect(fired.fired).toBe(false)
+    await second.enableTrigger('event')
+    const results = await Promise.all([first.fire('event', 'delivery'), second.fire('event', 'delivery')])
+    expect(results.filter(result => result.fired)).toHaveLength(1)
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('legacy scheduler rejects a competing writer and resumes after its process exits', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'scheduler-lock-'))
+  const scheduler = new Scheduler({ directory })
+  await scheduler.createTrigger({ id: 'event', owner: 'user', schedule: { kind: 'event', topic: 'build' }, payload: taskPayload('event') })
+  const child = Bun.spawn([process.execPath, '--eval', `import { Database } from 'bun:sqlite'; const db=new Database(process.argv[1]); db.exec('BEGIN IMMEDIATE'); console.log('locked'); await Bun.sleep(60000);`, join(directory, 'scheduler.writer.sqlite')], { stdout: 'pipe', stderr: 'pipe' })
+  try {
+    const reader = child.stdout.getReader()
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain('locked')
+    reader.releaseLock()
+    await expect(scheduler.disableTrigger('event')).rejects.toThrow()
+    expect((await scheduler.load()).triggers.get('event')?.enabled).toBe(true)
+    child.kill('SIGKILL'); await child.exited
+    await scheduler.disableTrigger('event')
+    expect((await scheduler.load()).triggers.get('event')?.enabled).toBe(false)
+  } finally { child.kill(); await child.exited; await rm(directory, { recursive: true, force: true }) }
+})

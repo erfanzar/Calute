@@ -13,6 +13,10 @@ import { atom } from 'nanostores'
  * all three surfaces.
  */
 
+/** Optional rail preference; shared with transcript width accounting. */
+export const $agentRailVisible = atom(true)
+export const toggleAgentRail = () => $agentRailVisible.set(!$agentRailVisible.get())
+
 export const PANEL_WIDTH_STEP = 4
 export const PANEL_WIDTH_DELTA_MIN = -24
 export const PANEL_WIDTH_DELTA_MAX = 60

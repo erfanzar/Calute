@@ -1,6 +1,8 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { parseTodoList } from "../runtime/todoSnapshot.js";
+import { readContextControls } from '../context/controls.js'
 import type { AgentDefinition } from '../agents/definitions.js'
 import type { AuditEmitter } from '../audit/emitter.js'
 import { compressToolResult } from '../context/headroom.js'
@@ -38,14 +40,14 @@ import type { SpawnedAgentSnapshot } from '../operators/subagents.js'
 import type { LlmClient } from '../llms/client.js'
 import { type ProviderOverrides, retryPolicyForModel } from '../llms/providerRegistry.js'
 import { agentNameForMode, modeSwitchHint, normalizeInteractionMode } from '../runtime/interactionModes.js'
-import { getGoal, type GoalView } from '../runtime/goalDomain.js'
+import { GOAL_CHANGES_KEY, getGoal, type GoalView } from '../runtime/goalDomain.js'
 import { DEFAULT_BLOCKED_AFTER_CONSECUTIVE_ROUNDS, goalPolicyPrompt } from '../runtime/goalTools.js'
 import {
   mergeContextDeltas,
   renderContextDeltas,
   takeContextDeltas,
 } from '../runtime/contextDeltas.js'
-import { beginEditDiagnosticsTurn, reportEditDiagnostics } from '../runtime/editDiagnostics.js'
+import { EditFeedback } from '../runtime/editFeedback.js'
 import { withActiveSession } from '../runtime/sessionContext.js'
 import { resolveTurnThinking } from '../runtime/thinkingLevels.js'
 import { captureUserWorkflowMemory } from '../runtime/workflowMemory.js'
@@ -65,7 +67,7 @@ import { imageUrlContentParts } from './images.js'
 import type { RawMessage, TranscriptMessageJournalAppend } from '../session/daemonTranscript.js'
 import type { ToolCall, ToolDefinition } from '../types/toolCalls.js'
 import type { DaemonInteractionBoard, DaemonQuestion } from './interactions.js'
-import type { DaemonEvent, DaemonSession, TurnRunControls, TurnRunner } from './runtime.js'
+import type { DaemonEvent, DaemonSession, RuntimeToolInventoryEntry, TurnRunControls, TurnRunner } from './runtime.js'
 import {
   recoverSubagentSnapshots,
   type SubagentTurnCoordinator,
@@ -91,6 +93,7 @@ export interface AgentTurnRunnerOptions {
    * made the entire hooks subsystem inert outside tests.
    */
   readonly hookRunner?: HookRunner
+  readonly hookRunnerForSession?: (session: DaemonSession) => HookRunner
   /**
    * Fallback model chain (Claude Code parity): when a terminal overload-class
    * provider failure arrives before any content streams, the turn restarts
@@ -176,6 +179,7 @@ export interface AgentTurnRunnerOptions {
    * a host that has not opted in must never pay a typecheck per turn.
    */
   readonly editDiagnostics?: boolean
+  readonly createEditFeedback?: (cwd: string) => EditFeedback
   /**
    * Root for off-transcript tool-result spill. Absent it, oversized results
    * stay inline — the previous behavior — so a host that has nowhere to write
@@ -215,6 +219,26 @@ export class AgentTurnRunner implements TurnRunner {
   private readonly toolResultStores = new Map<string, ToolResultStorage>()
 
   constructor(private readonly options: AgentTurnRunnerOptions) {}
+
+  toolInventory(session: DaemonSession): RuntimeToolInventoryEntry[] {
+    const agent = this.options.agentDefinitions?.get(session.agentId)
+    if (this.options.agentDefinitions && !agent) throw new ValidationError('agent_id', 'is not a registered agent profile', session.agentId)
+    const mode = interactionModeAgent(this.options.agentDefinitions, session.interactionMode)
+    if (mode === null) throw new ValidationError('interaction_mode', 'does not have a registered enforcement profile', session.interactionMode)
+    const all = this.options.toolRegistry?.definitions() ?? this.options.tools ?? []
+    const permitted = toolsForAgent(toolsForAgent(all, agent), mode) ?? []
+    const effective = session.metadata.session_kind === 'subagent' ? toolsForResumedSubagent(permitted, session.metadata) : permitted
+    const allowed = new Set(effective?.map(tool => tool.function.name))
+    const loaded = new Set((this.options.toolRegistry?.deferredToolLoading
+      ? this.options.toolRegistry.definitionsForTranscript(session.messages.flatMap(messageToChatMessage))
+      : this.options.tools ?? []).map(tool => tool.function.name))
+    return all.map(tool => {
+      const name = tool.function.name
+      const exposure = !allowed.has(name) ? 'filtered' as const : loaded.has(name) ? 'loaded' as const : this.options.toolRegistry?.deferredToolLoading ? 'deferred' as const : 'unexposed' as const
+      return { name, ...(tool.function.description ? { description: tool.function.description } : {}), exposure,
+        reason: exposure === 'filtered' ? 'Excluded by the current agent or interaction mode' : exposure === 'deferred' ? 'Registered; load through tool search' : exposure === 'unexposed' ? 'Registered but absent from runner schemas' : 'Schema exposed to the current session' }
+    })
+  }
 
   async *run(
     session: DaemonSession,
@@ -256,7 +280,9 @@ export class AgentTurnRunner implements TurnRunner {
     const projectRoot = sessionProjectRoot(session)
     // Anchor the pre-mutation baseline before any tool runs. Non-blocking:
     // a whole-project typecheck costs seconds and read-only turns must not pay it.
-    if (this.options.editDiagnostics) beginEditDiagnosticsTurn(projectRoot)
+    const editFeedback = this.options.editDiagnostics
+      ? this.options.createEditFeedback?.(projectRoot) ?? new EditFeedback(projectRoot)
+      : undefined
     state.metadata.project_root = projectRoot
     state.metadata.interaction_mode = session.interactionMode
     state.metadata.plan_mode = session.planMode
@@ -266,7 +292,8 @@ export class AgentTurnRunner implements TurnRunner {
     // one. Evidence starts false so a completion claim cannot inherit proof
     // from a previous turn.
     state.metadata.goal_turn_round = controls.goalRound ?? undefined
-    state.metadata.goal_turn_human = controls.goalRound === undefined
+    state.metadata.goal_turn_human = controls.goalRound === undefined && (controls.origin ?? 'human') === 'human'
+    state.metadata.turn_origin = controls.origin ?? (controls.goalRound === undefined ? 'human' : 'goal')
     delete state.metadata.pending_interaction_mode
     const agent = this.options.agentDefinitions?.get(session.agentId)
     if (this.options.agentDefinitions && !agent) {
@@ -315,7 +342,13 @@ export class AgentTurnRunner implements TurnRunner {
     // Rank the memory manifest against this turn rather than emitting every
     // topic in path order. Without a query the selector is inert, so calling
     // it with no arguments — as this did — left the ranking permanently off.
+    const contextControls = readContextControls(session.metadata)
+    if (!memory && (contextControls.pins.length || contextControls.excluded.length)) throw new Error('Session context controls require an available memory host')
+    const memorySources: { scope: string; path: string; content: string }[] = []
     const memoryPrompt = memory ? await memory.toPromptSection({
+      excludedSources: contextControls.excluded,
+      pinnedMemories: contextControls.pins,
+      onSource: source => memorySources.push(source),
       query: displayText,
       alreadySurfaced: recentTranscriptText(session),
       recentSuccessfulTools: recentSuccessfulToolNames(session),
@@ -393,10 +426,14 @@ export class AgentTurnRunner implements TurnRunner {
     // and every tool schema — the largest fixed cost in the request — which is
     // why auto-compaction fired late on tool-heavy sessions.
     session.requestScaffold = {
+      capturedAt: Date.now(),
+      memorySources,
+      systemSegments: systemSegments.map(({ name, text }) => ({ name, text })),
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(tools ? { toolSchemas: tools.map(tool => tool as unknown as Readonly<Record<string, unknown>>) } : {}),
     }
-    const toolExecutor = interactiveToolExecutor(this.options.toolExecutor, this.options.interactions, session.id)
+    const baseToolExecutor = interactiveToolExecutor(this.options.toolExecutor, this.options.interactions, session.id)
+    const toolExecutor = baseToolExecutor && editFeedback ? editFeedback.wrap(baseToolExecutor) : baseToolExecutor
     const auditContext = {
       sessionId: session.id,
       agentId: session.agentId,
@@ -487,7 +524,7 @@ export class AgentTurnRunner implements TurnRunner {
         maxSuggestedRetryDelayMs: retryPolicyForModel(attemptModel, this.options.providerOverrides)
           .maxSuggestedDelayMs,
         llm: attemptLlm,
-        ...(this.options.hookRunner ? { hookRunner: this.options.hookRunner } : {}),
+        ...((this.options.hookRunnerForSession || this.options.hookRunner) ? { hookRunner: this.options.hookRunnerForSession?.(session) ?? this.options.hookRunner } : {}),
         ...(permissionBroker ? { permissionBroker } : {}),
         ...(this.options.policy ? { policy: this.options.policy } : {}),
         ...(toolExecutor ? { toolExecutor } : {}),
@@ -520,6 +557,9 @@ export class AgentTurnRunner implements TurnRunner {
             }
           }
           const event = item.event
+          // Evidence references must resolve before the next provider round,
+          // while the runner still owns the transcript's final synchronization.
+          if (event.type === 'tool_end') session.toolExecutions = [...state.toolExecutions]
           accumulateSessionTelemetry(session, event)
           auditStreamEvent(this.options.auditEmitter, event, auditContext, state)
           auditTurnEnded ||= event.type === 'turn_done'
@@ -606,7 +646,7 @@ export class AgentTurnRunner implements TurnRunner {
       // to claim the edit compiled. Only paths this turn actually mutated are
       // reported, so a repo with pre-existing errors stays quiet.
       if (this.options.editDiagnostics && turnMutatedFiles(state)) {
-        const diagnostics = await reportEditDiagnostics(projectRoot).catch(() => '')
+        const diagnostics = await editFeedback?.report(signal).catch(() => '')
         if (diagnostics) {
           state.messages.push({ role: 'user', content: diagnostics })
         }
@@ -1023,7 +1063,7 @@ function systemPromptAddendum(session: DaemonSession): string {
 function displayBlocksFor(result: ToolResult): readonly Record<string, unknown>[] {
   if (result.name !== 'TodoWriteTool' || !result.permitted) return []
   const items = parseTodoList(result.result)
-  return items.length ? [{ type: 'todo', items }] : []
+  return [{ type: 'todo', items }]
 }
 
 /**
@@ -1034,20 +1074,6 @@ function displayBlocksFor(result: ToolResult): readonly Record<string, unknown>[
  * payload through ToolResult, which every other tool would then carry for one
  * tool's benefit.
  */
-function parseTodoList(text: string): readonly Record<string, unknown>[] {
-  const items: Record<string, unknown>[] = []
-  for (const line of text.split('\n')) {
-    const match = /^\s*(\d+)\.\s+\[([ x~])\]\s+(.*\S)\s*$/.exec(line)
-    if (!match) continue
-    const [, index, mark, content] = match
-    items.push({
-      content,
-      id: `todo-${index}`,
-      status: mark === 'x' ? 'completed' : mark === '~' ? 'in_progress' : 'pending',
-    })
-  }
-  return items
-}
 
 /**
  * Tell the model what exists but is not loaded.
@@ -1094,6 +1120,8 @@ function renderGoalLayer(toolsVisible: boolean, goal: GoalView | undefined): str
   const blocked = goal.blockedReason ? ` Blocker: ${goal.blockedReason.message}` : ''
   return `${policy}\n\nCurrent goal: ${JSON.stringify(goal.objective)} — phase ${goal.phase}, `
     + `round ${goal.roundsStarted} of ${goal.maxGoalRounds}, ${goal.activation}.${blocked}`
+    + (goal.maxDurationMs === undefined ? '' : ` Wall-time deadline (Unix milliseconds): ${goal.createdAt + goal.maxDurationMs} (includes pauses).`)
+    + (goal.criteria?.length ? '\nCompletion criteria: ' + JSON.stringify(goal.criteria.map(criterion => ({ id: criterion.id, description: criterion.description, evidenceToolCallId: criterion.evidence?.toolCallId ?? null }))) : '\nNo explicit completion criteria declared.')
 }
 
 /** Apply an agent's declared tool surface without exposing unregistered tools. */
@@ -1217,6 +1245,15 @@ function stateFromSession(session: DaemonSession): AgentState {
   const state = createAgentState(session.messages.flatMap(messageToChatMessage))
   state.apiCallsComplete = session.apiCallsComplete ?? session.turnCount === 0
   state.metadata = { ...session.metadata }
+  // Goal tools and /goal must use the same compare-and-set log during a turn.
+  // A copied log hides model edits until the turn ends and can overwrite a
+  // human's intervening goal edit when the final state is synchronized.
+  Object.defineProperty(state.metadata, GOAL_CHANGES_KEY, {
+    enumerable: true,
+    configurable: true,
+    get: () => session.metadata[GOAL_CHANGES_KEY],
+    set: value => { session.metadata[GOAL_CHANGES_KEY] = value },
+  })
   state.thinkingContent = session.thinkingContent.filter((content): content is string => typeof content === 'string')
   state.toolExecutions = session.toolExecutions.filter(isToolExecutionRecord)
   state.totalApiCalls = session.totalApiCalls ?? 0
@@ -1473,6 +1510,7 @@ function daemonEventFromStream(
           model: event.model,
           usage: event.usage,
           usage_complete: state.usageComplete,
+          ...(event.reason ? { stop_reason: event.reason } : {}),
           tool_calls: event.toolCallsCount,
           ...(event.apiCallsCount === undefined ? {} : { api_calls: event.apiCallsCount }),
           ...(state.apiCallsComplete

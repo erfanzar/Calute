@@ -217,7 +217,7 @@ const NATIVE_UNSUPPORTED_RPC_GUIDANCE: Readonly<Record<string, string>> = Object
   'process.stop': 'Use /stop to cancel the active native turn; this daemon has no background-process registry.',
   'reload.env': 'Restart the Bun daemon after changing environment values; live .env reload is unavailable.',
   'reload.mcp': 'Restart the Bun daemon after changing MCP configuration; live MCP reload is unavailable.',
-  'rollback.diff': 'Use /snapshots and /rollback <snapshot-id> for the native snapshot workflow.',
+  'rollback.diff': 'Use /rollback diff <snapshot-id> to preview the native snapshot restore.',
   'rollback.list': 'Use /snapshots for the native snapshot workflow.',
   'rollback.restore': 'Use /rollback <snapshot-id> for the native snapshot workflow.',
   'session.close': 'Native sessions are persistent; use /new or the session switcher instead.',
@@ -875,6 +875,12 @@ export class GatewayClient extends EventEmitter {
           text: String(params.text ?? '')
         }) as Promise<T>
 
+      case 'tool.inventory':
+      case 'snapshot.list':
+      case 'snapshot.preview':
+      case 'snapshot.restoreFile':
+        return this.rawRequest<T>(method, { ...params, session_key: this.keyFor(params.session_id) })
+
       case 'slash.exec':
         return this.slashExec(params) as Promise<T>
 
@@ -1263,7 +1269,8 @@ export class GatewayClient extends EventEmitter {
         info: await this.sessionInfoFromInitialize(raw, session, captured),
         // A resumed session can still be mid-turn (reattach to live work);
         // forward the inflight snapshot exactly like session.activate.
-        inflight: inflightFromSession(session),
+        todos: Array.isArray(session.todos) ? session.todos : undefined,
+      inflight: inflightFromSession(session),
         message_count: messageCount,
         messages,
         resumed: sessionId,
@@ -1311,6 +1318,7 @@ export class GatewayClient extends EventEmitter {
     return {
       info: await this.sessionInfoFromInitialize(raw, session, { info: null, usage: null }),
       inflight,
+      todos: Array.isArray(session.todos) ? session.todos : undefined,
       message_count: Number(session.message_count ?? session.messages ?? 0),
       // session.open returns the already-live transcript without competing
       // with its running turn.
@@ -1401,6 +1409,7 @@ export class GatewayClient extends EventEmitter {
     const subagentSnapshots = subagentSnapshotsFromSession(session)
 
     return {
+      todos: Array.isArray(session.todos) ? session.todos : undefined,
       inflight: inflightFromSession(session),
       messages: transcriptFromStoredMessages(session.transcript),
       session_id: String(session.id ?? sessionId),

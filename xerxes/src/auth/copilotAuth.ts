@@ -110,14 +110,33 @@ function requestDeadline(timeoutMs: number, signal?: AbortSignal): {
     () => controller.abort(new Error(`Copilot request timed out after ${timeoutMs}ms`)),
     timeoutMs,
   )
-  const dispose = (): void => clearTimeout(timer)
+  const onAbort = (): void => controller.abort(signal?.reason)
+  const dispose = (): void => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort) }
   if (!signal) return { dispose, signal: controller.signal }
   if (signal.aborted) controller.abort(signal.reason)
-  else signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true })
+  else signal.addEventListener('abort', onAbort, { once: true })
   return { dispose, signal: controller.signal }
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
+async function catalogRetryDelay(ms: number, signal?: AbortSignal, sleep?: (ms: number) => Promise<void>): Promise<void> {
+  signal?.throwIfAborted()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  try {
+    await new Promise<void>((resolve, reject) => {
+      onAbort = () => reject(signal?.reason)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (sleep) void Promise.resolve().then(() => sleep(ms)).then(resolve, reject)
+      else timer = setTimeout(resolve, ms)
+    })
+    signal?.throwIfAborted()
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (onAbort) signal?.removeEventListener('abort', onAbort)
+  }
+}
 
 /**
  * Derive the Copilot API base from the token's own claims.
@@ -194,9 +213,9 @@ export async function fetchCopilotModels(
   } = {},
 ): Promise<string[]> {
   const request = options.fetchImplementation ?? fetch
-  const sleep = options.sleep ?? defaultSleep
   const url = `${(options.apiBase ?? copilotApiBase(credential.access)).replace(/\/+$/, '')}/models`
   for (let attempt = 0; ; attempt += 1) {
+    options.signal?.throwIfAborted()
     const deadline = requestDeadline(COPILOT_REQUEST_TIMEOUT_MS, options.signal)
     let response: Response
     try {
@@ -207,13 +226,12 @@ export async function fetchCopilotModels(
         },
         signal: deadline.signal,
       })
-    } finally {
-      deadline.dispose()
-    }
     if (response.status === 429 && attempt < 2) {
       const retryAfter = Number(response.headers.get('retry-after'))
       const seconds = Number.isFinite(retryAfter) && retryAfter >= 0 ? Math.min(retryAfter, 30) : 1
-      await sleep(seconds * 1_000)
+      await response.body?.cancel()
+      deadline.dispose()
+      await catalogRetryDelay(seconds * 1_000, options.signal, options.sleep)
       continue
     }
     if (!response.ok) {
@@ -223,6 +241,7 @@ export async function fetchCopilotModels(
       )
     }
     const payload = asRecord(await response.json())
+    deadline.signal.throwIfAborted()
     const entries = Array.isArray(payload?.data) ? payload.data : []
     const ids: string[] = []
     for (const entry of entries) {
@@ -232,6 +251,9 @@ export async function fetchCopilotModels(
       if (id) ids.push(id)
     }
     return ids
+    } finally {
+      deadline.dispose()
+    }
   }
 }
 

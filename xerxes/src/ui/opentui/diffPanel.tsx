@@ -88,9 +88,9 @@ export function DiffPanelHotkey({
 }
 
 /** Enough for a basename plus the selection marker. */
-const FILE_PANE_WIDTH = 24
+const FILE_PANE_WIDTH = 36
 /** Below this the index would be taking columns the hunks need more. */
-const FILE_PANE_MIN_PANEL_WIDTH = 96
+const FILE_PANE_MIN_PANEL_WIDTH = 104
 
 /** Files are shown by basename; the full path is in the hunk header. */
 const baseName = (path: string) => path.split('/').at(-1) || path
@@ -257,6 +257,9 @@ export function DiffPanelOverlay({
     } else if (event.sequence === 'r') {
       consumeKey(event)
       reload()
+    } else if (event.name === 'left' || event.name === 'right') {
+      consumeKey(event)
+      scrollRef.current?.scrollBy({ x: event.name === 'right' ? 12 : -12, y: 0 })
     } else if (event.name === 'up') {
       consumeKey(event)
       scrollRef.current?.scrollBy(-1)
@@ -307,6 +310,8 @@ export function DiffPanelOverlay({
   // Only when the panel is wide enough that the index is not stealing the
   // columns the hunks need.
   const showFilePane = files.length > 1 && panelWidth >= FILE_PANE_MIN_PANEL_WIDTH
+  const codeWidth = Math.max(panelWidth - (showFilePane ? FILE_PANE_WIDTH + 1 : 0) - 8,
+    ...((diff?.lines ?? []).map(line => Bun.stringWidth(line.text) + (GUTTER_WIDTH + 1) * 2 + 4)))
   const location = cwd?.trim() || 'current workspace'
 
   // The file index is a where-am-I index, so its selection mirrors the
@@ -357,7 +362,7 @@ export function DiffPanelOverlay({
       <Box
         backgroundColor={t.color.completionBg}
         borderColor={t.color.border}
-        borderStyle="round"
+        borderSides={['top', 'bottom']}
         flexDirection="column"
         height={panelHeight}
         paddingX={2}
@@ -370,7 +375,7 @@ export function DiffPanelOverlay({
           <Box flexDirection="row" flexShrink={1} minWidth={0} overflow="hidden">
             <Text wrap="truncate-end">
               <Span color={t.color.accent}>{`${GLYPH.brand} `}</Span>
-              <Span color={t.ds.title}>working tree</Span>
+              <Span bold color={t.ds.title}>Working changes</Span>
               <Span color={t.ds.caption}> vs </Span>
               <Span color={t.ds.secondary}>HEAD</Span>
               <Span color={t.ds.separator}>{`  ${GLYPH.separator} `}</Span>
@@ -393,7 +398,7 @@ export function DiffPanelOverlay({
             </Text>
           </Box>
         </Box>
-        <Box flexDirection="row" flexGrow={1} flexShrink={1} minHeight={0}>
+        <Box flexDirection="row" flexGrow={1} flexShrink={1} minHeight={0} marginTop={1}>
         {/* A change set of forty-five files is not a document you read top to
             bottom — it is an index you navigate. The pane appears only when
             there is width to spare for it. */}
@@ -411,6 +416,7 @@ export function DiffPanelOverlay({
                 backgroundColor={index === fileIdx ? t.ds.selected : undefined}
                 flexDirection="row"
                 key={file.name}
+                onClick={() => { setFileIdx(index); scrollRef.current?.scrollTo({ x: 0, y: file.line + DIFF_HEADER_ROWS }) }}
               >
                 <Box flexGrow={1} minWidth={0} overflow="hidden">
                   {/* Paths clip from the LEFT — the filename is the part you
@@ -455,8 +461,8 @@ export function DiffPanelOverlay({
             ) : null}
           </Box>
         ) : null}
-        <scrollbox ref={scrollRef} style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }} viewportCulling>
-          <Box flexDirection="column">
+        <scrollbox ref={scrollRef} scrollX style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }} viewportCulling>
+          <Box flexDirection="column" width={codeWidth}>
             {loading ? <Text color={t.color.muted}>◌ Refreshing worktree changes…</Text> : null}
             {!loading && result?.kind === 'clean' ? (
               <Text color={t.color.muted}>working tree clean — nothing removed or replaced</Text>
@@ -498,7 +504,7 @@ export function DiffPanelOverlay({
           marginTop={1}
           paddingX={1}
         >
-          <Text color={t.color.muted}>{`↑↓ Navigate   ${PAGE_KEY_HINT}   R Refresh   ⇧⌘/⌃←/→ Resize`}</Text>
+          <Text color={t.color.muted}>{`↑↓ scroll · ←→ code · [ ] files   ${PAGE_KEY_HINT}   R Refresh   ⇧⌘/⌃←/→ Resize`}</Text>
           <Text color={t.color.muted}>Esc / Q Close</Text>
         </Box>
       </Box>

@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { STARTUP_RESUME_ID } from '../config/env.js'
 import { WHEEL_SCROLL_STEP } from '../config/limits.js'
+import { $agentRailVisible, $panelWidthDelta } from './panelSizeStore.js'
 import { agentContentWidth } from '../domain/agentPanelLayout.js'
 import { hasLeadGap, prevRenderedMsg } from '../domain/blockLayout.js'
 import { SECTION_NAMES, sectionMode } from '../domain/details.js'
@@ -55,6 +56,7 @@ import { isLiveTailActive } from './liveTailScroll.js'
 import { $overlayState, clearApprovalOverlay, clearClarifyOverlay, patchOverlayState } from './overlayStore.js'
 import { scrollWithSelectionBy } from './scroll.js'
 import { $spawnHistory, spawnHistoryForSession } from './spawnHistoryStore.js'
+import { $toolRunVisibility, toolRunExpanded } from './toolRunStore.js'
 import { $thinkingVisibility, thinkingRowExpanded } from './thinkingVisibilityStore.js'
 import { turnController } from './turnController.js'
 import { patchTurnState, useTurnSelector } from './turnStore.js'
@@ -160,7 +162,9 @@ export function useMainApp(gw: GatewayClient) {
   const sessionId = useStore($uiSessionId)
   const archivedAgentCount = spawnHistoryForSession(spawnHistory, sessionId)
     .reduce((count, snapshot) => count + snapshot.subagents.length, 0)
-  const cols = agentContentWidth(terminalCols, liveAgentCount + archivedAgentCount)
+  const railVisible = useStore($agentRailVisible)
+  const panelWidthDelta = useStore($panelWidthDelta)
+  const cols = agentContentWidth(terminalCols, liveAgentCount + archivedAgentCount, railVisible, panelWidthDelta)
 
   useEffect(() => {
     if (!stdout) {
@@ -450,6 +454,14 @@ export function useMainApp(gw: GatewayClient) {
     return rows
   }, [cols, detailsCtx, messageId, virtualHistoryItems])
 
+  const toolRunVisibility = useStore($toolRunVisibility)
+  const previousToolRuns = useRef(toolRunVisibility)
+  if (previousToolRuns.current !== toolRunVisibility) {
+    // Fold changes affect unmounted rows too. Discard measured heights from
+    // the previous shape before rebuilding the virtual scroll offsets.
+    heightCachesRef.current.clear()
+    previousToolRuns.current = toolRunVisibility
+  }
   const userPromptWidth = composerPromptWidth(ui.theme.brand.prompt)
   const heightCacheKey = `${ui.sid ?? 'draft'}:${cols}:${userPromptWidth}:${ui.compact ? '1' : '0'}:${detailsLayoutKey}`
 
@@ -466,7 +478,7 @@ export function useMainApp(gw: GatewayClient) {
     }
 
     return cache
-  }, [heightCacheKey])
+  }, [heightCacheKey, toolRunVisibility])
 
   const thinkingVisibility = useStore($thinkingVisibility)
   const estimateRowHeight = useCallback(
@@ -481,6 +493,7 @@ export function useMainApp(gw: GatewayClient) {
         thinkingExpanded: thinkingRowExpanded(thinkingVisibility, row.key),
         thinkingVisible: thinkingDetailsVisible,
         toolsVisible: toolsDetailsVisible,
+        toolRunExpanded: index => toolRunExpanded(toolRunVisibility, `${row.key}:run${index}`),
         userPrompt: ui.theme.brand.prompt
       })
 
@@ -515,6 +528,7 @@ export function useMainApp(gw: GatewayClient) {
       thinkingDetailsVisible,
       thinkingVisibility,
       toolsDetailsVisible,
+      toolRunVisibility,
       ui.compact,
       ui.detailsMode,
       ui.detailsModeCommandOverride,

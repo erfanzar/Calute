@@ -195,6 +195,7 @@ export interface SessionCreateResponse {
 }
 
 export interface SessionResumeResponse {
+  todos?: unknown[]
   inflight?: null | SessionInflightTurn
   info?: SessionInfo
   message_count?: number
@@ -265,6 +266,8 @@ export interface SessionInflightTurn {
 
 /** Persisted manifest row for a subagent the session spawned (daemon subagent_snapshots). */
 export interface SubagentSnapshotPayload {
+  provider_profile?: string
+  reasoning_effort?: string
   agent_id?: string
   api_calls?: number
   closed?: boolean
@@ -294,6 +297,7 @@ export interface SubagentSnapshotPayload {
 }
 
 export interface SessionActivateResponse {
+  todos?: unknown[]
   inflight?: null | SessionInflightTurn
   info?: SessionInfo
   message_count?: number
@@ -308,6 +312,7 @@ export interface SessionActivateResponse {
 
 /** Read-only live-session snapshot used by Agent View without attaching. */
 export interface SessionPeekResponse {
+  todos?: unknown[]
   inflight?: null | SessionInflightTurn
   messages: GatewayTranscriptMessage[]
   session_id: string
@@ -649,6 +654,8 @@ export interface RollbackRestoreResponse {
 // ── Subagent events ──────────────────────────────────────────────────
 
 export interface SubagentEventPayload {
+  provider_profile?: string
+  reasoning_effort?: string
   agent_name?: string
   agent_type?: string
   api_calls?: number

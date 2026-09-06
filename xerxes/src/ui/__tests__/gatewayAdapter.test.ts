@@ -578,6 +578,8 @@ describe('gatewayAdapter', () => {
         type: 'turn_end'
       },
       model: 'grok-code-fast',
+      provider_profile: 'audit-profile',
+      reasoning_effort: 'high',
       parent_id: 'runtime-parent',
       rules: ['read-only audit'],
       task_index: 1,
@@ -594,6 +596,8 @@ describe('gatewayAdapter', () => {
         files_written: ['src/policy.ts'],
         input_tokens: 1200,
         model: 'grok-code-fast',
+        provider_profile: 'audit-profile',
+        reasoning_effort: 'high',
         output_tokens: 320,
         reasoning_tokens: 90,
         rules: ['read-only audit'],

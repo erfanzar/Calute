@@ -21,14 +21,16 @@ export class WorkspacePathError extends ValidationError {
  * redirected through an existing symlink outside the workspace.
  */
 export class WorkspacePathResolver {
-  readonly root: string
+  private readonly fallbackRoot: string
 
-  constructor(root: string = process.cwd()) {
+  constructor(root: string = process.cwd(), private readonly activeRoot?: () => string | undefined) {
     if (!root.trim()) {
       throw new ValidationError('workspace_root', 'must not be empty', root)
     }
-    this.root = resolve(root)
+    this.fallbackRoot = resolve(root)
   }
+
+  get root(): string { return resolve(this.activeRoot?.() ?? this.fallbackRoot) }
 
   async resolve(candidate: string): Promise<string> {
     const normalized = validateCandidate(candidate)

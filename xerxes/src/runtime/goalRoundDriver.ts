@@ -27,6 +27,7 @@ import {
   admitGoalRound,
   blockGoal,
   getGoal,
+  goalTimeRemainingMs,
   type GoalMessageSource,
   type GoalView,
 } from './goalDomain.js'
@@ -51,6 +52,7 @@ export type GoalRoundRefusal =
   | 'not-active'
   | 'disarmed'
   | 'rounds-exhausted'
+  | 'time-exhausted'
   | 'human-work-pending'
 
 export type GoalRoundOutcome =
@@ -85,6 +87,22 @@ export function nextGoalRound(
   if (goal.phase !== 'active') return { refused: 'not-active', goal }
   if (goal.activation !== 'armed') return { refused: 'disarmed', goal }
   if (options.humanWorkPending) return { refused: 'human-work-pending', goal }
+  const now = options.now ?? Date.now()
+  if (goalTimeRemainingMs(goal, now) === 0) {
+    return {
+      refused: 'time-exhausted',
+      goal: blockGoal(
+        metadata,
+        sessionId,
+        { id: goal.id, revision: goal.revision },
+        {
+          code: 'time-limit',
+          message: 'Goal reached its configured wall-clock duration.',
+        },
+        now,
+      ),
+    }
+  }
   if (goal.roundsStarted >= goal.maxGoalRounds) {
     // Exhaustion is a durable outcome, not a silent stop. A goal that simply
     // stopped producing rounds is indistinguishable, from every surface a
@@ -102,12 +120,12 @@ export function nextGoalRound(
           code: 'round-limit',
           message: `Goal reached its configured limit of ${goal.maxGoalRounds} rounds.`,
         },
-        options.now ?? Date.now(),
+        now,
       ),
     }
   }
 
-  const source = admitGoalRound(metadata, sessionId, options.now ?? Date.now())
+  const source = admitGoalRound(metadata, sessionId, now)
   if (!source) return { refused: 'not-active', goal }
   return {
     admitted: {
@@ -133,6 +151,7 @@ export function goalRoundPrompt(goal: GoalView, round: number): string {
   return [
     '<goal_round>',
     `Objective: ${JSON.stringify(goal.objective)}`,
+    ...(goal.currentMilestone === undefined ? [] : [`Current milestone (progress context, not proof): ${JSON.stringify(goal.currentMilestone)}`]),
     `Round ${round} of ${goal.maxGoalRounds}.`,
     '',
     'The current workspace, this session\'s tool results, and the durable goal state are authoritative —',

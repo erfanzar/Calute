@@ -14,7 +14,7 @@ import { spawnRosterFromLine } from './toolStartDisplay.js'
 import { isToolTrailResultLine, parseToolTrailResultLine, toolTrailParts } from './text.js'
 
 /** Below this a run is not worth summarizing; the rows are cheaper to read. */
-export const TOOL_RUN_MIN = 4
+export const TOOL_RUN_MIN = 3
 
 export interface ToolRunSummary {
   /** Total seconds across the run, when the lines carried durations. */
@@ -145,6 +145,6 @@ export function toolRunSpawnRoster(lines: readonly string[]): { extra: number; n
 export const collapsedRunHeight = (group: ToolRunGroup): number => {
   if (group.kind === 'row') return 1
   const roster = toolRunSpawnRoster(group.lines)
-  const base = group.summary.slowestDuration > 0 ? 2 : 1
+  const base = 1
   return base + (roster?.names.length ?? 0) + (roster?.extra ? 1 : 0)
 }

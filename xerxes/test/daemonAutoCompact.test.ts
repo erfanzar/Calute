@@ -1230,3 +1230,69 @@ test("compaction completion still succeeds under a generous deadline", async () 
   expect(text).toBe("short summary");
   expect(calls).toBe(1);
 });
+
+test("external compaction cancellation releases a noncooperative provider promptly", async () => {
+  const controller = new AbortController();
+  const started = Promise.withResolvers<void>();
+  const client: LlmClient = {
+    stream(): AsyncIterable<LlmDelta> {
+      return (async function* stalled(): AsyncGenerator<LlmDelta> {
+        started.resolve();
+        await new Promise<void>(() => undefined);
+        yield { content: "never" };
+      })();
+    },
+  };
+  const port = compactionCompletionPort(client, "gpt-4", 60_000, controller.signal);
+  const pending = port({ prompt: "CONTEXT TO SUMMARIZE", maxTokens: 32, stream: false, temperature: 0 });
+  await started.promise;
+  controller.abort();
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+});
+
+test("already aborted lazy compaction does not construct its provider", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let constructions = 0;
+  const lazy = lazyCompactionCompletionPort(() => {
+    constructions += 1;
+    throw new Error("provider must not be constructed");
+  }, "gpt-4", 5_000, controller.signal);
+  await expect(lazy.port({ prompt: "CONTEXT", maxTokens: 32, stream: false, temperature: 0 }))
+    .rejects.toMatchObject({ name: "AbortError" });
+  await lazy.close();
+  expect(constructions).toBe(0);
+});
+
+test("external compaction cancellation does not retry with a smaller summary budget", async () => {
+  const controller = new AbortController();
+  const started = Promise.withResolvers<void>();
+  let calls = 0;
+  const client: LlmClient = {
+    stream(): AsyncIterable<LlmDelta> {
+      calls += 1;
+      return (async function* stalled(): AsyncGenerator<LlmDelta> {
+        started.resolve();
+        await new Promise<void>(() => undefined);
+        yield { content: "never" };
+      })();
+    },
+  };
+  const port = compactionCompletionPort(client, "gpt-4", 60_000, controller.signal);
+  const filler = "transcript filler ".repeat(40);
+  const pending = compactMessagesIfNeeded({
+    completion: port,
+    messages: [
+      { role: "user", content: `first ${filler}` },
+      { role: "assistant", content: `second ${filler}` },
+    ],
+    model: "gpt-4",
+    reason: "auto-compact",
+    summaryBudgets: [32, 16],
+  });
+  await started.promise;
+  controller.abort();
+  const outcome = await pending;
+  expect(outcome.compacted).toBe(false);
+  expect(calls).toBe(1);
+});

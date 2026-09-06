@@ -11,6 +11,51 @@ const nativeUnavailable = (ctx: SlashRunCtx, detail: string) =>
   ctx.transcript.sys(`unavailable in the native Bun daemon: ${detail}`)
 
 export const opsCommands: SlashCommand[] = [
+  { name: 'loop', help: 'manage bounded follow-ups for this conversation', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ loops: true, schedules: false }); else return runNativeSlash(ctx, `loop ${arg.trim()}`, 'Follow-ups') } },
+  { name: 'context', help: 'inspect context, pin memory and exclude stale recall', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ contextInspector: true }); else ctx.transcript.sys('usage: /context') } },
+  { name: 'mcp', help: 'inspect MCP health [status|reconnect <name>]', run: (arg, ctx) => runNativeSlash(ctx, `mcp ${arg.trim()}`, 'MCP connections') },
+  { name: 'snapshots', help: 'browse snapshot timeline [list]', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ snapshots: true }); else if (arg.trim() === 'list') runNativeSlash(ctx, 'snapshots', 'Snapshots'); else ctx.transcript.sys('usage: /snapshots [list]') } },
+  { name: 'workspaces', help: 'review retained agent workspaces [list|after <cursor>|inspect <id>]', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ workspaces: true }); else runNativeSlash(ctx, `workspaces ${arg.trim()}`, 'Agent workspaces') } },
+  { name: 'config', help: 'configure agents, MCP or LSP servers [agents|mcp|lsp]', run: (arg, ctx) => {
+    if (!arg.trim() || arg.trim() === 'agents') patchOverlayState({ agentSettings: true })
+    else if (arg.trim() === 'lsp') patchOverlayState({ lspSettings: true })
+    else if (arg.trim() === 'mcp') patchOverlayState({ mcpSettings: true })
+    else runNativeSlash(ctx, 'config', 'Runtime configuration')
+  } },
+  {
+    name: 'lsp',
+    help: 'inspect workspace language servers [status|release <name>]',
+    run: (arg, ctx) => runNativeSlash(ctx, `lsp ${arg.trim()}`, 'Language servers')
+  },
+  {
+    name: 'hooks',
+    help: 'inspect hooks [list|preview <event> [tool-name]|failures [event]]',
+    run: (arg, ctx) => runNativeSlash(ctx, `hooks ${arg.trim()}`, 'Hooks')
+  },
+  {
+    name: 'schedules',
+    help: 'manage workspace schedules [list|add|pause|resume|run|remove|legacy|migrate]',
+    run: (arg, ctx) => {
+      if (!arg.trim()) { patchOverlayState({ schedules: true, loops: false }); return }
+      return runNativeSlash(ctx, `schedules ${arg.trim()}`, 'Schedules')
+    }
+  },
+  {
+    name: 'monitors',
+    help: 'list or stop session watches [list|stop <id>]',
+    run: (arg, ctx) => {
+      if (!arg.trim()) { patchOverlayState({ monitors: true }); return }
+      return runNativeSlash(ctx, `monitors ${arg.trim()}`, 'Monitors')
+    }
+  },
+  {
+    help: 'inspect durable runs and unread results [list|unread|inspect|ack]',
+    name: 'runs',
+    run: (arg, ctx) => {
+      if (!arg.trim()) { patchOverlayState({ runs: true }); return }
+      runNativeSlash(ctx, `runs ${arg.trim()}`, 'Runs')
+    }
+  },
   {
     help: 'cancel the active native turn',
     name: 'stop',
@@ -80,7 +125,7 @@ export const opsCommands: SlashCommand[] = [
   },
 
   {
-    help: 'list snapshots or roll back to one',
+    help: 'list snapshots, preview with diff <id>, or restore one',
     name: 'rollback',
     run: (arg, ctx) => {
       const parts = arg.trim().split(/\s+/).filter(Boolean)
@@ -92,7 +137,13 @@ export const opsCommands: SlashCommand[] = [
       }
 
       if (lower === 'diff') {
-        return nativeUnavailable(ctx, 'snapshot diffs are not exposed; use /snapshots or /rollback <snapshot-id>.')
+        if (rest.length !== 1) return ctx.transcript.sys('usage: /rollback diff <snapshot-id>')
+        return runNativeSlash(ctx, `rollback diff ${rest[0]}`, 'Snapshot restore preview')
+      }
+
+      if (lower === 'apply') {
+        if (rest.length !== 2 || !/^[a-f0-9]{64}$/.test(rest[1]!)) return ctx.transcript.sys('usage: /rollback apply <snapshot-id> <preview-revision>')
+        return runNativeSlash(ctx, `rollback apply ${rest[0]} ${rest[1]}`, 'Restore reviewed snapshot')
       }
 
       const snapshotId = lower === 'restore' ? rest[0] : command
@@ -205,7 +256,7 @@ export const opsCommands: SlashCommand[] = [
   },
 
   {
-    help: 'list native skills',
+    help: 'list native skills, inspect <name>, or show discovery diagnostics',
     name: 'skills',
     run: (arg, ctx) => {
       const [sub = '', ...rest] = arg.trim().split(/\s+/).filter(Boolean)
@@ -216,10 +267,10 @@ export const opsCommands: SlashCommand[] = [
       }
 
       if (lower === 'inspect') {
-        return nativeUnavailable(
-          ctx,
-          'skill inspection is not exposed. Use /skills to list skills or /skill <name> to activate one.'
-        )
+        return runNativeSlash(ctx, `skills inspect ${rest.join(' ')}`, 'Skill inspection')
+      }
+      if (lower === 'diagnostics') {
+        return runNativeSlash(ctx, `skills diagnostics ${rest.join(' ')}`.trim(), 'Skill diagnostics')
       }
 
       if (lower === 'search' || lower === 'install' || lower === 'browse') {
@@ -230,15 +281,15 @@ export const opsCommands: SlashCommand[] = [
       }
 
       if (rest.length) {
-        return ctx.transcript.sys('usage: /skills [list]  (activate a discovered skill with /skill <name>)')
+        return ctx.transcript.sys('usage: /skills [list|inspect <name>|diagnostics]  (activate with /skill <name>)')
       }
 
-      ctx.transcript.sys('usage: /skills [list]  (activate a discovered skill with /skill <name>)')
+      ctx.transcript.sys('usage: /skills [list|inspect <name>|diagnostics]  (activate with /skill <name>)')
     }
   },
 
   {
-    help: 'list native plugins and plugin slash commands',
+    help: 'list native plugins or inspect <name>',
     name: 'plugins',
     run: (arg, ctx) => {
       const sub = arg.trim().split(/\s+/, 1)[0]?.toLowerCase()
@@ -246,6 +297,7 @@ export const opsCommands: SlashCommand[] = [
       if (!sub || sub === 'list') {
         return runNativeSlash(ctx, 'plugins', 'Plugins')
       }
+      if (sub === 'inspect') return runNativeSlash(ctx, `plugins ${arg.trim()}`, 'Plugin inspection')
 
       nativeUnavailable(
         ctx,
@@ -255,7 +307,7 @@ export const opsCommands: SlashCommand[] = [
   },
 
   {
-    help: 'list native tools',
+    help: 'inspect loaded, deferred and filtered native tools',
     name: 'tools',
     run: (arg, ctx) => {
       const sub = arg.trim().split(/\s+/, 1)[0]?.toLowerCase()

@@ -141,3 +141,35 @@ describe('shell hook execution', () => {
     expect(existsSync(marker)).toBe(true)
   })
 })
+
+describe.skipIf(process.platform === 'win32')('native hook deadlines', () => {
+  test('permission hooks that ignore TERM are killed and fail closed within a bounded deadline', async () => {
+    const dir = scratch()
+    const runner = new HookRunner()
+    registerShellHooks(runner, parseShellHookConfig({ PreToolUse: [{
+      command: "echo $$ > hook.pid; trap '' TERM; while :; do sleep 1; done", timeout_ms: 50,
+    }] }, 'test'), { cwd: dir })
+    const started = Date.now()
+    const results = await runner.run('tool_permission_check', { toolName: 'ReadFile' })
+    expect(results).toEqual([expect.objectContaining({ allow: false, reason: expect.stringContaining('timed out after 50ms') })])
+    expect(Date.now() - started).toBeLessThan(2000)
+    const pid = Number(readFileSync(join(dir, 'hook.pid'), 'utf8').trim())
+    for (let i = 0; i < 50; i++) {
+      try { process.kill(pid, 0) } catch { return }
+      await Bun.sleep(10)
+    }
+    throw new Error('Timed-out hook process survived SIGKILL')
+  })
+
+  test('a successful shell leaving an inherited pipe open still times out and cannot allow the tool', async () => {
+    const runner = new HookRunner()
+    registerShellHooks(runner, parseShellHookConfig({ PreToolUse: [{
+      command: "sleep 30 & printf '{\"allow\":true}'; exit 0", timeout_ms: 50,
+    }] }, 'test'), { cwd: scratch() })
+    const started = Date.now()
+    expect(await runner.run('tool_permission_check', { toolName: 'ReadFile' })).toEqual([
+      expect.objectContaining({ allow: false, reason: expect.stringContaining('timed out') }),
+    ])
+    expect(Date.now() - started).toBeLessThan(2000)
+  })
+})

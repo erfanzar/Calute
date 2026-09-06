@@ -22,7 +22,7 @@ export function summarizeToolStartDisplay(name: string, context: string, verbose
   }
 
   const raw = verboseArgs || context
-  const parsed = parseObject(raw)
+  const parsed = parseObject(raw) ?? parseObject(context)
 
   if (parsed) {
     return { context: summarizeStructuredArgs(toolName, parsed, context) }
@@ -31,6 +31,15 @@ export function summarizeToolStartDisplay(name: string, context: string, verbose
   // OpenTUI keeps tool calls as Grok-style one-line rows. A non-JSON
   // context can already be a useful daemon-provided label; raw argument
   // blobs are never carried into the persistent transcript.
+  if (/^\s*[{[]/.test(context || raw)) {
+    // Older daemons bounded arguments before summarizing. Recover only complete
+    // JSON string fields; never echo a broken payload or its content fields.
+    const fields: Record<string, unknown> = {}
+    for (const match of (context || raw).matchAll(/"(cmd|command|file_path|path|task_id)"\s*:\s*("(?:[^"\\]|\\.)*")/g)) {
+      try { fields[match[1]!] = JSON.parse(match[2]!) } catch { /* Incomplete escaped value. */ }
+    }
+    return { context: Object.keys(fields).length ? summarizeStructuredArgs(toolName, fields, '') : 'arguments truncated' }
+  }
   return { context: compact(context || raw) }
 }
 

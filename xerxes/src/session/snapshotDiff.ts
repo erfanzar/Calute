@@ -16,7 +16,7 @@ export interface SnapshotDiff {
 export async function diffAgainstSnapshot(manager: SnapshotManager, ref: string): Promise<SnapshotDiff> {
   const snapshot = manager.get(ref)
   if (!snapshot) throw new Error(`snapshot not found: ${ref}`)
-  const diffText = await manager.runGit(['diff', snapshot.commitSha, '--', '.'])
+  const diffText = await manager.diff(ref)
   const summary = summarizeDiff(diffText)
   return { snapshot, diffText, ...summary }
 }

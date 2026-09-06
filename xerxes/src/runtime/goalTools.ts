@@ -18,14 +18,13 @@
  * additionally reachable from the goal's own continuation round. Subagents get
  * none of it. Written against Xerxes's tool registry; no source is reproduced.
  *
- * What is deliberately kept from the old guard: a `complete` claim still has
- * to be backed by verification evidence from the current turn. DeepSeek's own
- * README lists evaluator-backed certification as deferred work — their protocol
- * trusts the model's judgement about when evidence is sufficient. Ours does
- * not, and that check is the one thing here worth not copying.
+ * Declared criteria require a record linked to a successful session tool call.
+ * The host checks execution outcome; the model explains relevance. This is
+ * an auditable claim, not evaluator-backed certification or a command whitelist.
  */
 
 import { ValidationError } from '../core/errors.js'
+import { successfulGoalEvidence } from './goalEvidence.js'
 import type { ToolExecutionContext } from '../executors/toolRegistry.js'
 import { ToolRegistry } from '../executors/toolRegistry.js'
 import type { JsonObject, ToolDefinition } from '../types/toolCalls.js'
@@ -39,6 +38,9 @@ import {
   getGoal,
   pauseGoal,
   resumeGoal,
+  recordGoalEvidence,
+  setGoalMilestone,
+  type GoalCriterionSpec,
   type GoalView,
 } from './goalDomain.js'
 
@@ -60,6 +62,11 @@ export interface GoalToolHost {
   isHumanTurn(context: ToolExecutionContext): boolean
   /** The current goal round when this turn is one, else undefined. */
   currentRound(context: ToolExecutionContext): number | undefined
+  /** A completed execution from this session, resolved by the host rather than model-supplied data. */
+  evidenceExecution?(context: ToolExecutionContext, toolCallId: string): unknown
+  goalCreated?(context: ToolExecutionContext, goal: GoalView): void
+  tokenUsage?(context: ToolExecutionContext, goal: GoalView): unknown
+  validateResume?(context: ToolExecutionContext, goal: GoalView): void
   now?(): number
 }
 
@@ -67,7 +74,7 @@ export interface GoalToolOptions {
   readonly blockedAfterConsecutiveRounds?: number
 }
 
-const view = (goal: GoalView | undefined) =>
+const goalView = (goal: GoalView | undefined) =>
   goal === undefined
     ? { goal: null }
     : {
@@ -75,13 +82,41 @@ const view = (goal: GoalView | undefined) =>
           id: goal.id,
           revision: goal.revision,
           objective: goal.objective,
+          ...(goal.currentMilestone === undefined ? {} : { currentMilestone: goal.currentMilestone }),
           phase: goal.phase,
           roundsStarted: goal.roundsStarted,
           maxGoalRounds: goal.maxGoalRounds,
+          ...(goal.maxTotalTokens === undefined ? {} : { maxTotalTokens: goal.maxTotalTokens }),
+          ...(goal.maxDurationMs === undefined ? {} : { maxDurationMs: goal.maxDurationMs, deadlineAt: goal.createdAt + goal.maxDurationMs }),
+          ...(goal.criteria ? { criteria: goal.criteria } : {}),
           ...(goal.blockedReason ? { blockedReason: goal.blockedReason } : {}),
         },
         activation: goal.activation,
       }
+
+function criterionSchema() {
+  return { type: 'array', maxItems: 32, description: 'Explicit completion criteria; create or edit only. Keep stable IDs when unchanged.',
+    items: { type: 'object', additionalProperties: false, required: ['id', 'description'], properties: {
+      id: { type: 'string', maxLength: 80 }, description: { type: 'string', maxLength: 1000 },
+    } } }
+}
+
+function criteriaInput(value: unknown): readonly GoalCriterionSpec[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value) || value.length > 32) throw new ValidationError('criteria', 'must be an array of at most 32 criteria')
+  return value.map(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || typeof item.description !== 'string'
+      || Object.keys(item).some(key => key !== 'id' && key !== 'description')) throw new ValidationError('criteria', 'each criterion must contain only id and description')
+    return { id: item.id, description: item.description }
+  })
+}
+
+function milestoneInput(inputs: JsonObject): string | null | undefined {
+  const value = inputs.current_milestone
+  if (value === undefined || value === null) return value
+  if (typeof value !== 'string') throw new ValidationError('current_milestone', 'must be text or null to clear')
+  return value
+}
 
 export const GOAL_TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
   {
@@ -108,6 +143,10 @@ export const GOAL_TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
         required: ['objective'],
         properties: {
           objective: { type: 'string', description: 'The completion objective, as the human stated it.' },
+          current_milestone: { type: 'string', maxLength: 1000, description: 'Optional current work milestone. Progress context only, not completion evidence.' },
+          criteria: criterionSchema(),
+          max_duration_ms: { type: 'integer', minimum: 1, description: 'Optional wall-time limit in milliseconds from goal creation, including paused time. Set only from the human request.' },
+          max_total_tokens: { type: 'integer', minimum: 1, description: 'Optional total counted token admission cap. Starts with provider calls after goal creation; includes descendants and cache tokens. Already admitted concurrent calls can exceed the cap. Set only from the human request.' },
           max_goal_rounds: {
             type: 'integer',
             description: `Total automatic continuation rounds allowed. Defaults to ${DEFAULT_MAX_GOAL_ROUNDS}.`,
@@ -132,11 +171,18 @@ export const GOAL_TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
           revision: { type: 'integer', description: 'Exact revision from get_goal.' },
           action: {
             type: 'string',
-            enum: ['edit', 'pause', 'resume', 'complete', 'blocked'],
+            enum: ['edit', 'pause', 'resume', 'complete', 'blocked', 'record_evidence', 'milestone'],
             description: 'Lifecycle transition to apply.',
           },
           objective: { type: 'string', description: 'Replacement objective; action "edit" only.' },
+          current_milestone: { type: ['string', 'null'], maxLength: 1000, description: 'Current work milestone; milestone or edit action only. Null clears it. Does not change objective, budgets, evidence, or phase.' },
+          criteria: criterionSchema(),
+          criterion_id: { type: 'string', description: 'Criterion receiving evidence; record_evidence only.' },
+          tool_call_id: { type: 'string', description: 'Exact completed successful tool call in this session; record_evidence only.' },
+          evidence_summary: { type: 'string', description: 'Explain what this result establishes for the criterion. Relevance is your assessment, not an automatic certification.' },
           max_goal_rounds: { type: 'integer', description: 'Replacement round cap; action "edit" only.' },
+          max_duration_ms: { type: 'integer', minimum: 1, description: 'Replacement wall-time limit from original creation; action "edit" only. Requires human authorization.' },
+          max_total_tokens: { type: 'integer', minimum: 1, description: 'Replacement total token admission cap; edit only, preserves recorded spend and requires human authorization.' },
           blocked_reason: {
             type: 'string',
             description: 'The concrete condition that persists; action "blocked" only.',
@@ -153,8 +199,15 @@ export function goalPolicyPrompt(blockedAfterConsecutiveRounds: number): string 
     '[Goal policy]',
     'Use the goal tools for one long-running completion objective in the current session. create_goal may',
     'infer goal intent from a direct human request in any language; do not create a goal for routine',
-    'single-turn work. Call get_goal before update_goal and copy its exact goal_id and revision. After a',
-    'session resume or fork an active goal is disarmed: when a human asks to continue or resume, in any',
+    'single-turn work. Call get_goal before update_goal and copy its exact goal_id and revision.',
+    'Declare concrete criteria when creating a goal. Attach evidence with record_evidence using the exact',
+    'tool_call_id of a successful completed call in this session and explain its relevance. Every declared',
+    'criterion needs evidence before completion. Execution success is not automatic proof of relevance.',
+    'Keep the current milestone up to date with action milestone and current_milestone. This records',
+    'what you are working on; it does not prove a criterion or change the goal objective or budget.',
+    'The user can accept a criterion with a decision note in F10. Such evidence is labelled user-decision',
+    'in get_goal. You cannot create a user decision; record_evidence only records tool-result evidence.',
+    'After a session resume or fork an active goal is disarmed: when a human asks to continue or resume, in any',
     'wording or language, use update_goal action resume to rearm it. Mark complete only when the objective',
     'is actually achieved and THIS turn ran the check that proves it — not your recollection of an earlier',
     'round, and not a plausible argument that it must be true. If you have not run that check yet, run it',
@@ -177,6 +230,7 @@ export function registerGoalTools(
     throw new ValidationError('blockedAfterConsecutiveRounds', 'must be a positive integer', threshold)
   }
   const now = () => host.now?.() ?? Date.now()
+  const view = (goal: GoalView | undefined) => goalView(goal)
   const capabilities = {
     concurrencySafe: false,
     defer: false,
@@ -188,7 +242,8 @@ export function registerGoalTools(
   const byName: Record<string, (inputs: JsonObject, context: ToolExecutionContext) => unknown> = {
     get_goal: (_inputs, context) => {
       assertMainAgent(context)
-      return view(getGoal(host.metadata(context), host.sessionId(context)))
+      const goal = getGoal(host.metadata(context), host.sessionId(context))
+      return { ...view(goal), ...(goal && host.tokenUsage ? { token_usage: host.tokenUsage(context, goal) } : {}) }
     },
 
     create_goal: (inputs, context) => {
@@ -198,18 +253,31 @@ export function registerGoalTools(
       assertHumanAuthority(host, context, 'create_goal')
       const objective = requiredString(inputs, 'objective')
       const maxGoalRounds = optionalInteger(inputs, 'max_goal_rounds')
-      return wrap(() =>
-        view(createGoal(
+      const maxDurationMs = optionalInteger(inputs, 'max_duration_ms')
+      const maxTotalTokens = optionalInteger(inputs, 'max_total_tokens')
+      const criteria = criteriaInput(inputs.criteria)
+      const currentMilestone = milestoneInput(inputs)
+      if (currentMilestone === null) throw new ValidationError('current_milestone', 'omit it when creating a goal without a milestone')
+      return wrap(() => {
+        const goal = createGoal(
           host.metadata(context),
           host.sessionId(context),
-          { objective, ...(maxGoalRounds === undefined ? {} : { maxGoalRounds }) },
+          { objective, ...(maxGoalRounds === undefined ? {} : { maxGoalRounds }), ...(maxDurationMs === undefined ? {} : { maxDurationMs }), ...(maxTotalTokens === undefined ? {} : { maxTotalTokens }), ...(criteria === undefined ? {} : { criteria }), ...(currentMilestone === undefined ? {} : { currentMilestone }) },
           now(),
-        )))
+        )
+        host.goalCreated?.(context, goal)
+        return view(goal)
+      })
     },
 
     update_goal: (inputs, context) => {
       assertMainAgent(context)
       const action = requiredString(inputs, 'action')
+      if (inputs.current_milestone !== undefined && action !== 'edit' && action !== 'milestone') throw new ValidationError('current_milestone', 'is only accepted for action edit or milestone')
+      if (action === 'milestone' && Object.keys(inputs).some(key => !['goal_id', 'revision', 'action', 'current_milestone'].includes(key))) throw new ValidationError('action', 'milestone changes only current_milestone')
+      if (inputs.criteria !== undefined && action !== 'edit') throw new ValidationError('criteria', 'is only accepted for action edit')
+      if (inputs.max_duration_ms !== undefined && action !== 'edit') throw new ValidationError('max_duration_ms', 'is only accepted for action edit')
+      if (inputs.max_total_tokens !== undefined && action !== 'edit') throw new ValidationError('max_total_tokens', 'is only accepted for action edit')
       const ref = { id: requiredString(inputs, 'goal_id'), revision: requiredIntegerField(inputs, 'revision') }
       const metadata = host.metadata(context)
       const sessionId = host.sessionId(context)
@@ -223,30 +291,42 @@ export function registerGoalTools(
           case 'edit': {
             const objective = optionalString(inputs, 'objective')
             const maxGoalRounds = optionalInteger(inputs, 'max_goal_rounds')
+            const maxDurationMs = optionalInteger(inputs, 'max_duration_ms')
+            const maxTotalTokens = optionalInteger(inputs, 'max_total_tokens')
+            const criteria = criteriaInput(inputs.criteria)
+            const currentMilestone = milestoneInput(inputs)
             return view(editGoal(metadata, sessionId, ref, {
               ...(objective === undefined ? {} : { objective }),
               ...(maxGoalRounds === undefined ? {} : { maxGoalRounds }),
+              ...(maxDurationMs === undefined ? {} : { maxDurationMs }),
+              ...(maxTotalTokens === undefined ? {} : { maxTotalTokens }),
+              ...(criteria === undefined ? {} : { criteria }),
+              ...(currentMilestone === undefined ? {} : { currentMilestone }),
+            }, now()))
+          }
+          case 'milestone': {
+            assertConcludeAuthority(host, context, 'update milestone', expectCurrentGoal(metadata, sessionId, ref))
+            const currentMilestone = milestoneInput(inputs)
+            if (currentMilestone === undefined) throw new ValidationError('current_milestone', 'is required for action milestone; use null to clear')
+            return view(setGoalMilestone(metadata, sessionId, ref, currentMilestone, now()))
+          }
+          case 'record_evidence': {
+            assertConcludeAuthority(host, context, 'record evidence', expectCurrentGoal(metadata, sessionId, ref))
+            const toolCallId = requiredString(inputs, 'tool_call_id')
+            if (!successfulGoalEvidence(host.evidenceExecution?.(context, toolCallId), toolCallId)) throw new GoalError('Evidence must reference a completed successful tool call in this session; missing, failed, denied or pending results cannot satisfy a criterion', 'GOAL_INVALID_TRANSITION')
+            return view(recordGoalEvidence(metadata, sessionId, ref, requiredString(inputs, 'criterion_id'), {
+              toolCallId, summary: requiredString(inputs, 'evidence_summary'), recordedAt: now(),
             }, now()))
           }
           case 'pause':
             return view(pauseGoal(metadata, sessionId, ref, now()))
           case 'resume':
+            host.validateResume?.(context, expectCurrentGoal(metadata, sessionId, ref))
             return view(resumeGoal(metadata, sessionId, ref, now()))
           case 'complete': {
             assertConcludeAuthority(host, context, 'complete', expectCurrentGoal(metadata, sessionId, ref))
-            // Deliberately not gated on mechanically detected "verification
-            // evidence". That gate existed here and was removed after a live
-            // run: the model wrote the file, proved it with `cmp` (exit 0), and
-            // was refused, because the detector recognises verification by a
-            // hardcoded list of command names and `cmp` is not on it. It then
-            // deleted its own correct work and started over.
-            //
-            // A whitelist of blessed command names cannot enumerate how a
-            // thing is checked, so it fails exactly where the model was most
-            // careful — and being punished for a correct proof is worse than
-            // no gate at all. The requirement now lives in the policy prompt,
-            // where it can be stated in full, plus the closing brief that makes
-            // the model say to the person how it verified the work.
+            // Declared criteria are checked in the domain. Legacy goals without
+            // criteria retain their existing policy-based completion behavior.
             const completed = completeGoal(metadata, sessionId, ref, now())
             return withWrapup(host, context, view(completed), completed.objective)
           }
@@ -265,7 +345,7 @@ export function registerGoalTools(
             return withWrapup(host, context, view(blocked), blocked.objective, message)
           }
           default:
-            throw new ValidationError('action', 'must be edit, pause, resume, complete, or blocked', action)
+            throw new ValidationError('action', 'must be edit, pause, resume, complete, blocked, record_evidence, or milestone', action)
         }
       })
     },

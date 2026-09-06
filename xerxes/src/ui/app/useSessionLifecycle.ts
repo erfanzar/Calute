@@ -409,6 +409,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             usage: usageFrom(info)
           })
           hydrateLiveSessionInflight(r.inflight)
+          turnController.recordTodos(r.todos)
           setTimeout(() => scrollRef.current?.scrollToBottom(), 0)
         })
         .catch((e: Error) => {
@@ -475,6 +476,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               usage: usageFrom(info)
             })
             hydrateLiveSessionInflight(r.inflight)
+            turnController.recordTodos(r.todos)
 
             // Agent View "attach" is non-destructive: the chat you came from
             // remains live (and may keep working) while the saved chat becomes

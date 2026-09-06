@@ -1111,8 +1111,7 @@ class TurnController {
       // Prefer daemon-preserved semantic context when a prompt-heavy argument
       // object was too large to keep as valid JSON. Ordinary bounded arguments
       // still pass through the same summarizer as live tool.start rows.
-      const context = tool.context
-        || (tool.arguments ? summarizeToolStartDisplay(name, '', tool.arguments).context : '')
+      const context = summarizeToolStartDisplay(name, tool.context ?? '', tool.arguments).context
 
       if (tool.ok === undefined) {
         const id = tool.id ?? `inflight-${name}-${this.activeTools.length}`
@@ -1211,7 +1210,7 @@ class TurnController {
       this.clearNotice(yieldingNoticeKey)
     }
     patchUiState({ busy: true })
-    patchTurnState({ activity: [], outcome: '', subagents: [], todos: [], toolTokens: 0, tools: [], turnTrail: [] })
+    patchTurnState({ activity: [], outcome: '', subagents: [], toolTokens: 0, tools: [], turnTrail: [] })
   }
 
   upsertSubagent(

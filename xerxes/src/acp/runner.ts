@@ -8,6 +8,8 @@ import { formatSubagentResults } from '../daemon/turnRunner.js'
 import type { LlmClient } from '../llms/client.js'
 import type { SpawnedAgentSnapshot } from '../operators/subagents.js'
 import { createAgentState, type AgentState, type PermissionRequest, type StreamEvent } from '../streaming/events.js'
+import { EditFeedback } from '../runtime/editFeedback.js'
+import { withActiveSession } from '../runtime/sessionContext.js'
 import { runTurn } from '../streaming/loop.js'
 import type { PermissionBroker, PermissionDecision, PermissionMode, ToolPolicy } from '../streaming/permissions.js'
 import type { ToolDefinition } from '../types/toolCalls.js'
@@ -17,6 +19,7 @@ import type { AcpEventEmitter, AcpModelInfo, AcpPromptRequest, AcpWireEvent } fr
 import { toAcpEvent } from './events.js'
 
 export interface AcpAgentRunnerOptions {
+  readonly createEditFeedback?: (cwd: string) => EditFeedback
   readonly agentId?: string
   readonly defaultPermissionMode?: PermissionMode
   readonly llm: LlmClient
@@ -147,12 +150,14 @@ export class AcpAgentRunner {
     const summary: Record<string, unknown> = { ok: true, cancelled: false }
     const subagentCohort = this.options.subagentCoordinator?.begin(session.sessionId)
     let pendingAgentEventSnapshots: readonly SpawnedAgentSnapshot[] = []
+    const feedback = this.options.createEditFeedback?.(session.cwd)
+    const executor = this.options.toolExecutor && feedback ? feedback.wrap(this.options.toolExecutor) : this.options.toolExecutor
 
     try {
       const permissionBroker: PermissionBroker = {
         request: (permission, signal) => this.resolvePermission(session, permission, emit, signal),
       }
-      for await (const event of runTurn({
+      for await (const event of withActiveSession(session, runTurn({
         model,
         state,
         userMessage: request.text,
@@ -181,10 +186,17 @@ export class AcpAgentRunner {
         llm: this.options.llm,
         permissionBroker,
         ...(this.options.policy ? { policy: this.options.policy } : {}),
-        ...(this.options.toolExecutor ? { toolExecutor: this.options.toolExecutor } : {}),
-      }, controller.signal)) {
+        ...(executor ? { toolExecutor: executor } : {}),
+      }, controller.signal))) {
         if (event.type === 'permission_request') {
           continue
+        }
+        if (event.type === 'turn_done' && feedback && !controller.signal.aborted) {
+          const report = await feedback.report(controller.signal)
+          if (report) {
+            state.messages.push({ role: 'user', content: report })
+            await emit(toAcpEvent({ type: 'text', text: '\n\n' + report }).toWire())
+          }
         }
         await emit(toAcpEvent(event).toWire())
         updateSummary(summary, event)

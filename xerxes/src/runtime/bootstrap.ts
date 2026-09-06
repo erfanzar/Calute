@@ -335,7 +335,7 @@ export function buildBootstrapSystemPrompt(
     )
     if (toolNames.has('SpawnAgents')) {
       sections.push(
-        '- You may spawn any number of agents in one batch. Choose the count according to the scale and genuinely independent workload. The whole batch runs without an artificial ceiling; never add redundant agents just to increase the count.',
+        '- Spawn at most 32 agents per batch. Registration is concurrency-limited. Choose the count for independent work; never add redundant agents just to increase it. Use configured intelligence tiers when appropriate; the tool description lists available model mappings.',
       )
     }
     if (subagents.length) {

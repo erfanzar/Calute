@@ -5,7 +5,6 @@ import { TUI_SESSION_MODEL_FLAG } from '../../../domain/slash.js'
 import type {
   ConfigGetValueResponse,
   ConfigSetResponse,
-  SessionBranchResponse,
   SessionCompressResponse,
   SessionUsageResponse
 } from '../../../gatewayTypes.js'
@@ -230,23 +229,16 @@ export const sessionCommands: SlashCommand[] = [
 
   {
     aliases: ['fork'],
-    help: 'branch the session',
+    help: 'branch the session; --through-turn N selects a completed retained turn',
     name: 'branch',
     run: (arg, ctx) => {
-      const prevSid = ctx.sid
-
-      ctx.gateway.rpc<SessionBranchResponse>('session.branch', { name: arg, session_id: ctx.sid }).then(
-        ctx.guarded<SessionBranchResponse>(r => {
-          if (!r.session_id) {
-            return
-          }
-
-          void ctx.session.closeSession(prevSid)
-          patchUiState({ sid: r.session_id })
-          ctx.session.setSessionStartedAt(Date.now())
-          ctx.transcript.sys(`branched → ${r.title ?? ''}`)
-        })
-      ).catch(ctx.guardedErr)
+      if (ctx.session.guardBusySessionSwitch('branch the session')) return
+      ctx.gateway.rpc<{ ok?: boolean; error?: string; session?: { id?: string } }>('slash', { command: `/branch ${arg}`.trim() })
+        .then(ctx.guarded(r => {
+          if (r.ok !== true || typeof r.session?.id !== 'string' || !r.session.id) throw new Error(r.error ?? 'Branch creation returned no session')
+          ctx.session.resumeById(r.session.id, { keepCurrent: true })
+        }))
+        .catch(ctx.guardedErr)
     }
   },
 

@@ -6,8 +6,9 @@
 // A bare `process.kill(pid, 0)` is not enough on its own: pids are recycled, so
 // an unrelated program can inherit the pid recorded in a stale file and either
 // block recovery forever or, worse, be mistaken for ours. Proving identity
-// always takes two steps — the process is alive, and its command line is the
-// one we recorded.
+// requires more than liveness. Command and start-time mismatches disprove
+// ownership; neither matching strings nor an unreadable probe grants authority
+// to signal a recovered PID. Run history records both when available.
 //
 // The TUI keeps its own copy of this discipline in `ui/gatewayClient.ts`
 // alongside its daemon-signature matcher. That duplication is deliberate: the
@@ -54,6 +55,8 @@ export function processCommand(pid: number, platform: NodeJS.Platform = process.
   try {
     return execFileSync(command, args, {
       encoding: 'utf8',
+      timeout: 1_000,
+      maxBuffer: 64_000,
       stdio: ['ignore', 'pipe', 'ignore'],
       ...(isWindows(platform) ? { windowsHide: true } : {})
     }).trim()
@@ -90,4 +93,26 @@ export function processCommandProbe(
     ]
   }
   return ['ps', ['-p', String(pid), '-o', 'command=']]
+}
+
+/**
+ * OS start identity, used only to disprove ownership of retained records.
+ * Empty means unknown, never permission to signal or take over a process.
+ * POSIX ps exposes second precision; this is an additional recovery check,
+ * not an atomic process handle or proof against same-second PID reuse.
+ */
+export function processStartIdentity(pid: number, platform: NodeJS.Platform = process.platform): string {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return ''
+  const windows = isWindows(platform)
+  try {
+    const value = execFileSync(windows ? 'powershell.exe' : 'ps', windows
+      ? ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CreationDate.ToUniversalTime().ToString("o")`]
+      : ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf8', timeout: 1_000, maxBuffer: 4_096,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, LC_ALL: 'C', TZ: 'UTC0' },
+      ...(windows ? { windowsHide: true } : {})
+    }).trim()
+    return value ? `${platform}:${value}` : ''
+  } catch { return '' }
 }

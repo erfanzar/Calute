@@ -815,3 +815,36 @@ class CancelAwareRunner implements TurnRunner {
     })
   }
 }
+
+test('host cancellation reaches the active runner and rejected submits cannot cancel its owner', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-host-cancel-'))
+  const runner = new CancelAwareRunner()
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') })
+  const owner = new AbortController()
+  try {
+    const events: DaemonEvent[] = []
+    const turn = runtime.submitTurn('scheduled', 'wait', event => events.push(event), { signal: owner.signal })
+    await runner.waiting
+    const rejected = new AbortController()
+    await expect(runtime.submitTurn('scheduled', 'duplicate', () => {}, { signal: rejected.signal })).rejects.toThrow('already active')
+    rejected.abort()
+    expect(runtime.sessionStatus('scheduled')?.status).toBe('working')
+    owner.abort(new Error('schedule expired'))
+    await turn
+    expect(events.find(event => event.type === 'turn_end')?.payload.cancelled).toBe(true)
+    expect(runtime.sessionStatus('scheduled')?.status).toBe('idle')
+  } finally { owner.abort(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test('an already cancelled host submission never opens a session or starts a runner', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-host-preabort-'))
+  let runs = 0
+  const runtime = new InMemoryDaemonRuntime({ async *run() { runs++; yield { type: 'text_part', payload: { text: 'unexpected' } } } }, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') })
+  try {
+    const cancellation = new AbortController()
+    cancellation.abort(new Error('expired before admission'))
+    await expect(runtime.submitTurn('never-opened', 'work', () => {}, { signal: cancellation.signal })).rejects.toThrow('expired before admission')
+    expect(runs).toBe(0)
+    expect(runtime.sessionStatus('never-opened')).toBeUndefined()
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})

@@ -25,7 +25,7 @@ import type {
   SessionPeekResponse,
   SessionSteerResponse
 } from '../gatewayTypes.js'
-import { GLYPH, leaderRun, type NocturneState, stateSkin } from '../domain/nocturne.js'
+import { GLYPH, type NocturneState, stateSkin } from '../domain/nocturne.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
 import { compactPreview as compact } from '../lib/text.js'
 import type { Theme } from '../theme.js'
@@ -260,6 +260,7 @@ function SessionInspector({
 /** Exported for the assembled-screen test; `SessionPicker` is its only user. */
 export function SessionListRow({
   compactMode,
+  roomy = false,
   counts,
   firstInGroup,
   maxLabelWidth,
@@ -268,6 +269,7 @@ export function SessionListRow({
   t
 }: {
   compactMode?: boolean
+  roomy?: boolean
   counts: Record<SessionGroup, number>
   firstInGroup: boolean
   maxLabelWidth: number
@@ -320,18 +322,15 @@ export function SessionListRow({
 
   if (row.kind === 'saved') {
     const age = relativeAge(row.item.last_message_at ?? row.item.started_at)
-    // The group caption already says these are saved chats, so the row does
-    // not repeat the word. What it owes you is the size and the age, and
-    // those hang RIGHT on a dotted leader so thirty-seven of them stack into
-    // a column you can read vertically instead of a ragged left-packed edge.
+    // Right-align history metadata without a screen-wide dotted leader.
     const right = `${row.item.message_count} msgs${age ? ` · ${age}` : ''}`
     const name = compact(title, Math.max(8, maxLabelWidth - right.length - 8))
-    const dots = leaderRun(maxLabelWidth, name.length + 3, right.length)
+    const dots = ' '.repeat(Math.max(2, maxLabelWidth - name.length - right.length - 4))
 
     return (
       <>
         {caption}
-        <box backgroundColor={selectionBg} flexDirection="row" flexShrink={0} width="100%">
+        <box backgroundColor={selectionBg} flexDirection="row" flexShrink={0} marginBottom={roomy ? 1 : 0} width="100%">
           {/* Shared edge column: the needs-input accent strip paints here
               without shifting any other row's text column by one cell. */}
           <box flexShrink={0} width={1} />
@@ -359,7 +358,7 @@ export function SessionListRow({
   return (
     <>
       {caption}
-      <box backgroundColor={selectionBg} flexDirection="row" flexShrink={0} width="100%">
+      <box backgroundColor={selectionBg} flexDirection="row" flexShrink={0} marginBottom={roomy ? 1 : 0} width="100%">
         {/* Mockup 04: needs-input cards get a thicker accent edge so the
             "unblock me" group reads before anything is selected — the same
             left strip the agent-rail cards paint. */}
@@ -415,7 +414,8 @@ export function SessionPicker({ actions, currentSessionId, onCancel, t: supplied
   const { gw } = useGateway()
   const storeSessionId = useStore($uiSessionId)
   const storeTheme = useStore($uiTheme)
-  const { height, width } = useTerminalDimensions()
+  const { height: terminalHeight, width: terminalWidth } = useTerminalDimensions()
+  const width = terminalWidth >= 120 ? Math.min(160, terminalWidth - 8) : terminalWidth
   const t = suppliedTheme ?? storeTheme
   const effectiveSessionId = currentSessionId === undefined ? storeSessionId : currentSessionId
 
@@ -802,8 +802,12 @@ export function SessionPicker({ actions, currentSessionId, onCancel, t: supplied
   // short terminal it is not drawn at all, because one rule is not worth a
   // row of the list it is ruling off. Counted here so the budget and the
   // paint cannot disagree.
+  const desiredHeight = Math.max(peek ? 36 : rows.length ? 24 : 12,
+    12 + rows.reduce((total, row) => total + (row.kind === 'live' ? 3 : 2), 0) + new Set(rows.map(row => row.group)).size)
+  const height = terminalHeight >= 30 ? Math.min(44, terminalHeight - 6, desiredHeight) : terminalHeight
+  const roomy = height >= 24
   const showHeaderRule = height >= 20
-  const chromeRows = (error || notice ? 8 : 7) + (showHeaderRule ? 1 : 0)
+  const chromeRows = (error || notice ? 8 : 7) + (showHeaderRule ? 1 : 0) + (roomy ? 2 : 0)
   // Budget in RENDERED LINES, not entries: live rows are two lines tall and
   // group captions add one more, so a naive per-entry window overflowed the
   // pane and pushed the dispatch composer off-screen. Below four available
@@ -813,7 +817,7 @@ export function SessionPicker({ actions, currentSessionId, onCancel, t: supplied
   const anchored = windowItems(rows, selected, Math.min(listRows, rows.length))
   const rowLines = (row: SessionRow, isFirst: boolean): number => {
     if (compactMode) return 1
-    const base = row.kind === 'live' ? 2 : 1
+    const base = (row.kind === 'live' ? 2 : 1) + (roomy ? 1 : 0)
 
     return isFirst ? base + 1 : base
   }
@@ -870,12 +874,13 @@ export function SessionPicker({ actions, currentSessionId, onCancel, t: supplied
       backgroundColor={t.color.statusBg}
       flexDirection="column"
       height={height}
-      left={0}
+      left={Math.floor((terminalWidth - width) / 2)}
       position="absolute"
-      top={0}
+      top={Math.floor((terminalHeight - height) / 2)}
       width={width}
       zIndex={200}
     >
+      {roomy ? <box height={1} flexShrink={0} /> : null}
       <box flexDirection="row" flexShrink={0} height={1} paddingLeft={2} paddingRight={2}>
         <box flexShrink={0}>
           <text flexShrink={0}>
@@ -898,7 +903,7 @@ export function SessionPicker({ actions, currentSessionId, onCancel, t: supplied
             {/* Single-span truncate inside its own clipped box: span-heavy
                 truncation blanks whole runs at narrow widths, so only the
                 title itself shrinks — the muted label never clips mid-glyph. */}
-            <box flexShrink={1} minWidth={0} overflow="hidden">
+            <box flexShrink={1} maxWidth={Math.floor(width * 0.3)} minWidth={0} overflow="hidden">
               <text fg={t.color.accent} flexShrink={0} truncate width="100%" wrapMode="none">
                 {mainSessionTitle}
               </text>
@@ -907,7 +912,7 @@ export function SessionPicker({ actions, currentSessionId, onCancel, t: supplied
         ) : null}
         <box flexShrink={0}>
           <text fg={workingCount ? t.color.accent : t.color.muted} flexShrink={0}>
-            {workingCount ? 'live' : 'idle'}
+            {workingCount ? ' · live' : ' · idle'}
           </text>
         </box>
       </box>
@@ -930,12 +935,8 @@ export function SessionPicker({ actions, currentSessionId, onCancel, t: supplied
       ) : null}
       {error ? <InfoRow color={t.color.error}>error: {error}</InfoRow> : notice ? <InfoRow color={t.color.warn}>{notice}</InfoRow> : null}
 
-      {/* Screen 03's body: a grouped list on the left and an inspector on the
-          right, both visible at once, filling everything between the header
-          and the composer. The panel used to stack its children at their own
-          heights and leave the rest of the terminal empty — a four-chat list
-          with thirty dead rows under it. */}
-      <box flexDirection="row" flexGrow={1} minHeight={0} width="100%">
+      {/* Keep the list and preview inside the bounded session workspace. */}
+      <box flexDirection="row" flexGrow={1} minHeight={0} width="100%" paddingTop={roomy ? 1 : 0}>
         <box flexDirection="column" flexGrow={1} flexShrink={1} minHeight={0} minWidth={0} overflow="hidden">
           {loading ? (
             <InfoRow color={t.color.muted}>loading live and saved chats…</InfoRow>
@@ -960,6 +961,7 @@ export function SessionPicker({ actions, currentSessionId, onCancel, t: supplied
                 return (
                   <SessionListRow
                     compactMode={compactMode}
+                    roomy={roomy}
                     counts={groupCounts}
                     firstInGroup={!previous || previous.group !== row.group}
                     key={`${row.kind}:${row.id}`}
@@ -998,10 +1000,7 @@ export function SessionPicker({ actions, currentSessionId, onCancel, t: supplied
         ) : null}
       </box>
 
-      {/* Directly below the list, not pinned to the terminal's last row. The
-          old layout padded the gap with blank rows and left ~32 dead rows
-          between a four-chat list and its input; a flex spacer reproduced
-          exactly the same look. Stacking is what actually fixes it. */}
+      {/* Keep dispatch and keyboard actions visible below the list. */}
       <box borderColor={t.color.border} borderStyle="rounded" flexShrink={0} height={3} marginTop={1} paddingLeft={1} paddingRight={1}>
         <text flexShrink={0} truncate width="100%" wrapMode="none">
           <span fg={draft ? t.color.text : t.color.accent}>❯ </span>

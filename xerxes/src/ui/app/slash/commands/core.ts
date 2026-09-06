@@ -294,7 +294,7 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    help: 'set or view the goal for a long-running task',
+    help: 'set or view a goal and its milestone; --duration 30m or --tokens 100000 sets limits',
     name: 'goal',
     // Rendering happens daemon-side so the terminal, the bridge and every
     // channel describe one goal with one vocabulary. This end only carries the
@@ -313,7 +313,7 @@ export const coreCommands: SlashCommand[] = [
         )
         .catch(ctx.guardedErr)
     },
-    usage: '/goal [<objective>|clear|edit <objective>|pause|resume]'
+    usage: '/goal [<objective>|clear|edit <objective>|pause|resume|milestone [<text>|clear]|--duration <Ns|Nm|Nh>|--tokens <count>]'
   },
 
   {

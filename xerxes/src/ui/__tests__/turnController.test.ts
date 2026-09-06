@@ -75,7 +75,7 @@ describe('turnController', () => {
     expect(getTurnState().todos).toEqual(todos)
   })
 
-  it('clears pinned todos when the next assistant turn starts', () => {
+  it('retains session todos when the next assistant turn starts', () => {
     const todos = [{ content: 'verify the fix', id: '1', status: 'completed' as const }]
 
     turnController.recordTodos(todos)
@@ -83,7 +83,7 @@ describe('turnController', () => {
 
     turnController.startMessage()
 
-    expect(getTurnState().todos).toEqual([])
+    expect(getTurnState().todos).toEqual([{ id: '1', content: 'verify the fix', status: 'completed' }])
   })
 
   it('never flashes a reasoning tag split across live deltas', () => {

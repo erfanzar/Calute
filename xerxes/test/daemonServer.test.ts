@@ -1,6 +1,8 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { AgentSettingsStore } from '../src/agents/settingsStore.js';
+import { createGoal, recordGoalEvidence } from '../src/runtime/goalDomain.js';
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -8,10 +10,13 @@ import { connect, type Socket } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
+import { nativeSubagentWorktrees } from '../src/runtime/subagentWorktrees.js';
 import { InMemoryDaemonRuntime } from "../src/daemon/runtime.js";
 import { AgentPresetRoster } from "../src/agents/presets.js";
 import { DaemonInteractionBoard } from "../src/daemon/interactions.js";
 import { MCPManager } from "../src/mcp/manager.js";
+import { McpSettingsStore } from "../src/mcp/settingsStore.js";
+import { PluginRegistry } from "../src/extensions/plugins.js";
 import {
   DaemonServer,
   MAX_ACCEPTED_SUBMISSION_IDS,
@@ -19,6 +24,13 @@ import {
 } from "../src/daemon/server.js";
 import { ValidationError } from "../src/core/errors.js";
 import { TerminalRegistry } from "../src/runtime/terminalRegistry.js";
+import { ToolRegistry } from "../src/executors/toolRegistry.js";
+import { registerMonitorTools } from "../src/tools/monitorTools.js";
+import { Scheduler as LegacyScheduler } from "../src/runtime/scheduler.js";
+import { DeliveryOutbox } from "../src/cron/outbox.js";
+import { RunHistory } from "../src/runtime/runHistory.js";
+import { ReactionMailbox } from "../src/runtime/reactionMailbox.js";
+import { TerminalMonitors } from "../src/runtime/terminalMonitors.js";
 import { ProfileStore } from "../src/bridge/profiles.js";
 import {
   ChannelManager,
@@ -1702,6 +1714,8 @@ test("daemon lists and controls persistent cron jobs through slash commands", as
   const store = new JobStore(join(directory, "cron", "jobs.json"));
   const server = new DaemonServer({
     socketPath,
+    cronLeasePath: join(directory, "cron.lease"),
+    cronArchiveDirectory: join(directory, "cron", "archive"),
     cronStoreFactory: () => store,
     runtime: new InMemoryDaemonRuntime(undefined, {
       currentProjectDirectory: directory,
@@ -1715,7 +1729,7 @@ test("daemon lists and controls persistent cron jobs through slash commands", as
       jsonrpc: "2.0",
       id: 1,
       method: "slash",
-      params: { command: "/cron" },
+      params: { command: "/schedules" },
     });
     expect((await client.next((frame) => frame.id === 1)).result).toEqual({
       ok: true,
@@ -2369,6 +2383,8 @@ test("compaction archives the transcript it replaces beside the session file", a
       await client.next(eventFrame("turn_end"));
     }
     const session = runtime.sessionStatus("compact-archive");
+    const contextControls = { version: 1, revision: 2, pins: [{ scope: 'project', path: 'MEMORY.md', content: 'Keep this fact' }], excluded: [{ scope: 'global', path: 'USER.md' }] };
+    session!.metadata.context_controls = contextControls;
     const before = JSON.stringify(session?.messages ?? []);
 
     client.send({ jsonrpc: "2.0", id: 10, method: "session.compress", params: {} });
@@ -2383,6 +2399,15 @@ test("compaction archives the transcript it replaces beside the session file", a
       tokens_before: expect.any(Number),
     });
     expect(Date.parse(String(stamp.compacted_at))).toBeGreaterThan(0);
+    expect(session?.metadata.compaction_history).toEqual([stamp]);
+    const persisted = JSON.parse(await readFile(join(sessions, session!.id + '.json'), 'utf8'));
+    expect(persisted.metadata.compaction_history).toEqual([stamp]);
+    expect(persisted.metadata.context_controls).toEqual(contextControls);
+    expect(session?.metadata.context_controls).toEqual(contextControls);
+    client.send({ jsonrpc: '2.0', id: 11, method: 'context.inspect', params: { section: 'compaction' } });
+    const history = (await client.next(frame => frame.id === 11)).result;
+    expect(history).toMatchObject({ ok: true, section: 'compaction', entries: [{ estimated_tokens: 0, text: expect.stringContaining('compact') }] });
+
 
     // The pre-compaction transcript survives the swap that dropped it from the
     // session and from the single per-session JSON.
@@ -3123,6 +3148,44 @@ test("daemon snapshots, lists, and rolls back the active session workspace", asy
         `Snapshots (2):\n  \`${firstId}\` — \`first\``,
       ),
     });
+
+    client.send({ jsonrpc: "2.0", id: 60, method: "slash", params: { command: `/rollback diff ${firstId}` } });
+    const preview = (await client.next(frame => frame.id === 60)).result;
+    expect(preview).toMatchObject({ ok: true, snapshot_id: firstId, truncated: false });
+    expect(preview?.diff).toContain("-third");
+    expect(preview?.diff).toContain("+first");
+    expect(await Bun.file(sourcePath).text()).toBe("third");
+    expect((await client.next(eventFrame("notification"))).params?.payload).toMatchObject({ category: "slash", body: expect.stringContaining("Restore preview") });
+
+    client.send({ jsonrpc: "2.0", id: 70, method: "snapshot.list", params: {} });
+    expect((await client.next(frame => frame.id === 70)).result).toMatchObject({ ok: true, snapshots: [{ id: firstId }, {}] });
+    client.send({ jsonrpc: "2.0", id: 71, method: "snapshot.preview", params: { snapshot_id: firstId } });
+    expect((await client.next(frame => frame.id === 71)).result).toMatchObject({ ok: true, snapshot_id: firstId, revision: preview?.revision, diff: preview?.diff });
+    client.send({ jsonrpc: "2.0", id: 72, method: "snapshot.preview", params: { snapshot_id: 10 } });
+    expect((await client.next(frame => frame.id === 72)).result).toMatchObject({ ok: false });
+    client.send({ jsonrpc: "2.0", id: 73, method: "snapshot.preview", params: { snapshot_id: "missing" } });
+    expect((await client.next(frame => frame.id === 73)).result).toMatchObject({ ok: false, error: expect.stringContaining("not found") });
+
+    client.send({ jsonrpc: "2.0", id: 74, method: "snapshot.preview", params: { snapshot_id: firstId, path: "state.txt" } });
+    const filePreview = (await client.next(frame => frame.id === 74)).result;
+    expect(filePreview).toMatchObject({ ok: true, action: "restore", files: ["state.txt"] });
+    client.send({ jsonrpc: "2.0", id: 75, method: "snapshot.restoreFile", params: { snapshot_id: firstId, path: "state.txt", revision: filePreview?.revision } });
+    expect((await client.next(frame => frame.id === 75)).result).toMatchObject({ ok: true, path: "state.txt" });
+    await client.next(eventFrame("notification"));
+    expect(await Bun.file(sourcePath).text()).toBe("first");
+    client.send({ jsonrpc: "2.0", id: 76, method: "snapshot.restoreFile", params: { snapshot_id: firstId, path: "state.txt" } });
+    expect((await client.next(frame => frame.id === 76)).result).toMatchObject({ ok: false });
+
+    await writeFile(sourcePath, "concurrent", "utf8");
+    client.send({ jsonrpc: "2.0", id: 61, method: "slash", params: { command: `/rollback apply ${firstId} ${preview?.revision}` } });
+    expect((await client.next(frame => frame.id === 61)).result).toMatchObject({ ok: false, error: expect.stringContaining("preview is stale") });
+    await client.next(eventFrame("notification"));
+    expect(await Bun.file(sourcePath).text()).toBe("concurrent");
+    await writeFile(sourcePath, "third", "utf8");
+    client.send({ jsonrpc: "2.0", id: 62, method: "slash", params: { command: `/rollback apply ${firstId} ${preview?.revision}` } });
+    expect((await client.next(frame => frame.id === 62)).result).toMatchObject({ ok: true });
+    await client.next(eventFrame("notification"));
+    expect(await Bun.file(sourcePath).text()).toBe("first");
 
     client.send({
       jsonrpc: "2.0",
@@ -6702,9 +6765,14 @@ test("daemon stop persists sessions even when an in-flight turn never settles", 
     // only written in the turn's `finally`, which a crash never reaches.
     // Generous budgets: these waits separate "lands" from "never lands" and
     // must stay robust while the rest of the suite saturates the machine.
-    await waitFor(async () =>
-      (await readdir(sessionDirectory)).some((file) => file.endsWith(".jsonl")), 10_000,
-    );
+    await waitFor(async () => {
+      try {
+        return (await readdir(sessionDirectory)).some((file) => file.endsWith(".jsonl"));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    }, 10_000);
     const journal = (await readdir(sessionDirectory)).find((file) =>
       file.endsWith(".jsonl"),
     );
@@ -8284,4 +8352,1574 @@ test("workspace.worktree creates a real git worktree and refuses non-repos", asy
     await server.stop();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("scheduled timeout cancels the daemon provider turn without archiving a successful result", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "xerxes-cron-timeout-wiring-"));
+  const store = new JobStore(join(directory, "jobs.json"));
+  store.add(new CronJob({ id: "timeout", prompt: "wait", oneshot: true, nextRunAt: new Date(Date.now() - 1000).toISOString() }));
+  const runner = new AbortGateRunner();
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: join(directory, "sessions") });
+  const archive = join(directory, "archive");
+  const history = new RunHistory(join(directory, "runs.sqlite"));
+  const server = new DaemonServer({ socketPath: join(directory, "daemon.sock"), cronStoreFactory: () => store, cronLeasePath: join(directory, "cron.lease"), cronArchiveDirectory: archive, cronJobTimeout: 30, cronPollInterval: 5, runtime, runHistory: history });
+  try {
+    await server.start();
+    await waitFor(() => runner.runs === 1);
+    await waitFor(() => typeof store.get("timeout")?.metadata.last_error === "string");
+    await waitFor(() => runtime.sessionStatus("cron:timeout")?.status === "idle");
+    expect(store.get("timeout")?.metadata.last_error).toContain("timed out");
+    expect(runtime.sessionStatus("cron:timeout")?.cancelRequested).toBe(true);
+    expect(existsSync(archive)).toBe(false);
+    expect(runner.runs).toBe(1);
+    const owner = runtime.sessionStatus("cron:timeout")!.id;
+    await waitFor(() => history.list(owner)[0]?.state === "cancelled");
+    expect(history.list(owner, { unreadOnly: true })[0]).toMatchObject({ state: "cancelled", sourceId: "timeout" });
+  } finally { await server.stop(); history.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("shutdown keeps cron ownership until cancelled provider cleanup has settled", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "xerxes-cron-lease-drain-"));
+  const leasePath = join(directory, "cron.lease");
+  const store = new JobStore(join(directory, "jobs.json"));
+  store.add(new CronJob({ id: "cleanup", prompt: "work", oneshot: true, nextRunAt: new Date(Date.now() - 1000).toISOString() }));
+  const started = Promise.withResolvers<void>();
+  const cancelled = Promise.withResolvers<void>();
+  const cleanup = Promise.withResolvers<void>();
+  const runtime = new InMemoryDaemonRuntime({ async *run(_session, _text, signal) {
+    signal.addEventListener("abort", () => cancelled.resolve(), { once: true });
+    started.resolve();
+    await cleanup.promise;
+    yield { type: "text_part", payload: { text: "cleanup finished" } };
+  } }, { currentProjectDirectory: directory, sessionDirectory: join(directory, "sessions") });
+  const server = new DaemonServer({ socketPath: join(directory, "daemon.sock"), cronStoreFactory: () => store, cronLeasePath: leasePath, runtime });
+  try {
+    await server.start();
+    await started.promise;
+    const stopping = server.stop();
+    await cancelled.promise;
+    expect(readCronLease(leasePath)).toBeDefined();
+    cleanup.resolve();
+    await stopping;
+    await waitFor(() => !existsSync(leasePath));
+  } finally { cleanup.resolve(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("run history RPC and slash listing expose scoped unread results", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "xerxes-run-history-rpc-"));
+  const history = new RunHistory(join(directory, "runs.sqlite"));
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, "sessions") });
+  const session = await runtime.openSession("runs-owner");
+  const run = history.start({ ownerSessionId: session.id, workspace: directory, kind: "schedule", sourceId: "one", title: "Check build" });
+  const finished = history.finish(session.id, run.id, "succeeded", { output: "build passed" });
+  const socketPath = join(directory, "daemon.sock");
+  const interactions = new DaemonInteractionBoard();
+  const server = new DaemonServer({ socketPath, runtime, interactions, runHistory: history, cronLeasePath: join(directory, "cron.lease"), cronStoreFactory: () => new JobStore(join(directory, "jobs.json")) });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: "2.0", id: 1, method: "run.list", params: { session_key: "runs-owner", unread_only: true } });
+    const list = await client.next(frame => frame.id === 1);
+    expect(list.result?.runs).toMatchObject([{ id: run.id, unread: true, state: "succeeded" }]);
+    expect(JSON.stringify(list.result)).not.toContain("build passed");
+    const permission = interactions.permissionBroker(session.id).request({ requestId: 'pending-report', description: 'Write report', inputs: {}, toolCall: { id: 'write', type: 'function', function: { name: 'WriteFile', arguments: {} } } });
+    const foreign = interactions.permissionBroker('another-session').request({ requestId: 'foreign-report', description: 'Private report', inputs: {}, toolCall: { id: 'foreign', type: 'function', function: { name: 'WriteFile', arguments: {} } } });
+    client.send({ jsonrpc: '2.0', id: 99, method: 'run.list', params: { session_key: 'runs-owner', scope: 'workspace' } });
+    const attention = (await client.next(frame => frame.id === 99)).result;
+    expect(attention).toMatchObject({ attention_total: 1, attention: [{ id: 'pending-report', kind: 'approval', title: 'Write report' }] });
+    expect(JSON.stringify(attention)).not.toContain('Private report');
+    interactions.respondPermission('pending-report', 'reject'); interactions.respondPermission('foreign-report', 'reject');
+    await Promise.all([permission, foreign]);
+
+    client.send({ jsonrpc: "2.0", id: 2, method: "run.inspect", params: { session_key: "other", run_id: run.id } });
+    expect((await client.next(frame => frame.id === 2)).result?.ok).toBe(false);
+    client.send({ jsonrpc: "2.0", id: 3, method: "run.acknowledge", params: { session_key: "runs-owner", run_id: run.id, revision: finished.revision } });
+    expect((await client.next(frame => frame.id === 3)).result?.ok).toBe(true);
+    client.send({ jsonrpc: "2.0", id: 4, method: "slash", params: { session_key: "runs-owner", command: "/runs unread" } });
+    expect((await client.next(frame => frame.id === 4)).result?.runs).toEqual([]);
+    const sibling = history.start({ ownerSessionId: "sibling-session", workspace: directory, kind: "agent", sourceId: "child", title: "Sibling result" });
+    const unrelated = history.start({ ownerSessionId: "unrelated", workspace: join(directory, "different-project"), kind: "agent", sourceId: "other", title: "Private other project" });
+    client.send({ jsonrpc: "2.0", id: 5, method: "run.list", params: { session_key: "runs-owner", scope: "workspace" } });
+    const workspaceList = await client.next(frame => frame.id === 5);
+    expect(workspaceList.result?.runs).toHaveLength(2);
+    expect(JSON.stringify(workspaceList.result)).toContain(sibling.id);
+    expect(JSON.stringify(workspaceList.result)).not.toContain(unrelated.id);
+    client.send({ jsonrpc: "2.0", id: 6, method: "run.inspect", params: { session_key: "runs-owner", scope: "workspace", run_id: unrelated.id, workspace: join(directory, "different-project") } });
+    expect((await client.next(frame => frame.id === 6)).result?.ok).toBe(false);
+    client.send({ jsonrpc: "2.0", id: 8, method: "run.list", params: { session_key: "runs-owner", scope: "workspace", kind: "schedule", source_id: "one" } });
+    expect((await client.next(frame => frame.id === 8)).result?.runs).toMatchObject([{ id: run.id }]);
+    client.send({ jsonrpc: "2.0", id: 9, method: "run.list", params: { session_key: "runs-owner", kind: "unsupported" } });
+    expect((await client.next(frame => frame.id === 9)).result?.ok).toBe(false);
+    client.send({ jsonrpc: "2.0", id: 10, method: "run.list", params: { session_key: "runs-owner", scope: "workspace", state: "running" } });
+    expect((await client.next(frame => frame.id === 10)).result?.runs).toMatchObject([{ id: sibling.id }]);
+    client.send({ jsonrpc: "2.0", id: 11, method: "run.list", params: { session_key: "runs-owner", state: "unknown" } });
+    expect((await client.next(frame => frame.id === 11)).result).toMatchObject({ ok: false, error: "Unknown run state" });
+    const siblingDone = history.finish("sibling-session", sibling.id, "succeeded");
+    client.send({ jsonrpc: "2.0", id: 7, method: "run.acknowledge", params: { session_key: "runs-owner", scope: "workspace", run_id: sibling.id, revision: siblingDone.revision } });
+    expect((await client.next(frame => frame.id === 7)).result?.ok).toBe(true);
+  } finally { client.close(); await server.stop(); history.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("terminal completion reaches its attached session and archived output stays inspectable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "xerxes-terminal-completion-"));
+  const history = new RunHistory(join(directory, "runs.sqlite"));
+  const terminals = new TerminalRegistry({ runHistory: history });
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, "sessions") });
+  const socketPath = join(directory, "daemon.sock");
+  const server = new DaemonServer({ socketPath, runtime, runHistory: history, terminalRegistry: terminals, cronLeasePath: join(directory, "cron.lease"), cronStoreFactory: () => new JobStore(join(directory, "jobs.json")) });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: "2.0", id: 1, method: "session.open", params: { session_key: "terminal-owner" } });
+    await client.next(frame => frame.id === 1);
+    const owner = runtime.sessionStatus("terminal-owner")!.id;
+    const handle = terminals.open({ ownerSessionId: owner, cwd: directory, command: "bun test", id: "test-process", kind: "background" });
+    handle.append("checks complete");
+    handle.close(0);
+    const event = await client.next(frame => frame.method === "event" && String(frame.params?.payload?.id ?? "").startsWith("run:"));
+    expect(event.params?.payload?.body).toContain("terminal succeeded");
+    const run = history.list(owner)[0]!;
+    expect(run.unread).toBe(true);
+    terminals.clear();
+    client.send({ jsonrpc: "2.0", id: 2, method: "terminal.inspect", params: { terminal_id: `run:${run.id}` } });
+    expect((await client.next(frame => frame.id === 2)).result?.terminal).toMatchObject({ output: "checks complete", canKill: false, exitCode: 0 });
+    client.send({ jsonrpc: "2.0", id: 3, method: "terminal.output", params: { terminal_id: 'run:' + run.id, max_output_chars: 6 } });
+    const firstPage = (await client.next(frame => frame.id === 3)).result?.page as { cursor: { streamId: string; offset: number }; text: string };
+    expect(firstPage.text).toBe("checks");
+    client.send({ jsonrpc: "2.0", id: 4, method: "terminal.output", params: { terminal_id: 'run:' + run.id, cursor: firstPage.cursor } });
+    expect((await client.next(frame => frame.id === 4)).result?.page).toMatchObject({ text: " complete", hasMore: false });
+    client.send({ jsonrpc: "2.0", id: 5, method: "terminal.output", params: { terminal_id: 'run:' + run.id, cursor: { streamId: run.id, offset: -1 } } });
+    expect((await client.next(frame => frame.id === 5)).result?.ok).toBe(false);
+
+  } finally { client.close(); await server.stop(); history.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("terminal monitors announce matching events and native stop leaves the source alive", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "xerxes-monitor-daemon-"));
+  const history = new RunHistory(join(directory, "runs.sqlite"));
+  const terminals = new TerminalRegistry();
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, "sessions") });
+  const monitors = new TerminalMonitors(terminals, history, (watch, event) => server.notifyMonitorEvent(watch, event));
+  const socketPath = join(directory, "daemon.sock");
+  const server = new DaemonServer({ socketPath, runtime, monitors, runHistory: history, terminalRegistry: terminals, cronLeasePath: join(directory, "cron.lease"), cronStoreFactory: () => new JobStore(join(directory, "jobs.json")) });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: "2.0", id: 1, method: "session.open", params: { session_key: "monitor-owner" } });
+    await client.next(frame => frame.id === 1);
+    const owner = runtime.sessionStatus("monitor-owner")!.id;
+    const terminal = terminals.open({ id: "build", ownerSessionId: owner, command: "build", cwd: directory, kind: "background" });
+    const watch = monitors.start(owner, { terminalId: "build", match: "error" });
+    client.send({ jsonrpc: "2.0", id: 30, method: "monitor.create", params: { terminal_id: "build", match: "warning", duration_seconds: 60 } });
+    expect((await client.next(frame => frame.id === 30)).result?.monitor).toMatchObject({ state: "watching", match: "warning" });
+    client.send({ jsonrpc: "2.0", id: 31, method: "monitor.create", params: { terminal_id: "build", match: "bad", duration_seconds: -1 } });
+    expect((await client.next(frame => frame.id === 31)).result).toMatchObject({ ok: false, error: "Invalid monitor settings" });
+    client.send({ jsonrpc: "2.0", id: 32, method: "monitor.create", params: { terminal_id: "someone-elses-process", match: "error" } });
+    expect((await client.next(frame => frame.id === 32)).error).toBeDefined();
+
+    const finished = terminals.open({ id: "finished-build", ownerSessionId: owner, command: "tests", cwd: directory, kind: "background" });
+    finished.append("all checks passed"); finished.close(0);
+    client.send({ jsonrpc: "2.0", id: 33, method: "monitor.create", params: { terminal_id: "finished-build", trigger: "completion" } });
+    expect((await client.next(frame => frame.id === 33)).result?.monitor).toMatchObject({ trigger: "completion", state: "source-ended" });
+    client.send({ jsonrpc: "2.0", id: 34, method: "monitor.create", params: { terminal_id: "build", trigger: "invalid" } });
+    expect((await client.next(frame => frame.id === 34)).result?.ok).toBe(false);
+    const completion = await client.next(frame => frame.method === "event" && frame.params?.payload?.title === "Command finished");
+    expect(completion.params?.payload?.body).toContain("all checks passed");
+
+    terminal.append("error: compile failed\n");
+    const notification = await client.next(frame => frame.method === "event" && String(frame.params?.payload?.id ?? "").startsWith("monitor:"));
+    expect(notification.params?.payload?.body).toContain("compile failed");
+    client.send({ jsonrpc: "2.0", id: 21, method: "monitor.list", params: {} });
+    const inventory = (await client.next(frame => frame.id === 21)).result?.monitors as Record<string, unknown>[];
+    expect(inventory[0]?.id).toBe(watch.id);
+    expect(inventory[0]?.stopAction).toBe("stop-watch");
+    expect(inventory[0]?.events).toBeUndefined();
+    client.send({ jsonrpc: "2.0", id: 22, method: "monitor.inspect", params: { monitor_id: watch.id } });
+    expect((await client.next(frame => frame.id === 22)).result?.monitor).toMatchObject({ id: watch.id, events: [{ text: "error: compile failed" }] });
+
+    expect(history.inspect(owner, watch.id)?.unread).toBe(true);
+    client.send({ jsonrpc: "2.0", id: 10, method: "run.events", params: { run_id: watch.id, after_sequence: 0, limit: 1 } });
+    expect((await client.next(frame => frame.id === 10)).result).toMatchObject({ ok: true, next_cursor: 1, has_more: false, events: [{ sequence: 1, text: "error: compile failed" }] });
+    const reconnected = await SocketTestClient.connect(socketPath);
+    try {
+      reconnected.send({ jsonrpc: "2.0", id: 11, method: "session.open", params: { session_key: "monitor-owner" } });
+      await reconnected.next(frame => frame.id === 11);
+      reconnected.send({ jsonrpc: "2.0", id: 12, method: "run.events", params: { run_id: watch.id } });
+      expect((await reconnected.next(frame => frame.id === 12)).result?.events).toMatchObject([{ sequence: 1 }]);
+      reconnected.send({ jsonrpc: "2.0", id: 13, method: "run.events", params: { run_id: watch.id, after_sequence: 1 } });
+      expect((await reconnected.next(frame => frame.id === 13)).result?.events).toEqual([]);
+      reconnected.send({ jsonrpc: "2.0", id: 14, method: "session.open", params: { session_key: "other-monitor-owner" } });
+      await reconnected.next(frame => frame.id === 14);
+      reconnected.send({ jsonrpc: "2.0", id: 15, method: "run.events", params: { run_id: watch.id } });
+      expect((await reconnected.next(frame => frame.id === 15)).result).toMatchObject({ ok: false, error: "Unknown run" });
+      reconnected.send({ jsonrpc: "2.0", id: 23, method: "monitor.stop", params: { monitor_id: watch.id } });
+      expect((await reconnected.next(frame => frame.id === 23)).error).toBeDefined();
+      expect(monitors.inspect(owner, watch.id).state).toBe("watching");
+
+    } finally { reconnected.close(); }
+
+    client.send({ jsonrpc: "2.0", id: 2, method: "slash", params: { command: `/monitors stop ${watch.id}` } });
+    expect((await client.next(frame => frame.id === 2)).result?.ok).toBe(true);
+    expect(terminals.inspect(owner, "build")?.running).toBe(true);
+    client.send({ jsonrpc: "2.0", id: 3, method: "slash", params: { command: "/monitors list" } });
+    expect((await client.next(frame => frame.id === 3)).result?.monitors).toMatchObject([{ state: "stopped", stopAction: null }, { state: "watching", stopAction: "stop-watch" }, { state: "source-ended", stopAction: null }]);
+  } finally { client.close(); monitors.close(); await server.stop(); history.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("manual cron execution preserves background origin through daemon admission", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "xerxes-cron-origin-"));
+  const origins: unknown[] = [];
+  const runtime = new InMemoryDaemonRuntime({
+    async *run(_session, _text, _signal, controls) {
+      origins.push(controls?.origin);
+      yield { type: "text_part", payload: { text: "scheduled result" } };
+    },
+  }, { currentProjectDirectory: directory, sessionDirectory: join(directory, "sessions") });
+  const store = new JobStore(join(directory, "jobs.json"));
+  const server = new DaemonServer({ socketPath: join(directory, "daemon.sock"), runtime, cronStoreFactory: () => store,
+    cronLeasePath: join(directory, "cron.lease"), cronArchiveDirectory: join(directory, "archive") });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, "daemon.sock"));
+  try {
+    client.send({ jsonrpc: "2.0", id: 1, method: "session.open", params: { session_key: "cron-origin" } });
+    await client.next(frame => frame.id === 1);
+    client.send({ jsonrpc: "2.0", id: 2, method: "slash", params: { command: '/cron add --schedule "0 9 * * 1" --prompt "report"' } });
+    const added = await client.next(frame => frame.id === 2);
+    const job = added.result?.job as { id: string };
+    client.send({ jsonrpc: "2.0", id: 3, method: "slash", params: { command: `/cron run ${job.id}` } });
+    expect((await client.next(frame => frame.id === 3)).result?.ok).toBe(true);
+    expect(origins).toEqual(['schedule']);
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test.each([[false, 'completed'], [true, 'completed'], [false, 'output_limit'], [true, 'tool_budget_exhausted']] as const)("configured monitor reactions preserve outcome and usage (children: %s, reason: %s)", async (children, reason) => {
+  const { ReactionMailbox } = await import('../src/runtime/reactionMailbox.js');
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-monitor-reaction-'));
+  const history = new RunHistory(join(directory, 'runs.sqlite'));
+  const mailbox = new ReactionMailbox(join(directory, 'reactions.sqlite'));
+  const terminals = new TerminalRegistry();
+  const turns: { origin: unknown; text: string }[] = [];
+  const runtime = new InMemoryDaemonRuntime({ async *run(_session, text, _signal, controls) {
+    turns.push({ origin: controls?.origin, text });
+    if (children) {
+      yield { type: 'subagent_event', payload: { agent_id: 'child', event: { type: 'turn_begin' } } };
+      yield { type: 'subagent_event', payload: { agent_id: 'child', input_tokens: 40, output_tokens: 10 } };
+      yield { type: 'subagent_event', payload: { agent_id: 'child', input_tokens: 40, output_tokens: 10 } };
+    }
+    yield { type: 'text_part', payload: { text: 'Investigated monitor evidence.' } };
+    yield { type: 'status_update', payload: { usage: { inputTokens: 120, outputTokens: 30 }, usage_complete: true, stop_reason: reason } };
+  } }, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const monitors = new TerminalMonitors(terminals, history, (watch, event) => server.notifyMonitorEvent(watch, event), undefined, mailbox);
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), projectDirectory: directory, runtime, runHistory: history, reactionMailbox: mailbox,
+    monitors, terminalRegistry: terminals, cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')), cronLeasePath: join(directory, 'cron.lease') });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'session.open', params: { session_key: 'reaction-owner' } });
+    await client.next(frame => frame.id === 1);
+    const owner = runtime.sessionStatus('reaction-owner')!.id;
+    const buildDirectory = join(directory, 'build'); await mkdir(buildDirectory);
+    const terminal = terminals.open({ ownerSessionId: owner, id: 'build', cwd: buildDirectory, command: 'build', kind: 'background' });
+    const registry = new ToolRegistry();
+    registerMonitorTools(registry, monitors);
+    const request = { id: 'watch', type: 'function' as const, function: { name: 'monitor_terminal', arguments: { terminal_id: 'build', match: 'error', react: true, max_reactions: 1, reaction_timeout_seconds: 5 } } };
+    await expect(registry.execute(request, { sessionId: owner, metadata: { goal_turn_human: false } })).rejects.toThrow('direct user');
+    const watch = JSON.parse(await registry.execute(request, { sessionId: owner, metadata: { goal_turn_human: true } }));
+    expect(watch.reaction).toEqual({ maxReactions: 1, maxDurationMs: 5000 });
+    expect(watch.reactionHealth.state).toBe('waiting');
+    terminal.append('error: build failed\n');
+    await client.next(frame => frame.method === 'event' && frame.params?.type === 'turn_end');
+    expect(turns).toHaveLength(1);
+    expect(turns[0]?.origin).toBe('monitor');
+    expect(turns[0]?.text).toContain('error: build failed');
+    terminal.append('error: another failure\n');
+    await Bun.sleep(20);
+    expect(turns).toHaveLength(1);
+    expect(runtime.sessionStatus('reaction-owner')?.messages.some(message => String(message.content).includes('Investigated'))).toBe(true);
+    client.send({ jsonrpc: '2.0', id: 2, method: 'run.inspect', params: { run_id: watch.id } });
+    expect((await client.next(frame => frame.id === 2)).result?.run).toMatchObject({ reaction_health: { state: 'exhausted', attempts: 1, maxReactions: 1, lastOutcome: reason === 'completed' ? 'completed' : 'failed', usage: { inputTokens: children ? 160 : 120, outputTokens: children ? 40 : 30, complete: false } } });
+    const reaction = history.list(owner).find(run => run.sourceId !== 'build' && run.title.startsWith('Monitor reaction:'));
+    expect(reaction).toMatchObject({ state: reason === 'completed' ? 'succeeded' : 'failed', output: 'Investigated monitor evidence.' });
+    if (reason !== 'completed') expect(reaction?.error).toContain(reason);
+  } finally { client.close(); monitors.close(); await server.stop(); mailbox.close(); history.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('schedule RPC manages workspace jobs without exposing other projects', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-schedule-rpc-'));
+  const socketPath = join(directory, 'daemon.sock');
+  const store = new JobStore(join(directory, 'jobs.json'));
+  store.add(new CronJob({ id: 'local', prompt: 'review', projectRoot: directory, schedule: '0 9 * * *', paused: true }));
+  store.add(new CronJob({ id: 'foreign', prompt: 'private', projectRoot: join(directory, 'other'), schedule: '0 9 * * *', paused: true }));
+  const server = new DaemonServer({ socketPath, legacyScheduleDirectory: join(directory, 'legacy'), projectDirectory: directory, cronArchiveDirectory: join(directory, 'archive'), cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), runtime: new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') }) });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'schedule.list', params: {} });
+    const listed = (await client.next(frame => frame.id === 1)).result as { jobs: { id: string }[] };
+    expect(listed.jobs.map(job => job.id)).toEqual(['local']);
+    const recordsBeforePreview = store.listJobs().map(job => job.toRecord());
+    client.send({ jsonrpc: '2.0', id: 101, method: 'schedule.preview', params: { at: '2099-01-01T09:00:00+03:00' } });
+    expect((await client.next(frame => frame.id === 101)).result).toEqual({ ok: true, next_run_at: '2099-01-01T06:00:00.000Z', timezone: 'UTC' });
+    client.send({ jsonrpc: '2.0', id: 102, method: 'schedule.preview', params: { schedule: '0 9 * * *', timezone: 'Asia/Tokyo' } });
+    const preview = (await client.next(frame => frame.id === 102)).result;
+    expect(preview?.ok).toBe(true);
+    expect(String(preview?.next_run_at)).toContain('T00:00:00.000Z');
+    for (const [offset, params] of [{ schedule: 'bad' }, { at: '2000-01-01T00:00:00Z' }, { interval_seconds: 0 }, { schedule: '0 9 * * *', timezone: 'Invalid/Zone' }, { interval_seconds: 30, at: '2099-01-01T00:00:00Z' }].entries()) {
+      client.send({ jsonrpc: '2.0', id: 110 + offset, method: 'schedule.preview', params });
+      expect((await client.next(frame => frame.id === 110 + offset)).error).toBeDefined();
+    }
+    expect(store.listJobs().map(job => job.toRecord())).toEqual(recordsBeforePreview);
+    let id = 2;
+    for (const action of ['inspect', 'pause', 'resume', 'cancel', 'run']) {
+      client.send({ jsonrpc: '2.0', id, method: `schedule.${action}`, params: { schedule_id: 'foreign' } });
+      expect((await client.next(frame => frame.id === id)).result).toMatchObject({ ok: false, error: 'Schedule not found in this workspace' });
+      id++;
+    }
+    client.send({ jsonrpc: '2.0', id: 10, method: 'schedule.resume', params: { schedule_id: 'local' } });
+    expect((await client.next(frame => frame.id === 10)).result).toMatchObject({ ok: true, job: { paused: false, execution_state: 'idle' } });
+    expect(store.get('local')?.nextRunAt).toBeDefined();
+    client.send({ jsonrpc: '2.0', id: 11, method: 'schedule.pause', params: { schedule_id: 'local' } });
+    expect((await client.next(frame => frame.id === 11)).result).toMatchObject({ ok: true, job: { paused: true } });
+    client.send({ jsonrpc: '2.0', id: 12, method: 'schedule.cancel', params: { schedule_id: 'local' } });
+    expect((await client.next(frame => frame.id === 12)).result).toMatchObject({ ok: true, requested: false });
+    client.send({ jsonrpc: "2.0", id: 13, method: "schedule.create", params: { prompt: "new review", max_runs: 3, expires_at: "2099-01-01T00:00:00Z", schedule: "0 8 * * *", timezone: "America/New_York", paused: true, timeout_seconds: 45, max_retries: 0, missed_run_policy: 'skip', misfire_grace_seconds: 45 } });
+    const created = (await client.next(frame => frame.id === 13)).result as { ok: boolean; job: { id: string; revision: string } };
+    expect(created.ok).toBe(true);
+    expect(created.job).toMatchObject({ missed_run_policy: 'skip', misfire_grace_seconds: 45, overlap_policy: 'forbid' });
+    expect(store.get(created.job.id)?.timeoutMs).toBe(45000);
+    expect(store.get(created.job.id)?.maxRetries).toBe(0);
+    expect(store.get(created.job.id)?.timezone).toBe('America/New_York');
+    expect(store.get(created.job.id)?.projectRoot).toBe(await realpath(directory));
+    expect(created.job).toMatchObject({ max_runs: 3, runs_started: 0, expires_at: "2099-01-01T00:00:00.000Z" });
+    client.send({ jsonrpc: "2.0", id: 14, method: "schedule.update", params: { schedule_id: created.job.id, revision: created.job.revision, prompt: "edited review", schedule: "0 10 * * *", paused: true } });
+    expect((await client.next(frame => frame.id === 14)).result).toMatchObject({ ok: true, job: { prompt: "edited review", timezone: "America/New_York", expires_at: "2099-01-01T00:00:00.000Z" } });
+    client.send({ jsonrpc: "2.0", id: 15, method: "schedule.update", params: { schedule_id: created.job.id, revision: created.job.revision, prompt: "stale edit", schedule: "0 11 * * *", paused: true } });
+    expect(store.get(created.job.id)?.missedRunPolicy).toBe('skip');
+    expect(store.get(created.job.id)?.misfireGraceSeconds).toBe(45);
+    expect((await client.next(frame => frame.id === 15)).result).toMatchObject({ ok: false, error: "Schedule changed; refresh before editing" });
+    client.send({ jsonrpc: "2.0", id: 16, method: "schedule.create", params: { prompt: "invalid", schedule: "bad", paused: true } });
+    expect((await client.next(frame => frame.id === 16)).error).toBeDefined();
+    const outbox = new DeliveryOutbox(join(directory, "archive", "deliveries.sqlite"));
+    const deliveryId = outbox.enqueue("local", { platform: "test" }, "saved output", "archive.md");
+    client.send({ jsonrpc: "2.0", id: 30, method: "schedule.deliveries", params: { schedule_id: "local" } });
+    const deliveries = (await client.next(frame => frame.id === 30)).result;
+    expect(deliveries?.deliveries).toMatchObject([{ id: deliveryId, state: "pending" }]);
+    expect(JSON.stringify(deliveries)).not.toContain("saved output");
+    client.send({ jsonrpc: "2.0", id: 31, method: "schedule.delivery.inspect", params: { schedule_id: "foreign", delivery_id: deliveryId } });
+    expect((await client.next(frame => frame.id === 31)).result?.ok).toBe(false);
+    client.send({ jsonrpc: "2.0", id: 32, method: "schedule.delivery.send", params: { schedule_id: "local", delivery_id: deliveryId } });
+    expect((await client.next(frame => frame.id === 32)).result?.ok).toBe(false);
+    expect(outbox.inspect("local", deliveryId)?.state).toBe("pending");
+    client.send({ jsonrpc: "2.0", id: 40, method: "schedule.create", params: { prompt: "interval work", interval_seconds: 30, paused: true } });
+    const intervalResult = (await client.next(frame => frame.id === 40)).result as { job: { id: string } };
+    expect(store.get(intervalResult.job.id)?.intervalSeconds).toBe(30);
+    expect(store.get(intervalResult.job.id)?.oneshot).toBe(false);
+    client.send({ jsonrpc: "2.0", id: 41, method: "schedule.resume", params: { schedule_id: intervalResult.job.id } });
+    expect((await client.next(frame => frame.id === 41)).result?.ok).toBe(true);
+    expect(new Date(store.get(intervalResult.job.id)!.nextRunAt!).getTime()).toBeGreaterThan(Date.now());
+    const legacy = new LegacyScheduler({ directory: join(directory, "legacy") });
+    await legacy.createTrigger({ id: "old-interval", owner: "user", schedule: { kind: "interval", intervalSeconds: 60 }, payload: { id: "task", objective: "Review legacy", creatorId: "user", dependencies: [] } });
+    client.send({ jsonrpc: "2.0", id: 50, method: "slash", params: { command: "/schedules legacy" } });
+    expect((await client.next(frame => frame.id === 50)).result?.triggers).toMatchObject([{ id: "old-interval", supported: true }]);
+    client.send({ jsonrpc: "2.0", id: 51, method: "slash", params: { command: "/schedules migrate old-interval" } });
+    expect((await client.next(frame => frame.id === 51)).result?.job).toMatchObject({ paused: true, interval_seconds: 60, prompt: "Review legacy" });
+    expect((await legacy.load()).triggers.get("old-interval")?.enabled).toBe(false);
+    const countBefore = store.listJobs().length;
+    client.send({ jsonrpc: "2.0", id: 55, method: "schedule.create", params: { prompt: "invalid zone", schedule: "0 9 * * *", timezone: "Invalid/Zone", paused: true } });
+    expect((await client.next(frame => frame.id === 55)).error).toBeDefined();
+    client.send({ jsonrpc: "2.0", id: 52, method: "schedule.create", params: { prompt: "impossible date", at: "2099-02-29T12:00:00Z", paused: true } });
+    expect((await client.next(frame => frame.id === 52)).error).toBeDefined();
+    client.send({ jsonrpc: "2.0", id: 53, method: "slash", params: { command: '/cron add --at "2099-02-29T12:00:00Z" --prompt "Impossible date"' } });
+    expect((await client.next(frame => frame.id === 53)).result?.ok).toBe(false);
+    client.send({ jsonrpc: "2.0", id: 54, method: "slash", params: { command: '/cron add --at "2000-01-01T12:00:00Z" --prompt "Past date"' } });
+    expect((await client.next(frame => frame.id === 54)).result?.ok).toBe(false);
+    expect(store.listJobs().length).toBe(countBefore);
+    client.send({ jsonrpc: "2.0", id: 17, method: "schedule.create", params: { prompt: "invalid date", at: "2099-01-01", paused: true } });
+    expect((await client.next(frame => frame.id === 17)).error).toBeDefined();
+    expect(store.listJobs().length).toBe(countBefore);
+    client.send({ jsonrpc: "2.0", id: 18, method: "schedule.create", params: { prompt: "one shot", at: "2099-01-01T09:00:00Z", paused: true } });
+    expect((await client.next(frame => frame.id === 18)).result).toMatchObject({ ok: true, job: { oneshot: true, next_run_at: "2099-01-01T09:00:00.000Z" } });
+    client.send({ jsonrpc: "2.0", id: 56, method: "slash", params: { command: '/cron add --schedule "0 9 * * *" --timezone "Asia/Tokyo" --prompt "Local review"' } });
+    expect((await client.next(frame => frame.id === 56)).result).toMatchObject({ ok: true, job: { timezone: "Asia/Tokyo" } });
+    store.update('local', { paused: true, metadata: { execution_recovery_required: true, execution_receipt: { state: 'completed', occurrence: '2026-09-01T09:00:00Z' } } });
+    client.send({ jsonrpc: '2.0', id: 57, method: 'schedule.resume', params: { schedule_id: 'local' } });
+    expect((await client.next(frame => frame.id === 57)).result?.ok).toBe(true);
+    expect(store.get('local')?.metadata.execution_receipt).toBeUndefined();
+    expect(store.get('local')?.metadata.previous_execution_receipt).toMatchObject({ state: 'completed' });
+    expect(store.get(created.job.id)?.prompt).toBe("edited review");
+    expect(store.get("foreign")?.paused).toBe(true);
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('model schedule requests share workspace scope and optimistic edits with RPC jobs', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-model-schedule-'));
+  const store = new JobStore(join(directory, 'jobs.json'));
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, projectDirectory: directory, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), cronArchiveDirectory: join(directory, 'archive') });
+  try {
+    const session = await runtime.openSession('model');
+    store.add(new CronJob({ id: 'other', prompt: 'private', projectRoot: join(directory, 'other'), paused: true, schedule: '0 9 * * *' }));
+    await expect(server.scheduleToolRequest('unknown', 'list', {})).rejects.toThrow('active workspace');
+    const created = await server.scheduleToolRequest(session.id, 'create', { prompt: 'Review changes', paused: true, interval_seconds: 60 });
+    const job = created.job as { id: string; revision: string };
+    expect(store.get(job.id)?.projectRoot).toBe(await realpath(directory));
+    expect((await server.scheduleToolRequest(session.id, 'list', {})).jobs).toMatchObject([{ id: job.id }]);
+    expect(await server.scheduleToolRequest(session.id, 'resume', { schedule_id: 'other' })).toMatchObject({ ok: false, error: 'Schedule not found in this workspace' });
+    store.update(job.id, { prompt: 'An intervening UI edit' });
+    expect(await server.scheduleToolRequest(session.id, 'update', { schedule_id: job.id, revision: job.revision, prompt: 'stale', paused: true, interval_seconds: 60 })).toMatchObject({ ok: false, error: 'Schedule changed; refresh before editing' });
+    expect(store.get(job.id)?.prompt).toBe('An intervening UI edit');
+    const abort = new AbortController(); abort.abort(new Error('cancelled'));
+    await expect(server.scheduleToolRequest(session.id, 'resume', { schedule_id: job.id }, abort.signal)).rejects.toThrow('cancelled');
+    expect(store.get(job.id)?.paused).toBe(true);
+  } finally { await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('model schedule run-now is isolated and propagates caller cancellation without successful delivery', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-model-run-'));
+  const store = new JobStore(join(directory, 'jobs.json'));
+  const runner = new AbortGateRunner();
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, projectDirectory: directory, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), cronArchiveDirectory: join(directory, 'archive') });
+  await server.start();
+  const abort = new AbortController();
+  try {
+    const session = await runtime.openSession('caller');
+    store.add(new CronJob({ id: 'manual', prompt: 'Run checks', projectRoot: directory, paused: true, schedule: '0 9 * * *' }));
+    const result = server.scheduleToolRequest(session.id, 'run', { schedule_id: 'manual' }, abort.signal).then(value => ({ value }), error => ({ error }));
+    await waitFor(() => runner.runs === 1);
+    expect(session.activeTurnId).toBe('');
+    expect(runtime.sessionStatus('cron:manual')?.activeTurnId).not.toBe('');
+    await expect(server.scheduleToolRequest(session.id, 'run', { schedule_id: 'manual' })).rejects.toThrow('already running');
+    abort.abort();
+    expect(await result).toHaveProperty('error');
+    expect(store.get('manual')?.lastRunAt).toBeUndefined();
+    expect(existsSync(join(directory, 'archive'))).toBe(false);
+    expect(await server.scheduleToolRequest(session.id, 'inspect', { schedule_id: 'manual' })).toMatchObject({ ok: true, job: { execution_state: 'idle' } });
+  } finally { abort.abort(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('scheduled model runs use their stored project instead of the daemon default', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-schedule-project-'));
+  const other = join(directory, 'other'); await mkdir(other);
+  const seen: string[] = [];
+  const runner: TurnRunner = { async *run(session) { seen.push(session.cwd); yield { type: 'text_part', payload: { text: session.cwd } }; } };
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const store = new JobStore(join(directory, 'jobs.json'));
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, projectDirectory: directory, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), cronArchiveDirectory: join(directory, 'archive') });
+  await server.start();
+  try {
+    const caller = await runtime.openSession('caller', undefined, { cwd: other });
+    store.add(new CronJob({ id: 'project-job', prompt: 'Check project', projectRoot: other, paused: true, schedule: '0 9 * * *' }));
+    const result = await server.scheduleToolRequest(caller.id, 'run', { schedule_id: 'project-job' });
+    expect(result.ok).toBe(true);
+    expect(seen).toEqual([await realpath(other)]);
+    expect(runtime.sessionStatus('cron:project-job')?.cwd).toBe(await realpath(other));
+    expect(caller.messages).toHaveLength(0);
+  } finally { await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('scheduled runs reject a conflicting existing session without moving it or calling the provider', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-schedule-conflict-'));
+  const other = join(directory, 'other'); await mkdir(other);
+  let runs = 0;
+  const runner: TurnRunner = { async *run() { runs++; yield { type: 'text_part', payload: { text: 'unexpected' } }; } };
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const store = new JobStore(join(directory, 'jobs.json'));
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, projectDirectory: directory, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), cronArchiveDirectory: join(directory, 'archive') });
+  await server.start();
+  try {
+    const caller = await runtime.openSession('caller', undefined, { cwd: other });
+    const existing = await runtime.openSession('occupied');
+    const original = existing.cwd;
+    store.add(new CronJob({ id: 'conflicting', workspaceId: 'occupied', prompt: 'Check project', projectRoot: other, paused: true, schedule: '0 9 * * *' }));
+    await expect(server.scheduleToolRequest(caller.id, 'run', { schedule_id: 'conflicting' })).rejects.toThrow('another workspace');
+    expect(existing.cwd).toBe(original);
+    expect(existing.messages).toHaveLength(0);
+    expect(runs).toBe(0);
+    expect(store.get('conflicting')?.lastRunAt).toBeUndefined();
+  } finally { await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('background session open preserves project even when another opener is queued first', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-session-project-lock-'));
+  const other = join(directory, 'other'); await mkdir(other);
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  try {
+    const first = runtime.openSession('shared', undefined, { cwd: directory });
+    const second = runtime.openSession('shared', undefined, { cwd: other, preserveProject: true });
+    await expect(second).rejects.toThrow('another workspace');
+    expect((await first).cwd).toBe(directory);
+    expect(runtime.sessionStatus('shared')?.cwd).toBe(directory);
+  } finally { await runtime.shutdown(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('reopening a saved session recovers durable monitor evidence not offered before restart', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-monitor-restart-'));
+  const sessionDirectory = join(directory, 'sessions');
+  const original = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory });
+  const owner = await original.openSession('original');
+  await original.flushSessions();
+  await original.shutdown();
+  const historyPath = join(directory, 'runs.sqlite'), mailboxPath = join(directory, 'mailbox.sqlite');
+  const firstHistory = new RunHistory(historyPath);
+  const run = firstHistory.start({ ownerSessionId: owner.id, workspace: directory, kind: 'monitor', sourceId: 'terminal', title: 'watch' });
+  firstHistory.appendEvent(owner.id, run.id, { sequence: 1, text: 'build failed', at: Date.now() }, 'build failed');
+  firstHistory.close();
+  const firstMailbox = new ReactionMailbox(mailboxPath);
+  firstMailbox.configure({ owner: owner.id, runId: run.id, expiresAt: Date.now() + 60000, maxReactions: 2, maxDurationMs: 1000 });
+  firstMailbox.close();
+  const history = new RunHistory(historyPath), mailbox = new ReactionMailbox(mailboxPath);
+  let calls = 0;
+  const runner: TurnRunner = { async *run(_session, prompt) { calls++; expect(prompt).toContain('build failed'); yield { type: 'text_part', payload: { text: 'Recovered reaction' } }; } };
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory });
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), projectDirectory: directory, runtime, runHistory: history, reactionMailbox: mailbox, cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')), cronLeasePath: join(directory, 'lease') });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { resume_session_id: owner.id } });
+    await client.next(frame => frame.id === 1);
+    await waitFor(() => mailbox.inspect(owner.id, run.id)?.lastOutcome === 'completed');
+    expect(calls).toBe(1);
+    client.send({ jsonrpc: '2.0', id: 2, method: 'initialize', params: { resume_session_id: owner.id } });
+    await client.next(frame => frame.id === 2);
+    expect(mailbox.inspect(owner.id, run.id)).toMatchObject({ attempts: 1, pendingEvents: 0 });
+    expect(calls).toBe(1);
+  } finally { client.close(); await server.stop(); history.close(); mailbox.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('run cancellation routes to the live terminal and rejects stale or foreign rows', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-run-cancel-'));
+  const history = new RunHistory(join(directory, 'runs.sqlite'));
+  const terminals = new TerminalRegistry({ runHistory: history });
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const session = await runtime.openSession('owner');
+  let stopped = 0;
+  const terminal = terminals.open({ id: 'process', ownerSessionId: session.id, cwd: directory, command: 'build', kind: 'background', control: { kill: async () => { stopped++ } } });
+  const run = history.list(session.id)[0]!;
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, runHistory: history, terminalRegistry: terminals, cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')), cronLeasePath: join(directory, 'lease') });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'run.inspect', params: { session_key: 'owner', run_id: run.id } });
+    expect((await client.next(frame => frame.id === 1)).result?.run).toMatchObject({ cancel_label: 'Stop process' });
+    client.send({ jsonrpc: '2.0', id: 2, method: 'run.cancel', params: { session_key: 'other', run_id: run.id, revision: run.revision } });
+    expect((await client.next(frame => frame.id === 2)).result?.ok).toBe(false);
+    client.send({ jsonrpc: '2.0', id: 3, method: 'run.cancel', params: { session_key: 'owner', run_id: run.id, revision: run.revision + 1 } });
+    expect((await client.next(frame => frame.id === 3)).result?.error).toBe('Run changed; refresh before cancelling');
+    expect(stopped).toBe(0);
+    client.send({ jsonrpc: '2.0', id: 4, method: 'run.cancel', params: { session_key: 'owner', run_id: run.id, revision: run.revision } });
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ ok: true, requested: true });
+    expect(stopped).toBe(1);
+    expect(history.inspect(session.id, run.id)?.state).toBe('running');
+    terminal.close(0);
+    client.send({ jsonrpc: '2.0', id: 5, method: 'run.inspect', params: { session_key: 'owner', run_id: run.id } });
+    expect((await client.next(frame => frame.id === 5)).result?.run).toMatchObject({ cancel_label: null, state: 'succeeded' });
+  } finally { client.close(); await server.stop(); history.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('Runs cancels only the exact active schedule execution', async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'xerxes-schedule-run-control-')));
+  const history = new RunHistory(join(directory, 'runs.sqlite'));
+  const store = new JobStore(join(directory, 'jobs.json'));
+  const runner = new AbortGateRunner();
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const caller = await runtime.openSession('caller');
+  store.add(new CronJob({ id: 'job', prompt: 'Check', projectRoot: directory, paused: true, schedule: '0 9 * * *' }));
+  const stale = history.start({ ownerSessionId: caller.id, workspace: directory, kind: 'schedule', sourceId: 'job', title: 'Older incomplete record' });
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), projectDirectory: directory, runtime, runHistory: history, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), cronArchiveDirectory: join(directory, 'archive') });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  try {
+    const running = server.scheduleToolRequest(caller.id, 'run', { schedule_id: 'job' }).catch(error => error);
+    await waitFor(() => runner.runs === 1);
+    const current = history.listWorkspace(directory).find(run => run.id !== stale.id)!;
+    client.send({ jsonrpc: '2.0', id: 1, method: 'run.cancel', params: { session_key: 'caller', scope: 'workspace', run_id: stale.id, revision: stale.revision } });
+    expect((await client.next(frame => frame.id === 1)).result).toMatchObject({ ok: false, error: 'This run has no active cancellation control' });
+    client.send({ jsonrpc: '2.0', id: 2, method: 'run.cancel', params: { session_key: 'caller', scope: 'workspace', run_id: current.id, revision: current.revision } });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true, requested: true });
+    expect(await running).toBeInstanceOf(Error);
+    expect(history.inspect(current.ownerSessionId, current.id)?.state).toBe('cancelled');
+    expect(store.get('job')?.paused).toBe(true);
+  } finally { client.close(); await server.stop(); history.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('hooks slash reports the active workspace configuration without running commands', async () => {
+  const { workspaceShellHooks } = await import('../src/extensions/workspaceHooks.js');
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-hook-slash-'));
+  await Bun.write(join(directory, 'config.json'), JSON.stringify({ hooks: { PreToolUse: [{ command: 'touch forbidden' }] } }));
+  const factory = workspaceShellHooks({ home: directory, allowWorkspace: false, reportError: () => {} });
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions'), hookRunnerForSession: session => factory(session.cwd) });
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, projectDirectory: directory, cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')), cronLeasePath: join(directory, 'lease') });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'session.open', params: { session_key: 'hooks' } });
+    await client.next(frame => frame.id === 1);
+    client.send({ jsonrpc: '2.0', id: 2, method: 'slash', params: { command: '/hooks' } });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true, inspection: { workspaceTrusted: false, hooks: [{ command: 'touch forbidden', blocking: true }], recent: [] } });
+    expect(await Bun.file(join(directory, 'forbidden')).exists()).toBe(false);
+    client.send({ jsonrpc: '2.0', id: 3, method: 'slash', params: { command: '/hooks run' } });
+    expect((await client.next(frame => frame.id === 3)).result?.ok).toBe(false);
+    client.send({ jsonrpc: '2.0', id: 4, method: 'slash', params: { command: '/hooks preview PreToolUse ReadFile' } });
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ ok: true, preview: { event: 'tool_permission_check', executed: false, matched: 1, hooks: [{ blocking: true, matches: true }] } });
+    expect(await Bun.file(join(directory, 'forbidden')).exists()).toBe(false);
+    client.send({ jsonrpc: '2.0', id: 5, method: 'slash', params: { command: '/hooks preview unknown_event' } });
+    expect((await client.next(frame => frame.id === 5)).result).toMatchObject({ ok: false });
+    client.send({ jsonrpc: '2.0', id: 6, method: 'slash', params: { command: '/hooks failures PreToolUse' } });
+    expect((await client.next(frame => frame.id === 6)).result).toMatchObject({ ok: true, failures: { event: 'tool_permission_check', failed: 0, denied: 0, results: [] } });
+    expect(await Bun.file(join(directory, 'forbidden')).exists()).toBe(false);
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('agent settings RPC persists profile mappings without exposing credentials and rejects stale edits', async () => {
+  const { AgentSettingsStore } = await import('../src/agents/settingsStore.js');
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-agent-config-'));
+  const profiles = new ProfileStore(join(directory, 'profiles.json'));
+  profiles.save({ name: 'work', provider: 'openai', apiKey: 'private-test-key', baseUrl: 'https://example.invalid/v1', model: 'gpt-4o' });
+  const store = new AgentSettingsStore(join(directory, 'settings.sqlite'));
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, profileStore: profiles, agentSettingsStore: store, cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')), cronLeasePath: join(directory, 'lease') });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'agent.settings.get' });
+    const result = (await client.next(frame => frame.id === 1)).result;
+    expect(JSON.stringify(result)).not.toContain('private-test-key');
+    expect(result).toMatchObject({ revision: 0, profiles: expect.arrayContaining([{ name: 'work', provider: 'openai', model: 'gpt-4o' }]) });
+    client.send({ jsonrpc: '2.0', id: 2, method: 'agent.settings.save', params: { revision: 0, settings: { light: { model: 'gpt-4o', provider_profile: 'work' } } } });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true, revision: 1 });
+    client.send({ jsonrpc: '2.0', id: 3, method: 'agent.settings.save', params: { revision: 0, settings: { smart: 'other' } } });
+    expect((await client.next(frame => frame.id === 3)).error).toBeDefined();
+    client.send({ jsonrpc: '2.0', id: 4, method: 'agent.settings.save', params: { revision: 1, settings: { smart: { model: 'gpt-4o', provider_profile: 'missing' } } } });
+    expect((await client.next(frame => frame.id === 4)).error).toBeDefined();
+    expect(store.read().revision).toBe(1);
+    client.send({ jsonrpc: '2.0', id: 5, method: 'agent.settings.options', params: { provider_profile: 'work', model: 'gpt-5' } });
+    const options = (await client.next(frame => frame.id === 5)).result;
+    expect(options).toMatchObject({ ok: true, model: 'gpt-5', reasoning_efforts: expect.arrayContaining(['high']) });
+    expect(JSON.stringify(options)).not.toContain('private-test-key');
+    client.send({ jsonrpc: '2.0', id: 6, method: 'agent.settings.options', params: { provider_profile: 'missing' } });
+    expect((await client.next(frame => frame.id === 6)).error).toBeDefined();
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('agent settings use the selected Codex profile live reasoning ladder for choices and saves', async () => {
+  const { AgentSettingsStore } = await import('../src/agents/settingsStore.js');
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-tier-reasoning-'));
+  const profiles = new ProfileStore(join(directory, 'profiles.json'));
+  for (const name of ['deep', 'fast']) profiles.save({ name, provider: 'openai-codex', apiKey: '', baseUrl: `https://${name}.invalid`, model: 'future-model' });
+  const requested: string[] = [];
+  let releaseCatalog!: () => void;
+  const catalogGate = new Promise<void>(resolve => { releaseCatalog = resolve; });
+  const store = new AgentSettingsStore(join(directory, 'settings.sqlite'));
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, profileStore: profiles, agentSettingsStore: store,
+    cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')), cronLeasePath: join(directory, 'lease'),
+    codexModelCatalog: async profile => {
+      requested.push(profile.name);
+      if (profile.name === 'deep') await catalogGate;
+      return [{ id: 'future-model', displayName: undefined, contextLimit: undefined, harnessCoupled: false,
+        defaultReasoningLevel: 'high', reasoningLevels: [{ effort: profile.name === 'deep' ? 'ultra' : 'low', description: undefined }] }];
+    },
+  });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  try {
+    for (const [id, profile, effort] of [[1, 'deep', 'ultra'], [2, 'fast', 'low']] as const) {
+      client.send({ jsonrpc: '2.0', id, method: 'agent.settings.options', params: { provider_profile: profile, model: 'future-model' } });
+      if (id === 1) {
+        client.send({ jsonrpc: '2.0', id: 10, method: 'agent.settings.get' });
+        expect((await client.next(frame => frame.id === 10)).result).toMatchObject({ ok: true, revision: 0 });
+        releaseCatalog();
+      }
+      expect((await client.next(frame => frame.id === id)).result).toMatchObject({ reasoning_efforts: ["off", effort] });
+    }
+    client.send({ jsonrpc: '2.0', id: 3, method: 'agent.settings.save', params: { revision: 0, settings: { smart: { model: 'future-model', provider_profile: 'deep', reasoning_effort: 'ultra' } } } });
+    expect((await client.next(frame => frame.id === 3)).result).toMatchObject({ ok: true, revision: 1 });
+    client.send({ jsonrpc: '2.0', id: 4, method: 'agent.settings.save', params: { revision: 1, settings: { smart: { model: 'future-model', provider_profile: 'fast', reasoning_effort: 'ultra' } } } });
+    expect((await client.next(frame => frame.id === 4)).error).toBeDefined();
+    expect(store.read().revision).toBe(1);
+    expect(requested).toEqual(['deep', 'fast']);
+  } finally { releaseCatalog(); client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test.each(['output_limit', 'tool_budget_exhausted', 'provider_failed'])('scheduled %s outcomes are failed and never delivered', async reason => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-schedule-outcome-'));
+  const history = new RunHistory(':memory:');
+  const runner: TurnRunner = { async *run() {
+    yield { type: 'text_part', payload: { text: 'Partial scheduled analysis' } };
+    yield { type: 'status_update', payload: { stop_reason: reason } };
+  } };
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const store = new JobStore(join(directory, 'jobs.json'));
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, runHistory: history, projectDirectory: directory, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), cronArchiveDirectory: join(directory, 'archive') });
+  await server.start();
+  try {
+    const caller = await runtime.openSession('caller');
+    store.add(new CronJob({ id: 'limited-job', prompt: 'Check project', projectRoot: directory, paused: true, schedule: '0 9 * * *' }));
+    await expect(server.scheduleToolRequest(caller.id, 'run', { schedule_id: 'limited-job' })).rejects.toThrow(reason);
+    const scheduled = runtime.sessionStatus('cron:limited-job')!;
+    expect(history.list(scheduled.id)[0]).toMatchObject({ state: 'failed', output: 'Partial scheduled analysis' });
+    expect(existsSync(join(directory, 'archive'))).toBe(false);
+    expect(store.get('limited-job')?.lastRunAt).toBeUndefined();
+  } finally { await server.stop(); history.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('schedule destinations validate before persistence and deliver through the configured adapter', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-schedule-destination-'));
+  const socketPath = join(directory, 'daemon.sock');
+  const store = new JobStore(join(directory, 'jobs.json'));
+  const channel = new DaemonRecordingChannel('recording');
+  const server = new DaemonServer({ socketPath, projectDirectory: directory, channelManager: new ChannelManager({ channels: [['recording', channel]] }), cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), cronArchiveDirectory: join(directory, 'archive'), runtime: new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') }) });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'schedule.options', params: {} });
+    const options = (await client.next(frame => frame.id === 1)).result;
+    expect(options?.destinations).toEqual([{ name: 'none', enabled: true }, { name: 'recording', enabled: false }]);
+    const base = { prompt: 'scheduled report', schedule: '0 9 * * *', paused: true };
+    for (const [index, destination] of [{ deliver: 'unknown', recipient: 'room' }, { deliver: 'recording', recipient: '' }, { deliver: 'none', recipient: 'room' }, { deliver: 'recording', recipient: 'room\nother' }].entries()) {
+      client.send({ jsonrpc: '2.0', id: 10 + index, method: 'schedule.create', params: { ...base, ...destination } });
+      expect((await client.next(frame => frame.id === 10 + index)).error).toBeDefined();
+    }
+    expect(store.listJobs()).toHaveLength(0);
+    client.send({ jsonrpc: '2.0', id: 20, method: 'schedule.create', params: { ...base, deliver: 'recording', recipient: 'room-42' } });
+    const created = (await client.next(frame => frame.id === 20)).result as { job: { id: string; revision: string } };
+    expect(created.job).toMatchObject({ deliver: 'recording', recipient: 'room-42', paused: true });
+    expect(channel.sent).toHaveLength(0);
+    client.send({ jsonrpc: '2.0', id: 21, method: 'schedule.update', params: { ...base, schedule_id: created.job.id, revision: created.job.revision } });
+    const updated = (await client.next(frame => frame.id === 21)).result as { job: { revision: string } };
+    expect(updated.job).toMatchObject({ deliver: 'recording', recipient: 'room-42' });
+    client.send({ jsonrpc: '2.0', id: 22, method: 'schedule.run', params: { schedule_id: created.job.id } });
+    expect((await client.next(frame => frame.id === 22)).result?.ok).toBe(true);
+    expect(channel.sent).toHaveLength(1);
+    expect(channel.sent[0]).toMatchObject({ channel: 'recording', roomId: 'room-42', text: 'Bun daemon foundation received: scheduled report' });
+    client.send({ jsonrpc: '2.0', id: 23, method: 'schedule.inspect', params: { schedule_id: created.job.id } });
+    const inspected = (await client.next(frame => frame.id === 23)).result as { job: { revision: string } };
+    client.send({ jsonrpc: '2.0', id: 24, method: 'schedule.update', params: { ...base, schedule_id: created.job.id, revision: inspected.job.revision, deliver: 'none', recipient: '' } });
+    expect((await client.next(frame => frame.id === 24)).result?.job).toMatchObject({ deliver: 'none', recipient: '' });
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('session reattach restores persisted and live todo progress without mixing chats', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-todo-reattach-'));
+  const gate = Promise.withResolvers<void>();
+  const emitted = Promise.withResolvers<void>();
+  const result = '1. [x] One\n2. [x] Two\n3. [x] Three\n4. [~] Four\n5. [ ] Five\n\nProgress: 3/5';
+  const runner: TurnRunner = { async *run() {
+    yield { type: 'tool_call', payload: { id: 'todo', name: 'TodoWriteTool', arguments: '{}' } };
+    yield { type: 'tool_result', payload: { tool_call_id: 'todo', name: 'TodoWriteTool', permitted: true, return_value: result } };
+    emitted.resolve(); await gate.promise;
+  } };
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const original = await runtime.openSession('original');
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), projectDirectory: directory, runtime });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  const running = runtime.submitTurn('original', 'work', () => {});
+  try {
+    await emitted.promise;
+    for (const [index, key] of ['other', 'original'].entries()) {
+      client.send({ jsonrpc: '2.0', id: index + 1, method: 'session.open', params: { session_key: key, project_dir: directory } });
+      const payload = (await client.next(frame => frame.id === index + 1)).result as { session: { todos: { status: string }[] } };
+      expect(payload.session.todos).toHaveLength(key === 'original' ? 5 : 0);
+      if (key === 'original') expect(payload.session.todos.filter(item => item.status === 'completed')).toHaveLength(3);
+    }
+    gate.resolve(); await running;
+    // Completed and legacy records use the same canonical result parser.
+    expect(original.inflightTodoResult).toBeUndefined();
+    client.send({ jsonrpc: '2.0', id: 3, method: 'session.status', params: { session_key: 'original' } });
+    expect(((await client.next(frame => frame.id === 3)).result?.session as { todos: unknown[] }).todos).toHaveLength(5);
+    original.toolExecutions.push({ name: 'TodoWriteTool', permitted: true, result: 'Progress: 0/0' });
+    client.send({ jsonrpc: '2.0', id: 4, method: 'session.status', params: { session_key: 'original' } });
+    expect(((await client.next(frame => frame.id === 4)).result?.session as { todos: unknown[] }).todos).toEqual([]);
+  } finally { gate.resolve(); await running; client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('workspaces slash lists and inspects persisted checkouts without applying changes', async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'xerxes-workspace-slash-')));
+  const git = async (...args: string[]) => {
+    const process = Bun.spawn(['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd: directory, stdout: 'pipe', stderr: 'pipe' });
+    const [code, , error] = await Promise.all([process.exited, new Response(process.stdout).text(), new Response(process.stderr).text()]);
+    if (code) throw new Error(error);
+  };
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, projectDirectory: directory, cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')), cronLeasePath: join(directory, 'lease') });
+  try {
+    await git('init');
+    await Bun.write(join(directory, 'file.txt'), 'parent');
+    await git('add', '.'); await git('commit', '-m', 'workspace fixture');
+    const tree = await nativeSubagentWorktrees(directory).create({ taskId: 'task', taskName: 'Task' });
+    const id = tree.branch.replace('xerxes/agent-', '');
+    await Bun.write(join(tree.path, 'file.txt'), 'agent result');
+    await server.start();
+    const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+    try {
+      client.send({ jsonrpc: '2.0', id: 0, method: 'workspace.list', params: {} });
+      expect((await client.next(frame => frame.id === 0)).result).toMatchObject({ ok: false });
+      client.send({ jsonrpc: '2.0', id: 1, method: 'session.open', params: { session_key: 'workspaces' } });
+      await client.next(frame => frame.id === 1);
+      client.send({ jsonrpc: '2.0', id: 2, method: 'slash', params: { command: '/workspaces' } });
+      expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true, inventory: { records: [{ id, taskId: 'task' }] } });
+      client.send({ jsonrpc: '2.0', id: 3, method: 'slash', params: { command: '/workspaces inspect ' + id } });
+      expect((await client.next(frame => frame.id === 3)).result).toMatchObject({ ok: true, review: { id, path: tree.path, diff: expect.stringContaining('+agent result') } });
+      client.send({ jsonrpc: '2.0', id: 4, method: 'slash', params: { command: '/workspaces inspect ../foreign' } });
+      expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ ok: false });
+      client.send({ jsonrpc: '2.0', id: 5, method: 'workspace.list', params: {} });
+      expect((await client.next(frame => frame.id === 5)).result).toMatchObject({ ok: true, inventory: { records: [{ id }] } });
+      client.send({ jsonrpc: '2.0', id: 6, method: 'workspace.inspect', params: { workspace_id: id } });
+      expect((await client.next(frame => frame.id === 6)).result).toMatchObject({ ok: true, review: { id, diff: expect.stringContaining('+agent result') } });
+      const reviewed = await nativeSubagentWorktrees(directory).inspect(id);
+      client.send({ jsonrpc: '2.0', id: 7, method: 'workspace.checkApply', params: { workspace_id: id, review_id: reviewed.reviewId } });
+      const checked = (await client.next(frame => frame.id === 7)).result;
+      expect(checked).toMatchObject({ ok: true, check: { reviewId: reviewed.reviewId, canApply: true, destination: directory } });
+      expect(await Bun.file(join(directory, 'file.txt')).text()).toBe('parent');
+      expect(await Bun.file(join(tree.path, 'file.txt')).text()).toBe('agent result');
+      const applyParams = { workspace_id: id, review_id: reviewed.reviewId, destination_state: (checked?.check as { destinationState: string }).destinationState };
+      client.send({ jsonrpc: '2.0', id: 8, method: 'workspace.apply', params: applyParams });
+      expect((await client.next(frame => frame.id === 8)).result).toMatchObject({ ok: false });
+      expect(await Bun.file(join(directory, 'file.txt')).text()).toBe('parent');
+      client.send({ jsonrpc: '2.0', id: 9, method: 'workspace.apply', params: { ...applyParams, confirm: true, destination_state: '0'.repeat(64) } });
+      expect((await client.next(frame => frame.id === 9)).result).toMatchObject({ ok: false, error: expect.stringContaining('Destination changed') });
+      client.send({ jsonrpc: '2.0', id: 10, method: 'workspace.apply', params: { ...applyParams, confirm: true } });
+      const applied = (await client.next(frame => frame.id === 10)).result;
+      expect(applied).toMatchObject({ ok: true, integration: { status: 'applied', destination: directory } });
+      expect(await Bun.file(join(directory, 'file.txt')).text()).toBe('agent result');
+      expect(await Bun.file(join(tree.path, 'file.txt')).text()).toBe('agent result');
+      const integration = applied?.integration as { id: string; backupPath: string };
+      client.send({ jsonrpc: '2.0', id: 11, method: 'workspace.integrations', params: {} });
+      expect((await client.next(frame => frame.id === 11)).result).toMatchObject({ ok: true, inventory: { records: expect.arrayContaining([expect.objectContaining({ id: integration.id, status: 'applied' })]) } });
+      client.send({ jsonrpc: '2.0', id: 12, method: 'workspace.recover', params: { integration_id: integration.id, confirm: true } });
+      expect((await client.next(frame => frame.id === 12)).result).toMatchObject({ ok: true, recovery: { status: 'applied', conflicts: [] } });
+      expect(await Bun.file(join(directory, 'file.txt')).text()).toBe('agent result');
+      const recordPath = join(integration.backupPath, 'record.json');
+      await Bun.write(recordPath, JSON.stringify({ ...await Bun.file(recordPath).json(), status: 'prepared' }));
+      client.send({ jsonrpc: '2.0', id: 15, method: 'workspace.integration.inspect', params: { integration_id: integration.id } });
+      expect((await client.next(frame => frame.id === 15)).result).toMatchObject({ ok: true, inspection: { id: integration.id, files: [{ path: 'file.txt', action: 'restore' }] } });
+      client.send({ jsonrpc: '2.0', id: 13, method: 'workspace.recover', params: { integration_id: integration.id } });
+      expect((await client.next(frame => frame.id === 13)).result).toMatchObject({ ok: false });
+      expect(await Bun.file(join(directory, 'file.txt')).text()).toBe('agent result');
+      client.send({ jsonrpc: '2.0', id: 14, method: 'workspace.recover', params: { integration_id: integration.id, confirm: true } });
+      expect((await client.next(frame => frame.id === 14)).result).toMatchObject({ ok: true, recovery: { id: integration.id, status: 'rolled-back', conflicts: [] } });
+      expect(await Bun.file(join(directory, 'file.txt')).text()).toBe('parent');
+    } finally { client.close(); }
+  } finally { await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('workspace Runs includes ordered upcoming jobs without leaking another project or paused schedules', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-upcoming-runs-'))
+  const history = new RunHistory(join(directory, 'runs.sqlite'))
+  const store = new JobStore(join(directory, 'jobs.json'))
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') })
+  await runtime.openSession('owner')
+  for (const [id, projectRoot, paused, nextRunAt] of [
+    ['later', directory, false, '2099-01-02T09:00:00Z'],
+    ['first', directory, false, '2099-01-01T09:00:00Z'],
+    ['paused', directory, true, '2099-01-01T08:00:00Z'],
+    ['foreign', join(directory, 'other'), false, '2099-01-01T07:00:00Z'],
+  ] as const) store.add(new CronJob({ id, projectRoot, paused, nextRunAt, prompt: id, schedule: '0 9 * * *' }))
+  const socketPath = join(directory, 'daemon.sock')
+  const server = new DaemonServer({ socketPath, runtime, runHistory: history, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease') })
+  await server.start()
+  const client = await SocketTestClient.connect(socketPath)
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'run.list', params: { session_key: 'owner', scope: 'workspace' } })
+    expect((await client.next(frame => frame.id === 1)).result).toMatchObject({ upcoming_total: 2, upcoming: [{ id: 'first' }, { id: 'later' }], runs: [] })
+    client.send({ jsonrpc: '2.0', id: 2, method: 'run.list', params: { session_key: 'owner', scope: 'session' } })
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ upcoming_total: 0, upcoming: [] })
+  } finally { client.close(); await server.stop(); history.close(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test('daemon tool inventory uses the runtime surface when no catalog port is injected', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-tool-inventory-daemon-'));
+  const socketPath = join(directory, 'daemon.sock');
+  const runtime = new InMemoryDaemonRuntime({
+    toolInventory: () => [{ name: 'ReadFile', exposure: 'loaded', reason: 'Schema exposed to the current session' }],
+    async *run() { yield { type: 'text_part', payload: { text: 'unused' } }; },
+  }, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const server = new DaemonServer({ socketPath, runtime });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'tool.inventory', params: {} });
+    expect((await client.next(frame => frame.id === 1)).result).toMatchObject({ source: 'unavailable', execution_readiness: 'unknown', tools: [] });
+    client.send({ jsonrpc: '2.0', id: 2, method: 'initialize', params: { session_key: 'inventory', project_dir: directory } });
+    await client.next(frame => frame.id === 2);
+    await client.next(eventFrame('init_done'));
+    await client.next(eventFrame('status_update'));
+    client.send({ jsonrpc: '2.0', id: 3, method: 'tool.inventory', params: {} });
+    expect((await client.next(frame => frame.id === 3)).result).toMatchObject({ source: 'runtime-registry', execution_readiness: 'not_checked', tools: [{ name: 'ReadFile', exposure: 'loaded' }] });
+    client.send({ jsonrpc: '2.0', id: 4, method: 'slash', params: { command: '/tools' } });
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ source: 'runtime-registry' });
+    expect((await client.next(eventFrame('notification'))).params?.payload).toMatchObject({ body: expect.stringContaining('[loaded]') });
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('daemon MCP health exposes failed configurations and reload retries enabled servers', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-mcp-health-'));
+  const socketPath = join(directory, 'daemon.sock');
+  let fail = true;
+  const manager = new MCPManager({ clientFactory: config => ({
+    config, tools: [], resources: [], prompts: [], connected: true,
+    async connect() { if (fail) throw new Error('fixture connection refused'); },
+    async disconnect() {},
+    async callTool() { return { content: [] }; },
+    async readResource() { return { contents: [] }; },
+    async getPrompt() { return { messages: [] }; },
+  }), reconnect: { policy: { maxAttempts: 1 } } });
+  await manager.addServer({ name: 'broken' });
+  await manager.addServer({ name: 'off', enabled: false });
+  const server = new DaemonServer({ socketPath, mcpManager: manager, runtime: new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') }) });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'mcp.status', params: {} });
+    expect((await client.next(frame => frame.id === 1)).result).toMatchObject({ configured: true, servers: { broken: { state: 'failed', connected: false }, off: { state: 'disabled' } } });
+    fail = false;
+    client.send({ jsonrpc: '2.0', id: 2, method: 'slash', params: { command: '/reload-mcp' } });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true, servers: [{ name: 'broken', reconnected: true }] });
+    await client.next(eventFrame('notification'));
+    client.send({ jsonrpc: '2.0', id: 3, method: 'slash', params: { command: '/mcp status' } });
+    expect((await client.next(frame => frame.id === 3)).result).toMatchObject({ servers: { broken: { connected: true }, off: { state: 'disabled' } } });
+    await client.next(eventFrame('notification'));
+    client.send({ jsonrpc: '2.0', id: 4, method: 'slash', params: { command: '/mcp reconnect off' } });
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ ok: false, error: expect.stringContaining('disabled') });
+  } finally { client.close(); await server.stop(); await manager.disconnectAll(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('skill inspection exposes source and literal instructions without activating or expanding them', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-skill-inspect-'));
+  const skillDirectory = join(directory, 'skills');
+  const source = join(skillDirectory, 'inspect-fixture', 'SKILL.md');
+  const marker = join(directory, 'must-not-exist');
+  await mkdir(join(skillDirectory, 'inspect-fixture'), { recursive: true });
+  await writeFile(source, `---\nname: inspect-fixture\ndescription: Inspect fixture\n---\nLiteral $ARGUMENTS and !\`touch ${marker}\``);
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const socketPath = join(directory, 'daemon.sock');
+  const server = new DaemonServer({ socketPath, runtime, skillDirectories: [skillDirectory] });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { session_key: 'inspect' } });
+    await client.next(frame => frame.id === 1);
+    await client.next(eventFrame('init_done'));
+    await client.next(eventFrame('status_update'));
+    client.send({ jsonrpc: '2.0', id: 2, method: 'slash', params: { command: '/skills inspect inspect-fixture' } });
+    const result = await client.next(frame => frame.id === 2);
+    expect(result.result).toMatchObject({ ok: true, skill: { source, name: 'inspect-fixture', execution_readiness: 'not_checked', truncated: false, instructions: expect.stringContaining('$ARGUMENTS') } });
+    expect(await Bun.file(marker).exists()).toBe(false);
+    expect(runtime.sessionStatus('inspect')?.messages).toEqual([]);
+    client.send({ jsonrpc: '2.0', id: 3, method: 'complete', params: { text: '/skills inspect inspect-' } });
+    expect((await client.next(frame => frame.id === 3)).result).toMatchObject({ completions: [{ value: '/skills inspect inspect-fixture ', label: 'inspect-fixture' }] });
+    client.send({ jsonrpc: '2.0', id: 4, method: 'slash', params: { command: '/skills inspect missing' } });
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ ok: false, error: expect.stringContaining('not discovered') });
+  } finally {
+    client.close();
+    await server.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('skill diagnostics report shadowed sources and refresh after the conflict is removed', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-skill-diagnostics-'));
+  const first = join(directory, 'first');
+  const second = join(directory, 'second');
+  for (const root of [first, second]) {
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, 'SKILL.md'), '---\nname: duplicated\ndescription: fixture\n---\nReview files.');
+  }
+  const socketPath = join(directory, 'daemon.sock');
+  const server = new DaemonServer({ socketPath, skillDirectories: [first, second], runtime: new InMemoryDaemonRuntime(undefined, {
+    currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions'),
+  }) });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { session_key: 'diagnostics' } });
+    await client.next(frame => frame.id === 1);
+    await client.next(eventFrame('init_done'));
+    await client.next(eventFrame('status_update'));
+    client.send({ jsonrpc: '2.0', id: 2, method: 'slash', params: { command: '/skills diagnostics' } });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true, total: 1, truncated: false, diagnostics: [
+      { kind: 'shadowed', name: 'duplicated', path: join(second, 'SKILL.md'), detail: expect.stringContaining(join(first, 'SKILL.md')) },
+    ] });
+    await rm(join(second, 'SKILL.md'));
+    client.send({ jsonrpc: '2.0', id: 3, method: 'slash', params: { command: '/skills diagnostics' } });
+    expect((await client.next(frame => frame.id === 3)).result).toMatchObject({ ok: true, total: 0, diagnostics: [] });
+    client.send({ jsonrpc: '2.0', id: 4, method: 'complete', params: { text: '/skills dia' } });
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ completions: [{ value: '/skills diagnostics ', label: 'diagnostics' }] });
+    client.send({ jsonrpc: '2.0', id: 5, method: 'slash', params: { command: '/skills diagnostics unexpected' } });
+    expect((await client.next(frame => frame.id === 5)).result).toMatchObject({ ok: false });
+  } finally {
+    client.close(); await server.stop(); await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test.each([false, true])('plugin discovery reports actual host configuration and read-only inspection (configured=%s)', async configured => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-plugin-inspect-'));
+  const pluginRegistry = new PluginRegistry();
+  pluginRegistry.registerPlugin({ name: 'fixture' });
+  pluginRegistry.registerTool('fixture-tool', () => { throw new Error('must not execute'); }, undefined, 'fixture');
+  const socketPath = join(directory, 'daemon.sock');
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const server = new DaemonServer({ socketPath, runtime, ...(configured ? { pluginRegistry } : {}) });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { session_key: 'plugins' } });
+    await client.next(frame => frame.id === 1);
+    await client.next(eventFrame('init_done')); await client.next(eventFrame('status_update'));
+    client.send({ jsonrpc: '2.0', id: 2, method: 'slash', params: { command: '/plugins' } });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true, source: configured ? 'host-registry' : 'unconfigured', plugins: configured ? ['fixture'] : [], execution_readiness: 'not_checked' });
+    client.send({ jsonrpc: '2.0', id: 3, method: 'slash', params: { command: '/plugins inspect fixture' } });
+    expect((await client.next(frame => frame.id === 3)).result).toMatchObject(configured
+      ? { ok: true, plugin: { name: 'fixture', source: { kind: 'host-registration' }, tools: ['fixture-tool'] } }
+      : { ok: false });
+    client.send({ jsonrpc: '2.0', id: 4, method: 'complete', params: { text: '/plugins inspect fix' } });
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ completions: configured ? [{ value: '/plugins inspect fixture ', label: 'fixture' }] : [] });
+    expect(runtime.sessionStatus('plugins')?.messages).toEqual([]);
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('MCP settings RPC masks launch secrets and preserves omitted credentials during guarded saves', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-mcp-settings-rpc-'));
+  const path = join(directory, 'mcp.json'), socketPath = join(directory, 'daemon.sock');
+  const store = new McpSettingsStore(path);
+  const manager = new MCPManager({ clientFactory: config => ({
+    config, tools: [], resources: [], prompts: [],
+    async connect() { if (config.command === 'bad') throw new Error('rpc-private-token'); },
+    async disconnect() {}, async callTool() { return { content: [] }; },
+    async readResource() { return { contents: [] }; }, async getPrompt() { return { messages: [] }; },
+  }) });
+  await writeFile(path, JSON.stringify({ alpha: { command: 'bun', args: ['rpc-private-token'], env: { TOKEN: 'rpc-private-token' } } }));
+  await manager.addServer(store.read().servers[0]!);
+  const server = new DaemonServer({ socketPath, mcpManager: manager, mcpSettingsStore: store,
+    runtime: new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') }) });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'mcp.settings.get' });
+    const first = (await client.next(frame => frame.id === 1)).result!;
+    expect(first).toMatchObject({ ok: true, servers: [{ name: 'alpha', enabled: true, transport: 'stdio' }] });
+    expect(JSON.stringify(first)).not.toContain('rpc-private-token');
+    client.send({ jsonrpc: '2.0', id: 2, method: 'mcp.settings.save', params: { name: 'alpha', revision: first.revision, changes: { command: 'bad' } } });
+    const failed = (await client.next(frame => frame.id === 2)).result;
+    expect(failed).toMatchObject({ ok: false });
+    expect(JSON.stringify(failed)).not.toContain('rpc-private-token');
+    expect(manager.getServer('alpha')?.config.command).toBe('bun');
+    expect(store.read().revision).toBe(String(first.revision));
+    client.send({ jsonrpc: '2.0', id: 3, method: 'mcp.settings.save', params: { name: 'alpha', revision: first.revision, changes: { enabled: false } } });
+    expect((await client.next(frame => frame.id === 3)).result).toMatchObject({ ok: true, server: { state: 'disabled' } });
+    expect(store.read().servers[0]?.env).toEqual({ TOKEN: 'rpc-private-token' });
+    expect(store.read().servers[0]?.args).toEqual(['rpc-private-token']);
+    client.send({ jsonrpc: '2.0', id: 4, method: 'mcp.settings.save', params: { name: 'alpha', revision: first.revision, changes: { enabled: true } } });
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ ok: false });
+    expect(manager.status('alpha')?.state).toBe('disabled');
+    client.send({ jsonrpc: '2.0', id: 5, method: 'slash', params: { command: '/config mcp' } });
+    const config = (await client.next(frame => frame.id === 5)).result;
+    expect(config).toMatchObject({ ok: true, servers: [{ name: 'alpha', enabled: false }] });
+    expect(JSON.stringify(config)).not.toContain('rpc-private-token');
+    client.send({ jsonrpc: '2.0', id: 6, method: 'complete', params: { text: '/config m' } });
+    expect((await client.next(frame => frame.id === 6)).result).toMatchObject({ completions: [{ value: '/config mcp ' }] });
+    client.send({ jsonrpc: '2.0', id: 7, method: 'mcp.settings.save', params: { name: 'beta', revision: store.read().revision, create: true, changes: { command: 'bun', enabled: false } } });
+    expect((await client.next(frame => frame.id === 7)).result).toMatchObject({ ok: true, server: { name: 'beta', state: 'disabled' } });
+    expect(store.read().servers.map(server => server.name)).toEqual(['alpha', 'beta']);
+  } finally { client.close(); await server.stop(); await manager.disconnectAll(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('disconnecting an MCP settings editor cancels its candidate before persistence', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-mcp-settings-cancel-'));
+  const path = join(directory, 'mcp.json'), socketPath = join(directory, 'daemon.sock');
+  const store = new McpSettingsStore(path);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), cleaned = Promise.withResolvers<void>();
+  const manager = new MCPManager({ clientFactory: config => ({
+    config, tools: [], resources: [], prompts: [],
+    async connect() { if (config.command === 'new') { entered.resolve(); await release.promise; } },
+    async disconnect() { if (config.command === 'new') cleaned.resolve(); },
+    async callTool() { return { content: [] }; }, async readResource() { return { contents: [] }; }, async getPrompt() { return { messages: [] }; },
+  }) });
+  await writeFile(path, JSON.stringify({ alpha: { command: 'old' } }));
+  const original = store.read();
+  await manager.addServer(original.servers[0]!);
+  const server = new DaemonServer({ socketPath, mcpManager: manager, mcpSettingsStore: store,
+    runtime: new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') }) });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'mcp.settings.save', params: { name: 'alpha', revision: original.revision, changes: { command: 'new' } } });
+    await entered.promise;
+    client.close();
+    // Wait for the server's transport to observe EOF before releasing connect.
+    for (let i = 0; i < 100 && (server as unknown as { mcpSettingsUpdates: Map<unknown, AbortController> }).mcpSettingsUpdates.values().next().value?.signal.aborted !== true; i++) await Bun.sleep(5);
+    expect([...((server as unknown as { mcpSettingsUpdates: Map<unknown, AbortController> }).mcpSettingsUpdates.values())][0]?.signal.aborted).toBe(true);
+    release.resolve();
+    await cleaned.promise;
+    expect(store.read()).toEqual(original);
+    expect(manager.getServer('alpha')?.config.command).toBe('old');
+  } finally { release.resolve(); client.close(); await server.stop(); await manager.disconnectAll(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('goal inspection exposes criteria and evidence only for the active session without mutating history', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-goal-inspection-'));
+  const socketPath = join(directory, 'daemon.sock');
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const server = new DaemonServer({ socketPath, runtime, projectDirectory: directory, cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')), cronLeasePath: join(directory, 'cron.lease') });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'session.open', params: { session_key: 'goal-owner' } });
+    await client.next(frame => frame.id === 1);
+    const session = runtime.listSessions().find(row => row.sessionKey === 'goal-owner')!;
+    const goal = createGoal(session.metadata, session.id, { objective: 'Match artifacts', criteria: [{ id: 'match', description: 'Files match' }] }, 100);
+    recordGoalEvidence(session.metadata, session.id, goal, 'match', { toolCallId: 'cmp-result', summary: 'The comparison passed', recordedAt: 101 }, 101);
+    const before = JSON.stringify(session.metadata);
+    client.send({ jsonrpc: '2.0', id: 2, method: 'goal.inspect', params: {} });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true, session_id: session.id, goal: { revision: 2, criteria: [{ id: 'match', evidence: { toolCallId: 'cmp-result' } }] } });
+    expect(JSON.stringify(session.metadata)).toBe(before);
+    expect(session.messages).toHaveLength(0);
+    client.send({ jsonrpc: '2.0', id: 3, method: 'session.open', params: { session_key: 'goal-other' } });
+    await client.next(frame => frame.id === 3);
+    client.send({ jsonrpc: '2.0', id: 4, method: 'goal.inspect', params: { session_id: session.id } });
+    expect((await client.next(frame => frame.id === 4)).result?.goal).toBeNull();
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('context inspection is session-scoped, read-only and rejects stale pages', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-context-inspector-'));
+  const socketPath = join(directory, 'daemon.sock');
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const server = new DaemonServer({ socketPath, runtime, projectDirectory: directory, cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')), cronLeasePath: join(directory, 'cron.lease') });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'session.open', params: { session_key: 'context-owner' } });
+    await client.next(frame => frame.id === 1);
+    const session = runtime.listSessions().find(row => row.sessionKey === 'context-owner')!;
+    session.messages.push({ role: 'user', content: 'private source evidence' });
+    session.requestScaffold = { capturedAt: 1, systemSegments: [{ name: 'memory', text: 'saved preference' }] };
+    client.send({ jsonrpc: '2.0', id: 2, method: 'context.inspect', params: { section: 'memory' } });
+    const inspected = (await client.next(frame => frame.id === 2)).result!;
+    expect(inspected.entries).toMatchObject([{ title: 'memory', text: 'saved preference' }]);
+    client.send({ jsonrpc: '2.0', id: 3, method: 'slash', params: { command: '/context' } });
+    expect((await client.next(frame => frame.id === 3)).result?.ok).toBe(true);
+    expect(session.messages).toHaveLength(1);
+    session.messages[0] = { role: 'user', content: 'changed source' };
+    client.send({ jsonrpc: '2.0', id: 4, method: 'context.inspect', params: { section: 'conversation', generation: inspected.generation } });
+    expect((await client.next(frame => frame.id === 4)).error).toBeDefined();
+    client.send({ jsonrpc: '2.0', id: 5, method: 'session.open', params: { session_key: 'context-other' } });
+    await client.next(frame => frame.id === 5);
+    client.send({ jsonrpc: '2.0', id: 6, method: 'context.inspect', params: { section: 'memory', session_id: session.id } });
+    expect((await client.next(frame => frame.id === 6)).result?.entries).toEqual([]);
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('context controls validate source and revision, survive reload and reject active turns', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-context-controls-'));
+  const sessionDirectory = join(directory, 'sessions');
+  const socketPath = join(directory, 'daemon.sock');
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory });
+  const server = new DaemonServer({ socketPath, runtime, projectDirectory: directory, cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')), cronLeasePath: join(directory, 'cron.lease') });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  let id = 0;
+  const rpc = async (method: string, params: Record<string, unknown>) => {
+    const callId = ++id;
+    client.send({ jsonrpc: '2.0', id: callId, method, params });
+    return (await client.next(frame => frame.id === callId)).result!;
+  };
+  try {
+    await rpc('session.open', { session_key: 'controls-owner' });
+    const session = runtime.listSessions().find(row => row.sessionKey === 'controls-owner')!;
+    session.messages.push({ role: 'user', content: 'hello' }, { role: 'assistant', content: 'done' });
+    session.turnCount = 1;
+    session.requestScaffold = { memorySources: [{ scope: 'project', path: 'MEMORY.md', content: 'Captured fact' }] };
+    const page = await rpc('context.inspect', { section: 'memory' });
+    const patch = { action: 'pin', scope: 'project', path: 'MEMORY.md', revision: 0, generation: page.generation, content: 'untrusted replacement' };
+    expect((await rpc('context.control', { ...patch, path: 'bootstrap' })).ok).toBe(false);
+    expect((await rpc('context.control', patch)).ok).toBe(true);
+    expect(session.metadata.context_controls).toMatchObject({ revision: 1, pins: [{ content: 'Captured fact' }] });
+    expect((await rpc('context.control', patch)).ok).toBe(false);
+    const updated = await rpc('context.inspect', { section: 'memory' });
+    session.activeTurnId = 'running';
+    expect((await rpc('context.control', { ...patch, action: 'exclude', generation: updated.generation, revision: 1 })).ok).toBe(false);
+    session.activeTurnId = '';
+    const restoredRuntime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory });
+    const restored = await restoredRuntime.openSession(session.id, session.agentId, { resume: true, cwd: session.cwd });
+    expect(restored.metadata.context_controls).toEqual(session.metadata.context_controls);
+    expect(restored.requestScaffold).toBeUndefined();
+    const transcriptPath = join(sessionDirectory, session.id + '.json');
+    const original = await readFile(transcriptPath, 'utf8');
+    const divergent = JSON.parse(original);
+    divergent.generation = (divergent.generation ?? 0) + 1;
+    divergent.messages[0].content = 'External transcript replacement';
+    await writeFile(transcriptPath, JSON.stringify(divergent));
+    try {
+      const failed = await rpc('context.control', { ...patch, action: 'exclude', generation: updated.generation, revision: 1 });
+      expect(failed.ok).toBe(false);
+      expect(session.metadata.context_controls).toMatchObject({ revision: 1, pins: [{ content: 'Captured fact' }] });
+      expect(runtime.listSessions()).toContain(session);
+    } finally { await writeFile(transcriptPath, original); }
+    await rpc('session.open', { session_key: 'controls-other' });
+    expect((await rpc('context.control', { ...patch, session_id: session.id })).ok).toBe(false);
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('session schedules bind identity, serialize follow-ups and cancel queued work', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-session-followup-'));
+  const started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const seen: string[] = [];
+  const runner: TurnRunner = { async *run(session, prompt) {
+    seen.push(session.id + ':' + prompt);
+    started.resolve(); await release.promise;
+    yield { type: 'text_part', payload: { text: 'Follow-up finished' } };
+  } };
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const store = new JobStore(join(directory, 'jobs.json'));
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, projectDirectory: directory, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), cronArchiveDirectory: join(directory, 'archive') });
+  await server.start();
+  try {
+    const caller = await runtime.openSession('caller');
+    const options = { prompt: 'Check back', paused: true, interval_seconds: 60, target: 'session', max_runs: 3, expires_at: '2099-01-01T00:00:00Z' };
+    await expect(server.scheduleToolRequest(caller.id, 'create', { ...options, max_runs: null })).rejects.toThrow('require');
+    const first = await server.scheduleToolRequest(caller.id, 'create', options) as { job: { id: string; target_session_id: string } };
+    const second = await server.scheduleToolRequest(caller.id, 'create', options) as { job: { id: string } };
+    expect(first.job.target_session_id).toBe(caller.id);
+    const active = server.scheduleToolRequest(caller.id, 'run', { schedule_id: first.job.id });
+    await started.promise;
+    const controller = new AbortController();
+    const queued = server.scheduleToolRequest(caller.id, 'run', { schedule_id: second.job.id }, controller.signal).catch(error => error);
+    await Bun.sleep(20);
+    expect(seen).toEqual([caller.id + ':Check back']);
+    controller.abort(); release.resolve();
+    expect((await active).ok).toBe(true);
+    expect(await queued).toBeInstanceOf(Error);
+    expect(seen).toHaveLength(1);
+    expect(caller.messages.some(message => String(message.content).includes('Follow-up finished'))).toBe(true);
+    expect(runtime.listSessions()).toHaveLength(1);
+  } finally { release.resolve(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('bound session resume rejects a missing transcript instead of creating a replacement', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-bound-resume-'));
+  const runtime = new InMemoryDaemonRuntime({ async *run() {} }, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  try {
+    await expect(runtime.openSession('missing', undefined, { resume: true, expectedSessionId: 'missing' })).rejects.toThrow('missing');
+    expect(runtime.listSessions()).toHaveLength(0);
+    const original = await runtime.openSession('slot');
+    await expect(runtime.openSession('slot', undefined, { expectedSessionId: 'different' })).rejects.toThrow('identity changed');
+    expect(runtime.sessionStatus('slot')?.id).toBe(original.id);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('session follow-up reloads its persisted conversation after daemon restart', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-followup-restart-'));
+  const sessions = join(directory, 'sessions');
+  const seen: string[] = [];
+  const runner: TurnRunner = { async *run(session) { seen.push(session.id); expect(JSON.stringify(session.messages)).toContain('remember this context'); yield { type: 'text_part', payload: { text: 'Resumed follow-up' } }; } };
+  const store = new JobStore(join(directory, 'jobs.json'));
+  let runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: sessions });
+  const makeServer = () => new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, projectDirectory: directory, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), cronArchiveDirectory: join(directory, 'archive') });
+  let server = makeServer();
+  try {
+    await server.start();
+    const owner = await runtime.openSession('old-tab');
+    owner.messages.push({ role: 'user', content: 'remember this context' }, { role: 'assistant', content: 'I will remember it.' });
+    await runtime.flushSessions('rewrite');
+    const result = await server.scheduleToolRequest(owner.id, 'create', { prompt: 'Follow up', target: 'session', paused: true, interval_seconds: 60, max_runs: 2, expires_at: '2099-01-01T00:00:00Z' }) as { job: { id: string } };
+    await server.stop();
+    runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: sessions });
+    server = makeServer(); await server.start();
+    const caller = await runtime.openSession('new-tab');
+    expect((await server.scheduleToolRequest(caller.id, 'run', { schedule_id: result.job.id })).ok).toBe(true);
+    expect(seen).toEqual([owner.id]);
+    expect(caller.messages).toHaveLength(0);
+    expect(runtime.listSessions().find(session => session.id === owner.id)?.messages.some(message => String(message.content).includes('Resumed follow-up'))).toBe(true);
+  } finally { await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('an active model tool cannot await its own scheduled follow-up', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-followup-self-wait-'));
+  let server: DaemonServer;
+  let followupId = '';
+  let observed = false;
+  const runner: TurnRunner = { async *run(session) {
+    expect(session.activeTurnId).toBeTruthy();
+    await expect(server.scheduleToolRequest(session.id, 'run', { schedule_id: followupId }, undefined, true)).rejects.toThrow('inside its own active conversation');
+    observed = true;
+    yield { type: 'text_part', payload: { text: 'Parent turn remains responsive' } };
+  } };
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const store = new JobStore(join(directory, 'jobs.json'));
+  server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, projectDirectory: directory, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), cronArchiveDirectory: join(directory, 'archive') });
+  await server.start();
+  try {
+    const caller = await runtime.openSession('caller');
+    const created = await server.scheduleToolRequest(caller.id, 'create', { prompt: 'Check later', target: 'session', paused: true, interval_seconds: 60, max_runs: 3, expires_at: '2099-01-01T00:00:00Z' }) as { job: { id: string } };
+    followupId = created.job.id;
+    await runtime.submitTurn(caller.sessionKey, 'Run my follow-up', () => {});
+    expect(observed).toBe(true);
+    expect(store.get(followupId)?.runsStarted).toBe(0);
+  } finally { await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('/loop only lists and controls the current conversation follow-ups', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-loop-scope-'));
+  const runtime = new InMemoryDaemonRuntime({ async *run() {} }, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const store = new JobStore(join(directory, 'jobs.json'));
+  const server = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, projectDirectory: directory, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease') });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'session.open', params: { session_key: 'loop-owner' } });
+    await client.next(frame => frame.id === 1);
+    const owner = runtime.sessionStatus('loop-owner')!;
+    const other = await runtime.openSession('other-owner');
+    const options = { prompt: 'Check', target: 'session', paused: true, interval_seconds: 600, max_runs: 10, expires_at: '2099-01-01T00:00:00Z' };
+    const mine = await server.scheduleToolRequest(owner.id, 'create', options) as { job: { id: string } };
+    const theirs = await server.scheduleToolRequest(other.id, 'create', options) as { job: { id: string } };
+    client.send({ jsonrpc: '2.0', id: 2, method: 'slash', params: { command: '/loop' } });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true, jobs: [{ id: mine.job.id }] });
+    client.send({ jsonrpc: '2.0', id: 3, method: 'schedule.resume', params: { scope: 'session', schedule_id: theirs.job.id } });
+    expect((await client.next(frame => frame.id === 3)).result).toMatchObject({ ok: false });
+    expect(store.get(theirs.job.id)?.paused).toBe(true);
+    client.send({ jsonrpc: '2.0', id: 4, method: 'slash', params: { command: '/loop resume ' + mine.job.id } });
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ ok: true });
+    expect(store.get(mine.job.id)?.paused).toBe(false);
+    client.send({ jsonrpc: '2.0', id: 5, method: 'schedule.list', params: { scope: 'session', owner_session_id: owner.id } });
+    expect((await client.next(frame => frame.id === 5)).result).toMatchObject({ ok: true, owner_session_id: owner.id, jobs: [{ id: mine.job.id }] });
+    client.send({ jsonrpc: '2.0', id: 6, method: 'schedule.pause', params: { scope: 'session', owner_session_id: other.id, schedule_id: mine.job.id } });
+    expect((await client.next(frame => frame.id === 6)).error?.message).toContain('active conversation changed');
+    expect(store.get(mine.job.id)?.paused).toBe(false);
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('follow-ups can report only their own configured condition and require explicit rearm after completion', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-followup-complete-'));
+  let daemon!: DaemonServer;
+  let id = '';
+  let releaseLate!: () => void;
+  let lateResult: Promise<unknown> | undefined;
+  let runs = 0;
+  const runtime = new InMemoryDaemonRuntime({ async *run(session, prompt) {
+    runs++;
+    expect(prompt).toContain('Follow-up stop condition: "Deployment healthy"');
+    expect(prompt).toContain('action "complete"');
+    const args = { schedule_id: id, evidence: 'Health endpoint returned 200 and all replicas were ready.' };
+    await expect(daemon.scheduleToolRequest('other-session', 'complete', args, undefined, true)).rejects.toThrow('currently executing');
+    await expect(daemon.scheduleToolRequest(session.id, 'complete', { ...args, schedule_id: 'other-job' }, undefined, true)).rejects.toThrow('currently executing');
+    await expect(daemon.scheduleToolRequest(session.id, 'complete', { ...args, evidence: '' }, undefined, true)).rejects.toThrow('evidence');
+    const abort = new AbortController(); abort.abort(new Error('cancelled attempt'));
+    await expect(daemon.scheduleToolRequest(session.id, 'complete', args, abort.signal, true)).rejects.toThrow('cancelled attempt');
+    const update = store.update.bind(store);
+    store.update = (jobId, changes, revision) => {
+      if (changes.metadata && typeof changes.metadata === 'object' && 'followup_completion' in changes.metadata) {
+        store.update = update;
+        update(jobId, { metadata: { ...store.get(jobId)!.metadata, concurrent_edit: runs } });
+      }
+      return update(jobId, changes, revision);
+    };
+    await expect(daemon.scheduleToolRequest(session.id, 'complete', args, undefined, true)).rejects.toThrow('Schedule changed');
+    expect(store.get(id)?.metadata.followup_completion).toBeUndefined();
+    const result = await daemon.scheduleToolRequest(session.id, 'complete', args, undefined, true);
+    expect(result).toMatchObject({ ok: true, completion: { source: 'model_reported', evidence: args.evidence, condition: 'Deployment healthy' } });
+    expect(await daemon.scheduleToolRequest(session.id, 'complete', args, undefined, true)).toMatchObject({ ok: true, completion: result.completion });
+    lateResult = new Promise<void>(resolve => { releaseLate = resolve; }).then(() =>
+      expect(daemon.scheduleToolRequest(session.id, 'complete', args, undefined, true)).rejects.toThrow('currently executing'));
+    yield { type: 'text_part', payload: { text: 'Condition met.' } };
+  } }, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const path = join(directory, 'jobs.json');
+  const store = new JobStore(path);
+  daemon = new DaemonServer({ socketPath: join(directory, 'daemon.sock'), runtime, projectDirectory: directory, cronStoreFactory: () => store, cronLeasePath: join(directory, 'lease'), cronArchiveDirectory: join(directory, 'archive') });
+  await daemon.start();
+  try {
+    const session = await runtime.openSession('followup-owner');
+    const created = await daemon.scheduleToolRequest(session.id, 'create', { prompt: 'Check deployment', target: 'session', stop_condition: 'Deployment healthy', paused: true, interval_seconds: 600, max_runs: 5, expires_at: '2099-01-01T00:00:00Z' }) as { job: { id: string } };
+    id = created.job.id;
+    await expect(daemon.scheduleToolRequest(session.id, 'complete', { schedule_id: id, evidence: 'outside attempt' }, undefined, true)).rejects.toThrow('currently executing');
+    await daemon.scheduleToolRequest(session.id, 'run', { schedule_id: id });
+    releaseLate(); await lateResult;
+    expect(new JobStore(path).get(id)).toMatchObject({ paused: true, runsStarted: 1, stopCondition: 'Deployment healthy', metadata: { followup_completion: { source: 'model_reported' } } });
+    expect(store.get(id)?.metadata.followup_completions).toHaveLength(1);
+    const summary = await daemon.scheduleToolRequest(session.id, 'list', { scope: 'session', summary: true }) as { jobs: { metadata: Record<string, unknown> }[] };
+    expect(summary.jobs[0]?.metadata).toEqual({ execution_recovery_required: false, followup_completion: { source: 'model_reported' } });
+    await expect(daemon.scheduleToolRequest(session.id, 'run', { schedule_id: id })).rejects.toThrow('explicitly resume');
+    expect(runs).toBe(1);
+    await daemon.scheduleToolRequest(session.id, 'resume', { schedule_id: id });
+    expect(store.get(id)?.metadata.followup_completion).toBeUndefined();
+    expect(store.get(id)?.metadata.followup_completions).toHaveLength(1);
+    await daemon.scheduleToolRequest(session.id, 'run', { schedule_id: id });
+    releaseLate(); await lateResult;
+    expect(store.get(id)?.metadata.followup_completions).toHaveLength(2);
+    expect(runs).toBe(2);
+  } finally { releaseLate?.(); await lateResult; await daemon.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('monitor policy RPC edits are guarded and owner scoped', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'monitor-policy-rpc-'));
+  const history = new RunHistory(join(directory, 'runs.sqlite'));
+  const mailbox = new ReactionMailbox(join(directory, 'reactions.sqlite'));
+  const terminals = new TerminalRegistry();
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const monitors = new TerminalMonitors(terminals, history, () => {}, undefined, mailbox);
+  const socketPath = join(directory, 'daemon.sock');
+  const server = new DaemonServer({ socketPath, runtime, monitors, reactionMailbox: mailbox, runHistory: history, terminalRegistry: terminals, cronLeasePath: join(directory, 'cron.lease'), cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')) });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'session.open', params: { session_key: 'owner' } });
+    await client.next(frame => frame.id === 1);
+    const owner = runtime.sessionStatus('owner')!.id;
+    terminals.open({ id: 'build', ownerSessionId: owner, command: 'fixture', cwd: directory, kind: 'background' });
+    const watch = monitors.start(owner, { terminalId: 'build', match: 'error', reaction: { maxReactions: 3, maxDurationMs: 60000, maxTotalTokens: 100 } });
+    const params = { monitor_id: watch.id, revision: watch.reactionHealth!.policy!.revision, max_reactions: 5, reaction_timeout_seconds: 30, max_total_tokens: 200 };
+    client.send({ jsonrpc: '2.0', id: 2, method: 'monitor.update', params });
+    expect((await client.next(frame => frame.id === 2)).result?.monitor).toMatchObject({ reactionHealth: { attempts: 0, policy: { maxReactions: 5, maxDurationMs: 30000, maxTotalTokens: 200 } } });
+    client.send({ jsonrpc: '2.0', id: 3, method: 'monitor.update', params });
+    expect((await client.next(frame => frame.id === 3)).error).toBeDefined();
+    client.send({ jsonrpc: '2.0', id: 4, method: 'session.open', params: { session_key: 'other' } });
+    await client.next(frame => frame.id === 4);
+    client.send({ jsonrpc: '2.0', id: 5, method: 'monitor.update', params: { ...params, revision: mailbox.inspect(owner, watch.id)!.policy!.revision } });
+    expect((await client.next(frame => frame.id === 5)).error).toBeDefined();
+    expect(mailbox.inspect(owner, watch.id)?.policy?.maxTotalTokens).toBe(200);
+  } finally { client.close(); monitors.close(); await server.stop(); mailbox.close(); history.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('branch keeps independent metadata and the source reasoning and permission settings', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'session-branch-copy-'));
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const source = await runtime.openSession('owner');
+  source.messages = [{ role: 'user', content: 'Review' }, { role: 'assistant', content: 'Reviewed' }];
+  source.metadata = { nested: { note: 'source' } };
+  source.extra = { nested: { note: 'source-extra' } };
+  source.reasoningEffort = 'high'; source.reasoningPinned = true;
+  source.permissionMode = 'manual'; source.permissionPinned = true;
+  source.turnCount = 1; source.totalApiCalls = 2;
+  source.usageComplete = false;
+  delete source.apiCallsComplete;
+  const server = new DaemonServer({ runtime, socketPath: join(directory, 'daemon.sock'), agentSettingsStore: new AgentSettingsStore(join(directory, 'settings.sqlite')),
+    cronLeasePath: join(directory, 'lease'), cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')) });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'session.open', params: { session_key: 'owner' } });
+    await client.next(frame => frame.id === 1);
+    source.status = 'working';
+    client.send({ jsonrpc: '2.0', id: 3, method: 'slash', params: { command: '/branch Partial' } });
+    expect((await client.next(frame => frame.id === 3)).result).toMatchObject({ ok: false });
+    expect(runtime.listSessions()).toHaveLength(1);
+    source.status = 'idle';
+    client.send({ jsonrpc: '2.0', id: 2, method: 'slash', params: { command: '/branch Fork' } });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true });
+    const branch = runtime.listSessions().find(session => session.id !== source.id)!;
+    expect(branch).toMatchObject({ reasoningEffort: 'high', reasoningPinned: true, permissionMode: 'manual', permissionPinned: true, totalApiCalls: 2, turnCount: 1, usageComplete: false, apiCallsComplete: false });
+    const reopenedRuntime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+    const reopened = await reopenedRuntime.openSession(branch.sessionKey, branch.agentId, { resume: true, cwd: branch.cwd });
+    expect(reopened.id).toBe(branch.id);
+    expect(reopened).toMatchObject({ reasoningEffort: 'high', reasoningPinned: true, permissionMode: 'manual', permissionPinned: true, totalApiCalls: 2, turnCount: 1, usageComplete: false, apiCallsComplete: false });
+    expect(reopened.messages).toEqual(source.messages);
+    expect(branch.messages).toEqual(source.messages);
+    (branch.metadata.nested as { note: string }).note = 'branch';
+    (branch.extra.nested as { note: string }).note = 'branch-extra';
+    branch.messages[0] = { role: 'user', content: 'Changed' };
+    expect(source.metadata.nested).toEqual({ note: 'source' });
+    expect(source.extra.nested).toEqual({ note: 'source-extra' });
+    expect(source.messages[0]?.content).toBe('Review');
+    expect(branch.metadata.parent_session_id).toBe(source.id);
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('native branch selects a retained turn without copying later derived state', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'session-branch-turn-'));
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const source = await runtime.openSession('owner');
+  source.messages = [{ role: 'user', content: 'First' }, { role: 'assistant', content: 'First answer' }, { role: 'user', content: 'Later' }, { role: 'assistant', content: 'Later answer' }];
+  source.metadata.future_note = 'Only true after second turn';
+  source.turnCount = 2; source.totalInputTokens = 100; source.totalOutputTokens = 50;
+  const server = new DaemonServer({ runtime, socketPath: join(directory, 'daemon.sock'), agentSettingsStore: new AgentSettingsStore(join(directory, 'settings.sqlite')),
+    cronLeasePath: join(directory, 'lease'), cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')) });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'session.open', params: { session_key: 'owner' } });
+    await client.next(frame => frame.id === 1);
+    client.send({ jsonrpc: '2.0', id: 2, method: 'slash', params: { command: '/branch --through-turn 1 Earlier' } });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true });
+    const branch = runtime.listSessions().find(session => session.id !== source.id)!;
+    expect(branch.messages).toEqual(source.messages.slice(0, 2));
+    expect(branch.metadata).toMatchObject({ title: 'Earlier', branch_through_retained_turn: 1, branch_message_count: 2, parent_session_id: source.id });
+    expect(branch.metadata.future_note).toBeUndefined();
+    expect(branch).toMatchObject({ turnCount: 1, usageComplete: false, apiCallsComplete: false });
+    expect(source.messages).toHaveLength(4);
+    expect(source.metadata.future_note).toBe('Only true after second turn');
+    for (const [id, value] of [[3, '0'], [4, '99'], [5, 'bad']] as const) {
+      client.send({ jsonrpc: '2.0', id, method: 'slash', params: { command: `/branch --through-turn ${value}` } });
+      expect((await client.next(frame => frame.id === id)).result).toMatchObject({ ok: false });
+      expect(runtime.listSessions()).toHaveLength(2);
+    }
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('Codex inventory uses one fresh catalog for capacities and reasoning and rejects stale pages', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'codex-inventory-snapshot-'));
+  const profiles = new ProfileStore(join(directory, 'profiles.json'));
+  const profile = { name: 'fixture', provider: 'openai-codex', apiKey: '', baseUrl: 'https://example.invalid', model: 'worker-a' };
+  profiles.save(profile);
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const session = await runtime.openSession('owner');
+  let calls = 0, effort = 'high', replace = false;
+  const controller = new AbortController();
+  const server = new DaemonServer({ runtime, profileStore: profiles, agentSettingsStore: new AgentSettingsStore(join(directory, 'notes.sqlite')),
+    socketPath: join(directory, 'daemon.sock'), cronLeasePath: join(directory, 'lease'), cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')),
+    codexModelCatalog: async (_profile, signal) => {
+      expect(signal).toBe(controller.signal);
+      calls++;
+      if (replace) profiles.save({ ...profile, baseUrl: 'https://replacement.invalid' });
+      return ['worker-a', 'worker-b'].map(id => ({ id, displayName: undefined, contextLimit: 64000, harnessCoupled: false,
+        defaultReasoningLevel: effort, reasoningLevels: [{ effort, description: undefined }] }));
+    },
+  });
+  await server.start();
+  try {
+    const first = await server.modelInventoryToolRequest(session.id, { provider_profile: 'fixture', limit: 1 }, controller.signal) as { revision: string; entries: unknown[] };
+    expect(calls).toBe(1);
+    expect(first.entries[0]).toMatchObject({ context_window: 64000, reasoning_efforts: ['off', 'high'], reasoning_source: 'provider_reported' });
+    effort = 'low';
+    await expect(server.modelInventoryToolRequest(session.id, { provider_profile: 'fixture', offset: 1, revision: first.revision }, controller.signal)).rejects.toThrow('changed');
+    expect(calls).toBe(2);
+    profiles.updateModelCapabilities('fixture', 'worker-a', { contextLimit: 32000, maxOutputTokens: 4096 });
+    const overridden = await server.modelInventoryToolRequest(session.id, { provider_profile: 'fixture', limit: 1 }, controller.signal) as { entries: unknown[] };
+    expect(overridden.entries[0]).toMatchObject({ context_window: 32000, context_source: 'override', max_output_tokens: 4096, output_source: 'override' });
+    replace = true;
+    await expect(server.modelInventoryToolRequest(session.id, { provider_profile: 'fixture' }, controller.signal)).rejects.toThrow('profile changed');
+  } finally { await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('model inventory uses configured discovery without exposing credentials or switching the session', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'model-inventory-daemon-'));
+  const endpoint = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => Response.json({ data: [{ id: 'fixture-model', context_length: 32000 }] }) });
+  const profileStore = new ProfileStore(join(directory, 'profiles.json'));
+  profileStore.save({ name: 'fixture', provider: 'openai', apiKey: 'fixture-secret', baseUrl: `http://127.0.0.1:${endpoint.port}/v1`, model: 'configured-model' });
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, model: 'parent-model', sessionDirectory: join(directory, 'sessions') });
+  const session = await runtime.openSession('owner');
+  const server = new DaemonServer({ runtime, profileStore, agentSettingsStore: new AgentSettingsStore(join(directory, 'notes.sqlite')), socketPath: join(directory, 'daemon.sock'), cronLeasePath: join(directory, 'lease'), cronStoreFactory: () => new JobStore(join(directory, 'jobs.json')) });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'daemon.sock'));
+  try {
+    client.send({ jsonrpc: '2.0', id: 41, method: 'model.routing_note.save', params: { provider_profile: 'fixture', model: 'fixture-model', note: 'Use for careful review', revision: 0 } });
+    expect((await client.next(frame => frame.id === 41)).result).toMatchObject({ ok: true, routing_note: { revision: 1 } });
+    client.send({ jsonrpc: '2.0', id: 42, method: 'model.routing_note.save', params: { provider_profile: 'fixture', model: 'fixture-model', note: 'stale', revision: 0 } });
+    expect((await client.next(frame => frame.id === 42)).error).toBeDefined();
+    const profiles = await server.modelInventoryToolRequest(session.id, {});
+    expect(JSON.stringify(profiles)).not.toContain('fixture-secret');
+    const models = await server.modelInventoryToolRequest(session.id, { provider_profile: 'fixture' }) as { entries: Array<Record<string, unknown>>; quota: unknown };
+    expect(models.entries).toContainEqual(expect.objectContaining({ model: 'fixture-model', provider_profile: 'fixture', context_window: 32000, reasoning_efforts: expect.any(Array) }));
+    expect(JSON.stringify(models.entries)).toContain('Use for careful review');
+    expect(models.quota).toMatchObject({ status: 'unknown' });
+    await server.validateAgentProviderSelection('fixture', 'fixture-model', 'high');
+    await expect(server.validateAgentProviderSelection('fixture', 'unknown-model')).rejects.toThrow('not configured or discovered');
+    await expect(server.validateAgentProviderSelection('fixture', 'fixture-model', 'impossible')).rejects.toThrow('Unsupported reasoning');
+    await expect(server.validateAgentProviderSelection('fixture', 'fixture-model', undefined, AbortSignal.abort(new Error('cancelled')))).rejects.toThrow('cancelled');
+    expect(session.model).toBe('parent-model');
+    expect(profileStore.active()?.model).toBe('configured-model');
+    await expect(server.modelInventoryToolRequest('other', {})).rejects.toThrow('session unavailable');
+  } finally { client.close(); await server.stop(); endpoint.stop(true); await rm(directory, { recursive: true, force: true }); }
 });

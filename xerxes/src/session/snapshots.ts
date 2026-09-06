@@ -3,7 +3,7 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises'
+import { lstat, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 import { xerxesHome } from '../daemon/paths.js'
@@ -49,6 +49,16 @@ export interface SnapshotRecord {
    */
   readonly turnIndex?: number
   readonly workspaceDir: string
+}
+
+export interface SnapshotRestoreAttempt {
+  readonly id: string
+  readonly targetId: string
+  readonly backupId: string
+  readonly path: string | null
+  readonly phase: 'prepared' | 'completed' | 'failed' | 'recovered' | 'reverted'
+  readonly updatedAt: string
+  readonly error?: string
 }
 
 /** Conversation coordinates attached to an automatic snapshot. */
@@ -152,7 +162,10 @@ export class SnapshotManager {
     if (!Number.isInteger(keep) || keep < 0) throw new RangeError('keep must be a non-negative integer')
     const records = this.list()
     if (records.length <= keep) return 0
-    const retained = keep === 0 ? [] : records.slice(-keep)
+    const attempts = await this.restoreAttempts()
+    const pinned = new Set(attempts.filter(attempt => (attempt.phase === 'prepared' || attempt.phase === 'failed')).flatMap(attempt => [attempt.targetId, attempt.backupId]))
+    const ordinary = new Set((keep === 0 ? [] : records.slice(-keep)).map(record => record.id))
+    const retained = records.filter(record => ordinary.has(record.id) || pinned.has(record.id))
     if (retained.length === 0) {
       this.resetUnlocked()
       return records.length
@@ -186,25 +199,47 @@ export class SnapshotManager {
     rmSync(this.shadowDirectory, { recursive: true, force: true })
   }
 
-  async rollback(ref: string): Promise<SnapshotRecord> {
-    return this.serializeRepositoryOperation(() => this.rollbackUnlocked(ref))
+  async rollback(ref: string, revision?: string): Promise<SnapshotRecord> {
+    return this.serializeRepositoryOperation(() => this.rollbackUnlocked(ref, revision))
   }
 
-  private async rollbackUnlocked(ref: string): Promise<SnapshotRecord> {
+  private async rollbackUnlocked(ref: string, revision?: string): Promise<SnapshotRecord> {
     const record = this.get(ref)
     if (!record) throw new Error(`snapshot not found: ${ref}`)
+    await this.ensureRepository()
+    const targetPaths = (await this.runGitUnlocked(['ls-tree', '-r', '--name-only', '-z', record.commitSha])).split('\0').filter(Boolean)
+    await this.preflightRestorePaths(targetPaths)
     // checkout-index overwrites modified files without a backup, so capture
     // the current tree first; the pre-rollback snapshot can itself be
     // rolled back to undo a mistaken restore.
-    await this.snapshotUnlocked(`pre-rollback:${record.id}`)
-    // Full-tree restore: point the index at the snapshot tree, rewrite every
-    // tracked file, then delete files the snapshot does not track. `-x` also
-    // removes ignored build outputs created after the snapshot (plain `-fd`
-    // would honor the workspace .gitignore and leave a mixed tree), while the
-    // explicit `-e` patterns keep shadow-excluded secrets and Xerxes state.
+    const previous = await this.snapshotUnlocked(`pre-rollback:${record.id}`)
+    if (revision !== undefined) {
+      const tree = (await this.runGitUnlocked(['rev-parse', `${previous.commitSha}^{tree}`])).trim()
+      if (revision !== restoreRevision(record.commitSha, tree)) {
+        throw new Error('Snapshot preview is stale or belongs to another target; preview again before restoring. Workspace files were not changed.')
+      }
+    }
+    // Only remove paths captured by the backup. Ignored files may contain work
+    // that neither snapshot tracks; a workspace-wide clean -x would lose it.
+    const removed = (await this.runGitUnlocked(['diff', '--name-only', '--no-renames', '--diff-filter=D', '-z', previous.commitSha, record.commitSha, '--', '.']))
+      .split('\0').filter(Boolean)
+    await this.preflightRestorePaths(removed)
+    await this.withRestoreAttempt(record, previous, null, async () => {
     await this.runGitUnlocked(['read-tree', record.commitSha])
     await this.runGitUnlocked(['checkout-index', '-f', '-a'])
-    await this.runGitUnlocked(['clean', '-fdx', ...SHADOW_EXCLUDE_PATTERNS.flatMap(pattern => ['-e', pattern])])
+    for (const path of removed) {
+      const absolute = join(this.workspaceDirectory, this.workspaceRelativePath(path))
+      const current = await lstat(absolute).catch(error => {
+        if (hasErrorCode(error, 'ENOENT')) return undefined
+        throw error
+      })
+      if (!current) continue
+      if (current.isDirectory()) throw new Error(`Restore cleanup refused a directory at ${path}; backup ${previous.id} preserves the prior files`)
+      // Honor the restored ignore rules too: excluded output is not part of
+      // the requested snapshot state, even if an intermediate backup saw it.
+      await this.runGitUnlocked(['clean', '-f', '--', `:(literal)${path}`])
+    }
+    })
     return record
   }
 
@@ -240,24 +275,173 @@ export class SnapshotManager {
    * current tree first, because `git checkout` overwrites the target with no
    * backup of its own.
    */
-  async restoreFile(ref: string, filePath: string): Promise<SnapshotRestoreResult> {
-    return this.serializeRepositoryOperation(() => this.restoreFileUnlocked(ref, filePath))
+  async restoreFile(ref: string, filePath: string, revision?: string): Promise<SnapshotRestoreResult> {
+    return this.serializeRepositoryOperation(() => this.restoreFileUnlocked(ref, filePath, revision))
   }
 
-  private async restoreFileUnlocked(ref: string, filePath: string): Promise<SnapshotRestoreResult> {
+  private async restoreFileUnlocked(ref: string, filePath: string, revision?: string): Promise<SnapshotRestoreResult> {
     const record = this.get(ref)
     if (!record) throw new Error(`snapshot not found: ${ref}`)
     const path = this.workspaceRelativePath(filePath)
     await this.ensureRepository()
-    // `cat-file -e` distinguishes "the snapshot never tracked this file" from a
-    // genuine git failure, which `checkout` alone reports as the same error.
-    const tracked = await this.runGitUnlocked(['cat-file', '-e', `${record.commitSha}:${path}`]).then(() => true, () => false)
-    if (!tracked) throw new Error(`snapshot ${record.id} does not track ${path}`)
+    const targetEntry = await this.fileEntry(record.commitSha, path)
+    if (!targetEntry && revision === undefined) throw new Error(`snapshot ${record.id} does not track ${path}`)
+    await this.preflightRestorePaths([path])
     const previous = await this.snapshotUnlocked(`pre-restore:${record.id}`)
-    // `:(literal)` keeps a filename containing glob characters from being
-    // expanded into a pathspec that would restore unrelated files.
-    await this.runGitUnlocked(['checkout', record.commitSha, '--', `:(literal)${path}`])
+    if (revision !== undefined) {
+      const currentEntry = await this.fileEntry(previous.commitSha, path)
+      if (revision !== fileRestoreRevision(record.commitSha, path, currentEntry)) throw new Error('Snapshot file preview is stale; preview this file again. Workspace files were not changed.')
+      if (!targetEntry && !currentEntry) throw new Error('File is absent from both captured trees')
+    }
+    await this.withRestoreAttempt(record, previous, path, async () => {
+    if (targetEntry) {
+      await this.runGitUnlocked(['checkout', record.commitSha, '--', `:(literal)${path}`])
+    } else {
+      // A guarded deletion only removes this backed-up leaf; rm is not recursive.
+      await this.preflightRestorePaths([path])
+      await rm(join(this.workspaceDirectory, path), { force: true })
+      await this.runGitUnlocked(['update-index', '--force-remove', '--', path])
+    }
+    })
     return { path, previous, snapshot: record }
+  }
+
+  /** Compare through a private index, including new files without changing the workspace index. */
+  async diff(ref: string, reverse = false): Promise<string> {
+    return (await this.preview(ref, reverse)).diff
+  }
+
+  async preview(ref: string, reverse = true, filePath?: string): Promise<{ snapshot: SnapshotRecord; revision: string; diff: string; files: string[]; action?: 'restore' | 'remove' }> {
+    return this.serializeRepositoryOperation(async () => {
+      const record = this.get(ref)
+      if (!record) throw new Error(`snapshot not found: ${ref}`)
+      await this.ensureRepository()
+      const index = join(this.shadowDirectory, `preview-${randomUUID()}.index`)
+      try {
+        await this.runGitUnlocked(['read-tree', 'HEAD'], index)
+        await this.runGitUnlocked(['add', '-A'], index)
+        const tree = (await this.runGitUnlocked(['write-tree'], index)).trim()
+        const path = filePath === undefined ? undefined : this.workspaceRelativePath(filePath)
+        const files = (await this.runGitUnlocked(['diff', '--no-renames', '--name-only', '-z', record.commitSha, tree, '--', '.'], index)).split('\0').filter(Boolean)
+        const targetEntry = path === undefined ? undefined : await this.fileEntry(record.commitSha, path)
+        const currentEntry = path === undefined ? undefined : await this.fileEntry(tree, path)
+        if (path !== undefined && !targetEntry && !currentEntry) throw new Error('File is absent from both captured trees')
+        const diff = await this.runGitUnlocked(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--binary',
+          ...(reverse ? ['-R'] : []), record.commitSha, tree, '--', path === undefined ? '.' : `:(literal)${path}`], index, 2 * 1024 * 1024)
+        return { snapshot: record, revision: path === undefined ? restoreRevision(record.commitSha, tree) : fileRestoreRevision(record.commitSha, path, currentEntry!), diff, files,
+          ...(path === undefined ? {} : { action: targetEntry ? 'restore' as const : 'remove' as const }) }
+      } finally {
+        await rm(index, { force: true })
+        await rm(index + '.lock', { force: true })
+      }
+    })
+  }
+
+  async restoreAttempts(): Promise<SnapshotRestoreAttempt[]> {
+    const filename = join(this.shadowDirectory, '_restore-attempts.json')
+    const info = await stat(filename).catch(error => { if (hasErrorCode(error, 'ENOENT')) return undefined; throw error })
+    if (!info) return []
+    if (info.size > 512_000) throw new Error('Restore recovery journal exceeds its size limit')
+    const parsed: unknown = JSON.parse(await readFile(filename, 'utf8'))
+    if (!Array.isArray(parsed) || parsed.length > 256) throw new Error('Invalid restore recovery journal')
+    return parsed.map((value: unknown) => {
+      if (!value || typeof value !== 'object') throw new Error('Invalid restore recovery record')
+      const row = value as Record<string, unknown>
+      if (typeof row.id !== 'string' || typeof row.targetId !== 'string' || typeof row.backupId !== 'string' || typeof row.updatedAt !== 'string'
+        || (row.path !== null && typeof row.path !== 'string') || !['prepared', 'completed', 'failed', 'recovered', 'reverted'].includes(String(row.phase))
+        || (row.error !== undefined && typeof row.error !== 'string')) throw new Error('Invalid restore recovery record')
+      return row as unknown as SnapshotRestoreAttempt
+    })
+  }
+
+  private async saveRestoreAttempts(rows: SnapshotRestoreAttempt[]): Promise<void> {
+    const filename = join(this.shadowDirectory, '_restore-attempts.json')
+    const temporary = filename + '.' + randomUUID()
+    const body = JSON.stringify(rows)
+    if (rows.length > 256 || Buffer.byteLength(body) > 512_000) throw new Error('Restore recovery journal exceeds its size limit')
+    try {
+      const file = await open(temporary, 'wx', 0o600)
+      try { await file.writeFile(body); await file.sync() } finally { await file.close() }
+      await rename(temporary, filename)
+      const directory = await open(this.shadowDirectory, 'r')
+      try { await directory.sync() } finally { await directory.close() }
+    } finally { await rm(temporary, { force: true }) }
+  }
+
+  private async withRestoreAttempt(target: SnapshotRecord, backup: SnapshotRecord, path: string | null, mutation: () => Promise<void>): Promise<void> {
+    const history = await this.restoreAttempts()
+    const unresolved = history.filter(row => row.phase === 'prepared' || row.phase === 'failed')
+    const recovering = unresolved.some(row => row.backupId === target.id && (path === null || row.path === path))
+    if (unresolved.length >= 128 && !recovering) throw new Error('Too many unresolved restore attempts; review recovery records before restoring')
+    // Keep the original recovery anchor and the latest retry for this target/scope.
+    // Otherwise failed recovery retries eventually make their own journal unreadable.
+    const pending = recovering ? unresolved.filter(row => row.targetId !== target.id || row.path !== path) : unresolved
+    const completed = history.filter(row => row.phase === 'completed' || row.phase === 'recovered' || row.phase === 'reverted')
+    const keepCompleted = Math.max(0, Math.min(100, 255 - pending.length))
+    const rows = [...(keepCompleted ? completed.slice(-keepCompleted) : []), ...pending]
+    const attempt: SnapshotRestoreAttempt = { id: randomUUID(), targetId: target.id, backupId: backup.id, path, phase: 'prepared', updatedAt: new Date().toISOString() }
+    await this.saveRestoreAttempts([...rows, attempt])
+    try {
+      await mutation()
+      await this.saveRestoreAttempts([...rows.map(row => row.backupId === target.id && (path === null || row.path === path) ? { ...row, phase: 'recovered' as const, updatedAt: new Date().toISOString() } : row), { ...attempt, phase: 'completed', updatedAt: new Date().toISOString() }])
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause)
+      let recoveryError = ''
+      try {
+        const conflicts = await this.reverseFailedRestore(target, backup, path)
+        if (conflicts.length) recoveryError = `${conflicts.length} file(s) need review: ${conflicts.slice(0, 20).join(', ')}`
+      } catch (error) { recoveryError = error instanceof Error ? error.message : String(error) }
+      const detail = recoveryError ? `${message}; automatic reversal incomplete: ${recoveryError}` : `${message}; original captured files restored automatically`
+      try { await this.saveRestoreAttempts([...rows, { ...attempt, phase: recoveryError ? 'failed' : 'reverted', updatedAt: new Date().toISOString(), error: detail.slice(0, 2000) }]) }
+      catch (journalError) { throw new AggregateError([cause, journalError], `Restore outcome uncertain; backup ${backup.id}, attempt ${attempt.id}. Recovery journal update also failed.`) }
+      throw new Error(`Restore failed; ${recoveryError ? 'workspace may be partially changed' : 'original captured files restored automatically'}. Review backup ${backup.id} (attempt ${attempt.id}): ${detail}`, { cause })
+    }
+  }
+
+  /** Reverse only files still matching this restore's target, preserving unknown edits. */
+  private async reverseFailedRestore(target: SnapshotRecord, backup: SnapshotRecord, path: string | null): Promise<string[]> {
+    const paths = path === null
+      ? (await this.runGitUnlocked(['diff', '--name-only', '--no-renames', '-z', backup.commitSha, target.commitSha, '--', '.'])).split('\0').filter(Boolean)
+      : [path]
+    const index = join(this.shadowDirectory, `reversal-${randomUUID()}.index`)
+    const conflicts: string[] = []
+    const deadline = Date.now() + 10_000
+    try {
+      for (const candidate of paths) {
+        if (Date.now() > deadline) { conflicts.push(candidate); continue }
+        try {
+          await this.preflightRestorePaths([candidate])
+          const before = await this.fileEntry(backup.commitSha, candidate)
+          const intended = await this.fileEntry(target.commitSha, candidate)
+          const current = await this.currentFileEntry(backup.commitSha, candidate, index)
+          if (current === before) continue
+          if (current !== intended) { conflicts.push(candidate); continue }
+          await this.preflightRestorePaths([candidate])
+          if (before) await this.runGitUnlocked(['checkout', backup.commitSha, '--', `:(literal)${candidate}`])
+          else {
+            await rm(join(this.workspaceDirectory, candidate), { force: true })
+            await this.runGitUnlocked(['update-index', '--force-remove', '--', candidate])
+          }
+          if (await this.currentFileEntry(backup.commitSha, candidate, index) !== before) conflicts.push(candidate)
+        } catch { conflicts.push(candidate) }
+      }
+      return conflicts
+    } finally { await rm(index, { force: true }); await rm(index + '.lock', { force: true }) }
+  }
+
+  private async currentFileEntry(base: string, path: string, index: string): Promise<string> {
+    const info = await lstat(join(this.workspaceDirectory, path)).catch(error => { if (hasErrorCode(error, 'ENOENT')) return undefined; throw error })
+    if (!info) return ''
+    await this.runGitUnlocked(['read-tree', base], index)
+    await this.runGitUnlocked(['add', '-A', '--', `:(literal)${path}`], index)
+    const tree = (await this.runGitUnlocked(['write-tree'], index)).trim()
+    return this.fileEntry(tree, path)
+  }
+
+  private async fileEntry(tree: string, path: string): Promise<string> {
+    const entry = await this.runGitUnlocked(['ls-tree', '-z', tree, '--', `:(literal)${path}`])
+    if (entry && !/^(100644|100755|120000) blob /.test(entry)) throw new Error('Selected snapshot path is not a file or symlink')
+    return entry
   }
 
   /** Run a command against the shadow repository for snapshot-diff consumers. */
@@ -265,11 +449,16 @@ export class SnapshotManager {
     return this.serializeRepositoryOperation(() => this.runGitUnlocked(args))
   }
 
-  private async runGitUnlocked(args: readonly string[]): Promise<string> {
+  private async runGitUnlocked(args: readonly string[], indexFile?: string, maxOutputBytes?: number): Promise<string> {
     return runGitProcess(args, {
+      ...(maxOutputBytes === undefined ? {} : { maxOutputBytes }),
       cwd: this.workspaceDirectory,
       env: {
         ...process.env,
+        GIT_INDEX_FILE: indexFile,
+        GIT_COMMON_DIR: undefined,
+        GIT_OBJECT_DIRECTORY: undefined,
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
         GIT_DIR: join(this.shadowDirectory, '.git'),
         GIT_WORK_TREE: this.workspaceDirectory,
         GIT_AUTHOR_NAME: 'xerxes-snapshot',
@@ -301,11 +490,40 @@ export class SnapshotManager {
     this.writeTextAtomically(this.recordsPath, content)
   }
 
+  /** Refuse known checkout obstructions before any workspace files are written. */
+  private async preflightRestorePaths(paths: readonly string[]): Promise<void> {
+    const checkedParents = new Set<string>()
+    for (const path of paths) {
+      const parts = path.split('/')
+      if (isAbsolute(path) || parts.some(part => !part || part === '.' || part === '..')) {
+        throw new Error(`Unsafe snapshot path: ${path}`)
+      }
+      let currentPath = this.workspaceDirectory
+      for (let index = 0; index < parts.length; index++) {
+        currentPath = join(currentPath, parts[index]!)
+        const leaf = index === parts.length - 1
+        if (!leaf && checkedParents.has(currentPath)) continue
+        const current = await lstat(currentPath).catch(error => {
+          if (hasErrorCode(error, 'ENOENT')) return undefined
+          throw error
+        })
+        if (!current) break
+        if (!leaf && !current.isDirectory()) {
+          throw new Error(`Restore refused: ancestor of ${path} is not a real directory. Workspace files were not changed.`)
+        }
+        if (leaf && (!current.isFile() && !current.isSymbolicLink())) {
+          throw new Error(`Restore refused: ${path} is a directory or special file. Workspace files were not changed.`)
+        }
+        if (!leaf) checkedParents.add(currentPath)
+      }
+    }
+  }
+
   /** Resolve a caller-supplied path to a workspace-relative, git-usable path. */
   private workspaceRelativePath(candidate: string): string {
     const trimmed = candidate.trim()
     if (!trimmed) throw new Error('a file path is required')
-    const relativePath = relative(this.workspaceDirectory, resolve(this.workspaceDirectory, trimmed))
+    const relativePath = relative(this.workspaceDirectory, resolve(this.workspaceDirectory, candidate))
     // A `../` path would let a restore write anywhere the daemon can write,
     // driven by nothing more than a snapshot ref and an attacker-chosen path.
     if (!relativePath || relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
@@ -424,7 +642,6 @@ async function recoverStaleRepositoryLock(path: string): Promise<void> {
     if (hasErrorCode(error, 'ENOENT')) return
     return
   }
-  if (Date.now() - lockStat.mtimeMs < REPOSITORY_LOCK_STALE_MS) return
   if (Number.isSafeInteger(pid) && pid > 0) {
     try {
       process.kill(pid, 0)
@@ -432,7 +649,7 @@ async function recoverStaleRepositoryLock(path: string): Promise<void> {
     } catch (error) {
       if (!hasErrorCode(error, 'ESRCH')) return
     }
-  }
+  } else if (Date.now() - lockStat.mtimeMs < REPOSITORY_LOCK_STALE_MS) return
   // Rename first so a delayed owner cannot unlink a replacement lock created
   // after recovery. If another waiter won the rename, simply retry normally.
   const abandoned = `${path}.stale-${process.pid}-${randomUUID()}`
@@ -454,7 +671,7 @@ function hasErrorCode(error: unknown, code: string): boolean {
 /** Run one git invocation with a hard timeout, killing the process when it overruns. */
 async function runGitProcess(
   args: readonly string[],
-  options: { readonly cwd: string; readonly env: Record<string, string | undefined> },
+  options: { readonly cwd: string; readonly env: Record<string, string | undefined>; readonly maxOutputBytes?: number },
 ): Promise<string> {
   const child = Bun.spawn(['git', ...args], {
     cwd: options.cwd,
@@ -462,15 +679,29 @@ async function runGitProcess(
     stdout: 'pipe',
     stderr: 'pipe',
   })
+  const readers = [child.stdout.getReader(), child.stderr.getReader()]
+  const collect = async (reader: typeof readers[number], limit: number): Promise<string> => {
+    const chunks: Uint8Array[] = []
+    let size = 0
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > limit) throw new Error(`git output exceeded ${limit} bytes; narrow the snapshot changes before retrying`)
+      chunks.push(value)
+    }
+    return Buffer.concat(chunks).toString('utf8')
+  }
   let timedOut = false
   const timer = setTimeout(() => {
     timedOut = true
-    child.kill()
+    child.kill('SIGKILL')
+    for (const reader of readers) void reader.cancel().catch(() => {})
   }, GIT_COMMAND_TIMEOUT_MS)
   try {
     const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
+      collect(readers[0]!, options.maxOutputBytes ?? 16 * 1024 * 1024),
+      collect(readers[1]!, 64 * 1024),
       child.exited,
     ])
     if (timedOut) throw new Error(`git ${args.join(' ')} timed out after ${GIT_COMMAND_TIMEOUT_MS}ms`)
@@ -480,9 +711,19 @@ async function runGitProcess(
     return stdout
   } finally {
     clearTimeout(timer)
+    if (child.exitCode === null) child.kill('SIGKILL')
+    await Promise.allSettled(readers.map(reader => reader.cancel()))
   }
 }
 
 function workspaceHash(workspaceDirectory: string): string {
   return createHash('sha1').update(workspaceDirectory).digest('hex').slice(0, 12)
+}
+
+function restoreRevision(target: string, current: string): string {
+  return createHash('sha256').update(target + ':' + current).digest('hex')
+}
+
+function fileRestoreRevision(target: string, path: string, current: string): string {
+  return createHash('sha256').update(JSON.stringify([target, path, current])).digest('hex')
 }

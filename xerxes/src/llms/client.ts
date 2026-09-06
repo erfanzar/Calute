@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 import { createHash } from 'node:crypto'
+import { chargeModelCall } from './callBudget.js'
 
 import { parseStreamingJson } from '@earendil-works/pi-ai'
 
@@ -1174,6 +1175,8 @@ export async function completeLlm(
   options: CompleteLlmOptions = {},
 ): Promise<LlmCompletion> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_COMPLETION_DEADLINE_MS
+  signal?.throwIfAborted()
+  const recordUsage = chargeModelCall()
   const deadline = AbortSignal.timeout(timeoutMs)
   // Bun 1.3 provides AbortSignal.any; combining keeps one wire into the
   // transport while the deadline stays attributable for error translation.
@@ -1184,16 +1187,19 @@ export async function completeLlm(
     const work = typeof client.complete === 'function'
       ? client.complete(request, combined)
       : collectLlmCompletion(client.stream(request, combined))
-    return await Promise.race([work, abortRejection(combined, listener => {
+    const result = await Promise.race([work, abortRejection(combined, listener => {
       onCombinedAbort = listener
     })])
+    recordUsage?.(result.usage)
+    return result
   } catch (error) {
     if (deadline.aborted && !signal?.aborted) {
       throw new CompletionDeadlineError(timeoutMs, { cause: error })
     }
     throw error
   } finally {
-    if (onCombinedAbort) combined.removeEventListener('abort', onCombinedAbort)
+    try { recordUsage?.(undefined, false) }
+    finally { if (onCombinedAbort) combined.removeEventListener('abort', onCombinedAbort) }
   }
 }
 

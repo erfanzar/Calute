@@ -11,6 +11,7 @@ import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type { GatewayEvent } from '../gatewayTypes.js'
 import { formatAbandonedClarify } from '../lib/text.js'
+import { adaptDaemonEvent } from '../gatewayAdapter.js'
 import type { Msg } from '../types.js'
 
 const buildHarness = (overrides: { bellOnComplete?: boolean; isTTY?: boolean } = {}) => {
@@ -63,6 +64,22 @@ const liveClarify = () =>
   })
 
 describe('createGatewayEventHandler', () => {
+  it('updates and clears the shared goal display from live status without erasing it on telemetry', () => {
+    const { handler } = buildHarness()
+    patchUiState({ info: { model: 'test', skills: {}, tools: {}, goal: 'Old review', goal_phase: 'active' } })
+    const status = (payload: Record<string, unknown>) => {
+      for (const event of adaptDaemonEvent('status_update', payload)) handler(event)
+    }
+    status({ goal: 'Optimize TPU kernels', goal_phase: 'active' })
+    expect(getUiState().info?.goal).toBe('Optimize TPU kernels')
+    status({ input_tokens: 42 })
+    expect(getUiState().info?.goal).toBe('Optimize TPU kernels')
+    status({ goal: 'Optimize TPU kernels', goal_phase: 'complete' })
+    expect(getUiState().info?.goal_phase).toBe('complete')
+    status({ goal: null, goal_phase: null })
+    expect(getUiState().info?.goal).toBeUndefined()
+    expect(getUiState().info?.goal_phase).toBeUndefined()
+  })
   afterEach(() => {
     turnController.fullReset()
     resetOverlayState()

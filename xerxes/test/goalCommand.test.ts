@@ -11,6 +11,29 @@ function fresh(): Record<string, unknown> {
   return {};
 }
 
+test('goal token command validates a positive whole cap and preserves the goal identity', () => {
+  const metadata = fresh()
+  runGoalCommand(metadata, 'token-command', 'finish work', 1000)
+  const id = getGoal(metadata, 'token-command')!.id
+  expect(runGoalCommand(metadata, 'token-command', '--tokens 100000', 2000).ok).toBe(true)
+  expect(getGoal(metadata, 'token-command')).toMatchObject({ id, maxTotalTokens: 100000 })
+  const before = JSON.stringify(metadata)
+  expect(runGoalCommand(metadata, 'token-command', '--tokens -1', 2000).ok).toBe(false)
+  expect(runGoalCommand(metadata, 'token-command', '--tokens 1.2', 2000).ok).toBe(false)
+  expect(JSON.stringify(metadata)).toBe(before)
+})
+
+test('goal duration sets an explicit wall-time limit and rejects malformed values without mutation', () => {
+  const metadata = fresh()
+  runGoalCommand(metadata, 'duration', 'finish work', 1000)
+  expect(runGoalCommand(metadata, 'duration', '--duration 30m', 2000).ok).toBe(true)
+  expect(getGoal(metadata, 'duration')?.maxDurationMs).toBe(1_800_000)
+  const before = JSON.stringify(metadata)
+  expect(runGoalCommand(metadata, 'duration', '--duration 0s', 2000).ok).toBe(false)
+  expect(runGoalCommand(metadata, 'duration', '--duration later', 2000).ok).toBe(false)
+  expect(JSON.stringify(metadata)).toBe(before)
+})
+
 test("only exact control words are subcommands; everything else is an objective", () => {
   expect(parseGoalCommand("")).toEqual({ kind: "show" });
   expect(parseGoalCommand("  ")).toEqual({ kind: "show" });
@@ -32,7 +55,36 @@ test("only exact control words are subcommands; everything else is an objective"
     kind: "create",
     objective: "pause the ingestion job",
   });
+  expect(parseGoalCommand("milestone")).toEqual({ kind: "milestone-show" });
+  expect(parseGoalCommand("milestone ship the migration")).toEqual({ kind: "milestone", value: "ship the migration" });
+  expect(parseGoalCommand("milestone clear")).toEqual({ kind: "milestone", value: null });
 });
+
+test('milestone command shows, sets and clears the current value', () => {
+  const metadata = fresh()
+  runGoalCommand(metadata, 'milestone-session', 'ship the feature', 1)
+  expect(runGoalCommand(metadata, 'milestone-session', 'milestone', 2).text).not.toContain('Milestone:')
+  const set = runGoalCommand(metadata, 'milestone-session', 'milestone implement the API', 3)
+  expect(set.ok).toBe(true)
+  expect(set.text).toContain('Milestone: implement the API')
+  const shown = runGoalCommand(metadata, 'milestone-session', 'milestone', 4)
+  expect(shown.text).toContain('Milestone: implement the API')
+  const cleared = runGoalCommand(metadata, 'milestone-session', 'milestone clear', 5)
+  expect(cleared.ok).toBe(true)
+  expect(cleared.text).not.toContain('Milestone: implement the API')
+})
+
+test('milestone remains visible as the last milestone after completion and cannot be changed', () => {
+  const metadata = fresh()
+  runGoalCommand(metadata, 'milestone-complete', 'ship the feature', 1)
+  runGoalCommand(metadata, 'milestone-complete', 'milestone release candidate built', 2)
+  runGoalCommand(metadata, 'milestone-complete', 'pause', 3)
+  const goal = getGoal(metadata, 'milestone-complete')!
+  completeGoal(metadata, 'milestone-complete', { id: goal.id, revision: goal.revision }, 4)
+  expect(runGoalCommand(metadata, 'milestone-complete', '', 5).text).toContain('Milestone: release candidate built')
+  const rejected = runGoalCommand(metadata, 'milestone-complete', 'milestone changed after completion', 6)
+  expect(rejected.ok).toBe(false)
+})
 
 test("the full human lifecycle runs through the same domain the tools use", () => {
   const metadata = fresh();

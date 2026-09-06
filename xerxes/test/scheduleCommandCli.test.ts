@@ -24,27 +24,18 @@ function spawnCli(args: string[]): { process: ReturnType<typeof Bun.spawn>; stdo
   }
 }
 
-test('xerxes schedule CLI creates and fires a webhook trigger', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'xerxes-schedule-cli-'))
+test("schedule CLI rejects unsupported sources and legacy storage before creating inert triggers", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "xerxes-schedule-cli-"))
   try {
-    const create = spawnCli(['schedule', 'create', '--id', 'cli-trigger', '--owner', 'user', '--schedule', 'webhook:/hooks/build', '--objective', 'run build', '--directory', directory])
-    const createExit = await create.process.exited
-    const createStdout = await create.stdout
-    expect(createExit).toBe(0)
-    expect(createStdout).toContain('created trigger cli-trigger')
-
-    const list = spawnCli(['schedule', 'list', '--directory', directory])
-    const listExit = await list.process.exited
-    const listStdout = await list.stdout
-    expect(listExit).toBe(0)
-    expect(listStdout).toContain('cli-trigger')
-
-    const fire = spawnCli(['schedule', 'fire', '--id', 'cli-trigger', '--delivery-id', 'delivery-1', '--directory', directory])
-    const fireExit = await fire.process.exited
-    const fireStdout = await fire.stdout
-    expect(fireExit).toBe(0)
-    expect(fireStdout).toContain('fired trigger cli-trigger')
-  } finally {
-    await rm(directory, { recursive: true, force: true })
-  }
+    const unsupported = spawnCli(["schedule", "create", "--schedule", "webhook:/hooks/build", "--objective", "run build", "--socket", join(directory, "absent.sock")])
+    expect(await unsupported.process.exited).not.toBe(0)
+    expect(await unsupported.stderr).toMatch(/webhook|unsupported/)
+    const legacy = spawnCli(["schedule", "create", "--id", "old-trigger", "--owner", "user", "--schedule", "interval:60", "--objective", "work", "--directory", directory])
+    expect(await legacy.process.exited).not.toBe(0)
+    expect(await legacy.stderr).toMatch(/legacy|migrat/)
+    expect(await Bun.file(join(directory, "scheduler.jsonl")).exists()).toBe(false)
+    const missing = spawnCli(["schedule", "list", "--project-dir", directory, "--socket", join(directory, "absent.sock")])
+    expect(await missing.process.exited).not.toBe(0)
+    expect(await missing.stderr).toMatch(/daemon|socket/)
+  } finally { await rm(directory, { recursive: true, force: true }) }
 })

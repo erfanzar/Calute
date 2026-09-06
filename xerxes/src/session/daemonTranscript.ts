@@ -5,6 +5,8 @@ import { appendFile, mkdir, open, readdir, readFile, rename, rm, stat, utimes } 
 import { basename, dirname, resolve, sep } from 'node:path'
 
 import { ValidationError } from '../core/errors.js'
+import { foldGoalChanges, readGoalChanges } from '../runtime/goalDomain.js'
+import { readGoalWake } from '../runtime/goalWake.js'
 import { inspectTranscriptEventLog, type TranscriptEventInspection } from './transcriptEventInspection.js'
 import {
   RESUME_REPLAY_SENTINEL,
@@ -174,6 +176,9 @@ export function normalizeDaemonTranscript(raw: unknown, options: TranscriptLoadO
   const repair = repairResumedTranscript(validMessages)
   const totalApiCalls = optionalIntegerValue(raw.total_api_calls)
   const eventLogOffset = optionalNonNegativeInteger(raw.event_log_offset)
+  const metadata = isRecord(raw.metadata) ? raw.metadata : {}
+  validateGoalMetadata(metadata)
+  readGoalWake(metadata, rawSessionId)
   return {
     format,
     schemaVersion: numberValue(raw.schema_version),
@@ -197,7 +202,7 @@ export function normalizeDaemonTranscript(raw: unknown, options: TranscriptLoadO
     totalInputTokens: integerValue(raw.total_input_tokens),
     totalOutputTokens: integerValue(raw.total_output_tokens),
     ...(typeof raw.usage_complete === 'boolean' ? { usageComplete: raw.usage_complete } : {}),
-    metadata: isRecord(raw.metadata) ? raw.metadata : {},
+    metadata,
     thinkingContent: Array.isArray(raw.thinking_content) ? raw.thinking_content.slice(-32) : [],
     toolExecutions: Array.isArray(raw.tool_executions) ? raw.tool_executions.slice(-200) : [],
     extra,
@@ -290,13 +295,28 @@ export interface DaemonTranscriptEntry {
 /** Record one persisted message in the crash journal. Never throws. */
 export type TranscriptMessageJournalAppend = (message: RawMessage, index: number) => void
 
-export function transcriptHasHistory(transcript: Pick<DaemonTranscript, 'messages' | 'turnCount'>): boolean {
+export function transcriptHasHistory(transcript: Pick<DaemonTranscript, 'messages' | 'turnCount'> & {
+  readonly metadata?: Readonly<Record<string, unknown>>
+}): boolean {
+  const hasGoalHistory = transcript.metadata === undefined
+    ? false
+    : validateGoalMetadata(transcript.metadata)
   if (transcript.turnCount > 0) return true
   // A completed exchange requires at least one assistant message. User-only
   // transcripts are dead attempts — a prompt whose turn never produced a
   // reply — and must neither persist nor list as sessions, or every failed
   // launch litters the session list with phantom rows.
-  return transcript.messages.some(message => message.role === 'assistant')
+  return transcript.messages.some(message => message.role === 'assistant') || hasGoalHistory
+}
+
+/** Validate goal metadata and recognize even a cleared goal as durable history. */
+function validateGoalMetadata(metadata: Readonly<Record<string, unknown>>): boolean {
+  const raw = metadata.goal_changes
+  if (!Array.isArray(raw) || raw.length === 0) return false
+  const changes = readGoalChanges(metadata)
+  if (changes.length === 0) return false
+  foldGoalChanges(changes)
+  return true
 }
 
 /** Filesystem store for legacy-compatible daemon transcripts. */
@@ -462,6 +482,7 @@ export class DaemonTranscriptStore {
       expectedMessageCount: transcript.messages.length,
     },
   ): Promise<void> {
+    readGoalWake(transcript.metadata, transcript.sessionId)
     if (!transcriptHasHistory(transcript)) {
       // Never delete a persisted transcript as a side effect of saving an
       // empty in-memory session. Several paths can briefly hold an empty
@@ -474,6 +495,10 @@ export class DaemonTranscriptStore {
     }
     return this.serializeTranscriptWrite(transcript.sessionId, async () => {
       const persisted = await this.readPersistedState(transcript.sessionId)
+      if (persisted.generation !== options.expectedGeneration
+        && JSON.stringify(persisted.contextControls ?? null) !== JSON.stringify(transcript.metadata.context_controls ?? null)) {
+        throw new ValidationError('context_controls', 'changed in another writer; reload the session before saving', options.expectedGeneration)
+      }
       const messages = this.resolveMessages(transcript, options, persisted)
       const generation = persisted.generation + 1
       const inheritedOffset = Math.max(persisted.eventLogOffset, transcript.eventLogOffset ?? 0)
@@ -570,13 +595,14 @@ export class DaemonTranscriptStore {
 
   private async readPersistedState(
     sessionId: string,
-  ): Promise<{ readonly eventLogOffset: number; readonly generation: number; readonly messages: readonly RawMessage[] }> {
+  ): Promise<{ readonly eventLogOffset: number; readonly generation: number; readonly messages: readonly RawMessage[]; readonly contextControls?: unknown }> {
     try {
       const raw = JSON.parse(await readFile(this.pathFor(sessionId), 'utf8')) as unknown
       return {
         eventLogOffset: isRecord(raw) ? optionalNonNegativeInteger(raw.event_log_offset) ?? 0 : 0,
         generation: isRecord(raw) ? integerValue(raw.generation) : 0,
         messages: isRecord(raw) && Array.isArray(raw.messages) ? raw.messages.filter(isRecord) : [],
+        contextControls: isRecord(raw) && isRecord(raw.metadata) ? raw.metadata.context_controls : undefined,
       }
     } catch (error) {
       if (isMissing(error)) return { eventLogOffset: 0, generation: 0, messages: [] }
