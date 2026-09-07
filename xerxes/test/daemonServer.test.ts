@@ -9955,3 +9955,17 @@ test('model inventory uses configured discovery without exposing credentials or 
     await expect(server.modelInventoryToolRequest('other', {})).rejects.toThrow('session unavailable');
   } finally { client.close(); await server.stop(); endpoint.stop(true); await rm(directory, { recursive: true, force: true }); }
 });
+
+test('workspace.diff reads untracked content in the daemon project without trusting a client cwd', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xr-rpc-diff-'));
+  await Bun.spawn(['git', 'init', '-q', directory]).exited;
+  await Bun.write(join(directory, 'new.ts'), 'export const remote = true\n');
+  const server = new DaemonServer({ socketPath: join(directory, 'rpc.sock'), projectDirectory: directory, runtime: new InMemoryDaemonRuntime() });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'rpc.sock'));
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'workspace.diff', params: { cwd: '/definitely/not/the/project' } });
+    const response = await client.next(frame => frame.id === 1);
+    expect(response.result).toMatchObject({ kind: 'ok', diff: { untracked: expect.arrayContaining(['new.ts']), lines: expect.arrayContaining([{ kind: 'add', text: '+export const remote = true', newLine: 1 }]) } });
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});

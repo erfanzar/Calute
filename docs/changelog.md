@@ -7,6 +7,20 @@ describe the earlier implementation and are not current setup instructions.
 
 ---
 
+## Unreleased
+
+- Remote workspaces now render locally over a private SSH-forwarded daemon
+  socket. Tunnel failures return to the original local workspace.
+- F7 collects changes on the daemon host and includes navigable untracked-file
+  previews, with empty-file and binary-file handling.
+
+- Fixed inline swarm status lists splitting comma-containing titles into phantom
+  queued agents; saved transcripts reconcile titles with actual agent records.
+- Added `TaskOutputTool` character pagination (`offset`, optional `limit`, up to
+  8,000 characters). Follow the returned next offset to read complete saved
+  reports without rerunning agents. For new work on a completed agent, use
+  `AgentTool` with `resume` and `prompt`; `SendMessageTool` targets running agents.
+
 ## 0.4.3 — 2026-09-07
 
 - Redesigned operational TUI dialogs, forms, empty states, and capability guides.

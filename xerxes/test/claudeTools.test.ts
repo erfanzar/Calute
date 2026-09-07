@@ -945,6 +945,15 @@ test('subagent outputs crossing the parent boundary are truncated with an explic
   const output = await tools.execute('TaskOutputTool', { task_id: 'loud-task' }, context) as string
   expect(output.length).toBeLessThan(9_000)
   expect(output).toContain('[truncated 12000 chars]')
+  expect(output).toContain('offset=8000')
+  const middle = await tools.execute('TaskOutputTool', { task_id: 'loud-task', offset: 8000 }, context) as string
+  expect(middle).toContain('offset=16000')
+  const tail = await tools.execute('TaskOutputTool', { task_id: 'loud-task', offset: 16000 }, context) as string
+  expect(tail).toBe(huge.slice(16000))
+  expect(output.slice(0, 8000) + middle.slice(0, 8000) + tail).toBe(huge)
+  for (const invalid of [{ offset: -1 }, { limit: 0 }, { limit: 8001 }]) {
+    await expect(tools.execute('TaskOutputTool', { task_id: 'loud-task', ...invalid }, context)).rejects.toThrow()
+  }
 
   const wire = await tools.execute('TaskGetTool', { task_id: 'loud-task' }, context) as {
     error: string

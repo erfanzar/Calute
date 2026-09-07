@@ -5,6 +5,7 @@ import { RGBA, type ScrollBoxRenderable } from '@opentui/core'
 import { useStore } from '@nanostores/react'
 import { useKeyboard, useTerminalDimensions } from '@opentui/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useOptionalGateway } from '../app/gatewayContext.js'
 
 import {
   $panelWidthDelta,
@@ -210,6 +211,7 @@ export function DiffPanelOverlay({
   onClose: () => void
   t: Theme
 }) {
+  const gateway = useOptionalGateway()
   const scrollRef = useRef<ScrollBoxRenderable | null>(null)
   const [result, setResult] = useState<GitDiffResult | null>(null)
   const [loading, setLoading] = useState(true)
@@ -226,7 +228,10 @@ export function DiffPanelOverlay({
   const reload = useCallback(() => {
     const gen = ++generation.current
     setLoading(true)
-    void collectGitDiff({ cwd: cwd ?? '' })
+    void (gateway ? gateway.rpc('workspace.diff', {}).then(value => {
+      if (!value || typeof value !== 'object' || !('kind' in value) || !['ok', 'clean', 'error'].includes(String(value.kind))) throw new Error('Invalid workspace diff response')
+      return value as GitDiffResult
+    }) : collectGitDiff({ cwd: cwd ?? '', includeUntracked: true }))
       .then(next => {
         if (generation.current === gen) {
           setResult(next)
@@ -239,7 +244,7 @@ export function DiffPanelOverlay({
           setLoading(false)
         }
       })
-  }, [cwd])
+  }, [cwd, gateway])
 
   useEffect(() => {
     reload()
@@ -451,11 +456,11 @@ export function DiffPanelOverlay({
             {diff && diff.untracked.length > 0 ? (
               <Box flexDirection="column" marginTop={1}>
                 <GroupCaption count={diff.untracked.length} label="UNTRACKED" t={t} width={FILE_PANE_WIDTH} />
-                {diff.untracked.slice(0, 8).map(name => (
-                  <Text color={t.color.muted} key={name} wrap="truncate-end">
-                    {'  '}
-                    {baseName(name)}
-                  </Text>
+                {diff.untracked.map(name => (
+                  <Box key={name} onClick={() => {
+                    const index = files.findIndex(file => file.name === name)
+                    if (index >= 0) { setFileIdx(index); scrollRef.current?.scrollTo(files[index]!.line + DIFF_HEADER_ROWS) }
+                  }}><Text color={t.color.accent} wrap="truncate-end">{'  + '}{baseName(name)}</Text></Box>
                 ))}
               </Box>
             ) : null}

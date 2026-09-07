@@ -160,8 +160,39 @@ export function spawnRosterFromSummary(args: string): { extra: number; names: st
   const extraMatch = roster.match(/, \+(\d+) more$/u)
   const extra = extraMatch ? Number(extraMatch[1]) : 0
   const body = extraMatch ? roster.slice(0, -extraMatch[0].length) : roster
-  const names = body.split(',').map(name => name.trim()).filter(Boolean)
+  let names: string[]
+  if (body.startsWith('["')) {
+    try {
+      const decoded: unknown = JSON.parse(body)
+      if (!Array.isArray(decoded) || !decoded.every(name => typeof name === 'string')) return null
+      names = decoded
+    } catch {
+      return null
+    }
+  } else {
+    names = body.split(',').map(name => name.trim()).filter(Boolean)
+  }
   return names.length || extra ? { extra, names } : null
+}
+
+/** Recover comma-containing titles in legacy transcripts using known identities. */
+export function reconcileSpawnRoster(names: readonly string[], aliases: ReadonlyMap<string, unknown>): string[] {
+  const result: string[] = []
+  for (let start = 0; start < names.length;) {
+    let end = names.length
+    while (end > start + 1 && !aliases.has(names.slice(start, end).join(', ').trim().toLowerCase())) end--
+    result.push(names.slice(start, end).join(', '))
+    start = end
+  }
+  return result
+}
+
+function serializeSpawnNames(names: readonly string[]): string {
+  // Simple historical summaries stay readable. JSON preserves ambiguous title
+  // boundaries, quotes and escapes without changing the persisted wire shape.
+  return names.some(name => /[,"\\\n\r]/u.test(name) || name.startsWith('['))
+    ? JSON.stringify(names)
+    : names.join(', ')
 }
 
 /**
@@ -189,7 +220,7 @@ function summarizeSpawnAgents(context: string, verboseArgs?: string): ToolStartD
   if (count > 0) {
     const shown = names.slice(0, MAX_INLINE_AGENTS)
     const suffix = names.length > MAX_INLINE_AGENTS ? `, +${names.length - MAX_INLINE_AGENTS} more` : ''
-    const roster = shown.length ? `: ${shown.join(', ')}${suffix}` : ''
+    const roster = shown.length ? `: ${serializeSpawnNames(shown)}${suffix}` : ''
     const wait = typeof parsed?.wait === 'boolean' ? ` · wait=${parsed.wait}` : ''
 
     return { context: `${count} agent${count === 1 ? '' : 's'}${roster}${wait}` }
@@ -198,15 +229,15 @@ function summarizeSpawnAgents(context: string, verboseArgs?: string): ToolStartD
   const fallbackNames = Array.from(
     fallback.matchAll(/["'](?:name|agent_name|title)["']\s*:\s*["']([^"']+)["']/g),
     m => m[1]
-  ).filter(Boolean)
+  ).filter((name): name is string => Boolean(name))
   if (fallbackNames.length) {
     const shown = fallbackNames.slice(0, MAX_INLINE_AGENTS)
     const suffix = fallbackNames.length > MAX_INLINE_AGENTS ? `, +${fallbackNames.length - MAX_INLINE_AGENTS} more` : ''
 
-    return { context: `${fallbackNames.length} agents: ${shown.join(', ')}${suffix}` }
+    return { context: `${fallbackNames.length} agents: ${serializeSpawnNames(shown)}${suffix}` }
   }
 
-  return { context: compact(fallback) }
+  return { context: spawnRosterFromSummary(fallback) ? fallback : compact(fallback) }
 }
 
 function summarizeFileOperation(toolName: string, context: string, verboseArgs?: string): ToolStartDisplay | null {

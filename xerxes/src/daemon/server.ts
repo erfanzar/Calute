@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 import { recordCompaction } from '../context/compactionHistory.js'
+import { collectGitDiff } from '../workspace/gitDiff.js'
 import { FEATURES_GUIDE } from '../bridge/features.js';
 import { inspectSessionContext } from '../context/inspection.js';
 import { readContextControls, updateContextControls } from '../context/controls.js';
@@ -1887,6 +1888,10 @@ export class DaemonServer {
         ...(projectDirectory ? { projectDirectory } : {}),
       });
       return { ok: true, sessions: sessions.map(savedSessionPayload) };
+    }
+    if (method === "workspace.diff") {
+      const session = this.runtime.sessionStatus(sessionKey(connection, params));
+      return await collectGitDiff({ cwd: session?.cwd || this.projectDirectory || process.cwd(), includeUntracked: true }) as unknown as JsonRpcPayload;
     }
     if (method === "session.status") {
       const session = this.runtime.sessionStatus(

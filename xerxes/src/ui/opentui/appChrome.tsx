@@ -372,6 +372,7 @@ export function WorkspaceFooter({
         {cwdLabel ? (
           <Text color={t.ds.secondary} wrap="truncate-end">
             <Span bold color={t.color.brandGold}>{`${GLYPH.brand} XERXES  `}</Span>
+            {process.env.XERXES_REMOTE_LABEL ? <Span color={t.color.accent}>{`SSH ${process.env.XERXES_REMOTE_LABEL} · `}</Span> : null}
             {cwdLabel}
             {branch ? (
               <>

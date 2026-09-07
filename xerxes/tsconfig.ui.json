@@ -6,7 +6,7 @@
     "moduleResolution": "nodenext",
     "jsx": "react-jsx",
     "outDir": "dist/ui",
-    "rootDir": "src/ui",
+    "rootDir": "src",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,

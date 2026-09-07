@@ -1,0 +1,37 @@
+// Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
+// Licensed under the Apache License, Version 2.0.
+import { createServer } from 'node:net'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { expect, it } from 'vitest'
+import { GatewayClient } from '../gatewayClient.js'
+
+it('external gateways verify protocol without replacing the remote daemon for a different local build', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'xr-gw-'))
+  const path = join(dir, 'rpc.sock')
+  const server = createServer(socket => {
+    socket.setEncoding('utf8')
+    let buffer = ''
+    socket.on('data', data => {
+      buffer += data
+      while (buffer.includes('\n')) {
+        const end = buffer.indexOf('\n'), frame = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1)
+        socket.write(JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: { runtime: 'bun-typescript', daemon_protocol: 35, daemon_build_id: 'remote-build' } }) + '\n')
+      }
+    })
+  })
+  await new Promise<void>(resolve => server.listen(path, resolve))
+  const client = new GatewayClient({ externalSocketPath: path, projectDir: '/remote/project', expectedDaemonBuildId: 'different-local-build' })
+  try {
+    await client.start()
+    expect(client.didSpawnDaemon).toBe(false)
+    expect(await client.request('runtime.status', {})).toMatchObject({ daemon_build_id: 'remote-build' })
+  } finally { client.close(); await new Promise<void>(resolve => server.close(() => resolve())); await rm(dir, { recursive: true, force: true }) }
+})
+
+it('a missing external tunnel never falls back to starting a local daemon', async () => {
+  const client = new GatewayClient({ externalSocketPath: '/tmp/xerxes-does-not-exist/rpc.sock', projectDir: '/remote/project' })
+  try { await expect(client.start()).rejects.toThrow('Remote daemon tunnel is unavailable'); expect(client.didSpawnDaemon).toBe(false) }
+  finally { client.close() }
+})

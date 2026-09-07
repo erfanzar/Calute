@@ -849,7 +849,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
       return this.snapshot(replacement)
     }
     if (!(await this.manager.sendMessage(task.id, input))) {
-      throw new ValidationError('handle_id', 'spawned agent is not accepting input', task.id)
+      throw new ValidationError('handle_id', 'spawned agent is not accepting input; use AgentTool with resume and prompt for follow-up work, or TaskOutputTool with offset pagination to read saved output', task.id)
     }
     const metadata = this.handles.get(task.id)
     if (metadata) metadata.lastInput = input

@@ -205,7 +205,7 @@ export const formatToolCall = (name: string, context = '') => {
   // Spawn context is already a bounded semantic roster with prompts removed.
   // Keep every displayed name in the internal line so the cube rows can parse
   // all agents; the terminal Text node still truncates only the visible tool row.
-  const preview = compactPreview(context, label === 'Spawn Agents' ? 512 : 64)
+  const preview = label === 'Spawn Agents' ? context : compactPreview(context, 64)
 
   return preview ? `${label}("${preview}")` : label
 }

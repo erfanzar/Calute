@@ -14,7 +14,7 @@ and live external-service acceptance are separate checks.
 | Goals | `/goal`, F10 | Inspect goal/todos; unlimited defaults; `/goal unlimited` removes saved caps |
 | Agent tiers | `/config` | Provider, model, reasoning and usage notes |
 | Project specialists | `/custom-agents`, `/agents edit` | Create/edit validated Markdown, reject conflicting saves, reload definitions |
-| Remote workspaces | `/machine` | Saved SSH targets, interactive remote Xerxes handoff, return to local chat |
+| Remote workspaces | `/machine` | Saved SSH targets, local renderer over an SSH-forwarded remote daemon, return to local chat |
 | Skills | `/skills` | List, search, inspect, trust, diagnostics and local bundle installation |
 | Plugins | `/plugins` | Local native tool-module installation, persisted enable/disable and inspection |
 | MCP/LSP | `/config mcp`, `/config lsp` | Settings and daemon configuration calls |

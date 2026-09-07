@@ -59,6 +59,22 @@ const tester: SubagentProgress = {
 }
 
 describe('spawn fleet roster', () => {
+  it('shows actual verdicts for comma-rich titles in a saved transcript', async () => {
+    const titles = ['SFT, embedding, reward, PRM trainers', 'On-policy/seq KD, GOLD, SSD']
+    const agents: SubagentProgress[] = titles.map((title, index) => ({ ...base, id: `comma-${index}`, name: 'subagent', title, goal: '', status: index ? 'running' : 'completed' }))
+    const setup = await testRender(<MessageLine msg={{ kind: 'trail', role: 'system', subagents: agents, text: '', tools: [`Spawn Agents("2 agents: ${titles.join(', ')}") ✓`] }} t={theme} />, { width: 220, height: 65 })
+    try {
+      await setup.flush()
+      const frame = setup.captureCharFrame()
+      expect(frame).toContain(`${titles[0]}  · completed`)
+      expect(frame).toContain(`${titles[1]}  · running`)
+      expect(frame).not.toContain('queued')
+      expect(frame).not.toContain('status unavailable')
+    } finally {
+      act(() => setup.renderer.destroy())
+    }
+  })
+
   afterEach(() => {
     clearSpawnHistory()
     resetTurnState()
@@ -91,7 +107,7 @@ describe('spawn fleet roster', () => {
       // and the agent that never reported keeps its muted dot-matrix marker.
       expect(frame).toContain('⣿ alpha  · completed')
       expect(frame).toContain('⣿ beta  · failed')
-      expect(frame).toContain('⠿ gamma  · queued')
+      expect(frame).toContain('⠿ gamma  · status unavailable')
     } finally {
       act(() => setup.renderer.destroy())
     }

@@ -245,7 +245,7 @@ export const CLAUDE_AGENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     wait: booleanSchema('Wait for the subagent to finish.', true),
     timeout: numberSchema('Maximum seconds to wait.'),
   }, ['prompt']),
-  definition('SendMessageTool', 'Queue a follow-up message for a managed subagent.', {
+  definition('SendMessageTool', 'Queue a message for a running subagent. Completed agents do not accept messages: use AgentTool with resume and prompt for follow-up work, or TaskOutputTool to read their saved output.', {
     target: stringSchema('Subagent id or stable name.'),
     message: stringSchema('Message for the subagent.'),
   }, ['target', 'message']),
@@ -294,8 +294,10 @@ export const CLAUDE_AGENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     offset: { type: 'integer', minimum: 0, default: 0, description: 'Zero-based task offset.' },
     limit: { type: 'integer', minimum: 1, maximum: MAX_TASK_LIST_PAGE_SIZE, default: DEFAULT_TASK_LIST_PAGE_SIZE, description: 'Maximum compact task rows to return.' },
   }),
-  definition('TaskOutputTool', 'Return the latest output of a managed subagent.', {
+  definition('TaskOutputTool', 'Read saved subagent output without rerunning it. Long outputs are paginated: follow the returned next offset until no continuation is shown. Completed agents retain their output.', {
     task_id: stringSchema('Subagent id or stable name.'),
+    offset: { type: 'integer', minimum: 0, default: 0, description: 'Character offset from the previous output page.' },
+    limit: { type: 'integer', minimum: 1, maximum: MAX_WIRE_OUTPUT_CHARS, default: MAX_WIRE_OUTPUT_CHARS, description: 'Maximum output characters in this page.' },
   }, ['task_id']),
   definition('TaskStopTool', 'Cancel and close a managed subagent task.', {
     task_id: stringSchema('Subagent id or stable name.'),
@@ -417,7 +419,7 @@ export class ClaudeAgentTools {
         case 'SpawnAgents': return await this.spawnAgents(inputs, context, signal)
         case 'TaskGetTool': return this.taskGet(requiredString(inputs, 'task_id'), context, 'task_id')
         case 'TaskListTool': return this.taskList(inputs, context)
-        case 'TaskOutputTool': return this.taskOutput(requiredString(inputs, 'task_id'), context, 'task_id')
+        case 'TaskOutputTool': return this.taskOutput(requiredString(inputs, 'task_id'), context, inputs, 'task_id')
         case 'TaskStopTool': return this.taskStop(requiredString(inputs, 'task_id'), context, 'task_id')
         case 'TaskUpdateTool': return await this.taskUpdate(inputs, context)
         case 'AwaitAgents': return await this.awaitAgents(inputs, context, signal)
@@ -625,11 +627,21 @@ export class ClaudeAgentTools {
     return page.map(compactAgentSnapshotWire)
   }
 
-  private taskOutput(target: string, context: ToolExecutionContext, inputField = 'target'): string {
+  private taskOutput(target: string, context: ToolExecutionContext, inputs: JsonObject, inputField = 'target'): string {
+    const offset = nonnegativeInteger(inputs, 'offset', 0)
+    const limit = nonnegativeInteger(inputs, 'limit', MAX_WIRE_OUTPUT_CHARS)
+    if (limit < 1 || limit > MAX_WIRE_OUTPUT_CHARS) {
+      throw new ValidationError('limit', `must be between 1 and ${MAX_WIRE_OUTPUT_CHARS}`, limit)
+    }
     const snapshot = this.requireSnapshot(target, context, inputField)
     if (snapshot.lastOutput !== undefined) {
       this.options.backgroundAgents?.consume([snapshot])
-      return boundedOutput(snapshot.lastOutput)
+      const output = snapshot.lastOutput
+      const end = Math.min(offset + limit, output.length)
+      const page = output.slice(offset, end)
+      return end < output.length
+        ? `${page}… [truncated ${output.length - end} chars]\nContinue with TaskOutputTool task_id=${JSON.stringify(snapshot.id)} offset=${end} limit=${limit}. Saved output is retained; no agent restart is needed.`
+        : page
     }
     return `No output for task '${target}' (may still be running).`
   }

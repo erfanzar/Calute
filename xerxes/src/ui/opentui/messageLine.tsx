@@ -25,7 +25,7 @@ import { sectionMode } from '../domain/details.js'
 import { GLYPH } from '../domain/nocturne.js'
 import { VOICE } from '../domain/roles.js'
 import { messageHasVisibleDetails, trailHasRenderableContent } from '../lib/liveProgress.js'
-import { spawnRosterFromLine } from '../lib/toolStartDisplay.js'
+import { reconcileSpawnRoster, spawnRosterFromLine } from '../lib/toolStartDisplay.js'
 import { subagentCardAccent, subagentCardModel } from '../lib/subagentCards.js'
 import { fmtDuration, subagentElapsedSeconds } from '../lib/subagentElapsed.js'
 import { groupToolRun, toolRunSpawnRoster, type ToolRunGroup } from '../lib/toolRun.js'
@@ -364,8 +364,9 @@ export function SpawnFleetRoster({
     return byName
   }, [archived, history, live, sessionId])
   const resolve = (name: string) => fleet.get(name.trim().toLowerCase())
+  const rosterNames = reconcileSpawnRoster(names, fleet)
   const [frame, setFrame] = useState(0)
-  const anyWorking = names.some(name => fleetRowState(resolve(name)) === 'working')
+  const anyWorking = rosterNames.some(name => fleetRowState(resolve(name)) === 'working')
 
   useEffect(() => {
     if (!anyWorking) return
@@ -376,9 +377,10 @@ export function SpawnFleetRoster({
 
   return (
     <Box flexDirection="column" flexShrink={0}>
-      {names.map(name => {
+      {rosterNames.map(name => {
         const entry = resolve(name)
-        const label = entry?.name?.trim() || entry?.title?.trim() || name
+        const stableName = entry?.name?.trim()
+        const label = stableName && stableName !== 'subagent' ? stableName : entry?.title?.trim() || stableName || name
         const state = fleetRowState(entry)
         const glyph = state === 'working'
           ? FLEET_CUBE_FRAMES[frame % FLEET_CUBE_FRAMES.length]
@@ -399,7 +401,7 @@ export function SpawnFleetRoster({
           : ''
         const timing = elapsed === null ? '' : ` [${fmtDuration(elapsed)}]`
         const tokenText = tokens ? ` · ${tokens} tok` : ''
-        const activity = entry?.status ?? 'queued'
+        const activity = entry?.status ?? 'status unavailable'
         return (
           <Box key={name} backgroundColor={t.color.statusBg} borderSides={['left']} borderColor={color}
             onClick={entry ? () => patchOverlayState({ agents: true, agentsInspectId: entry.id }) : undefined}>

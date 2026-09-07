@@ -1356,9 +1356,18 @@ strict host-key verification. Errors return `{ok:false,error}`; cancelled TUI
 pickers discard late replies. F2 on the host/folder field opens these pickers;
 Escape restores the unfinished form. These are read-only slash RPC extensions.
 Arguments may be single- or double-quoted. Resolution does not prove connectivity
-or change daemon session ownership. The terminal client suspends its renderer
-and launches interactive SSH for the returned target, then restores the local
-UI when SSH exits. Errors return `{ok:false,error}`.
+or change daemon session ownership. The terminal client prepares the remote daemon,
+forwards its Unix socket through SSH, and starts a local renderer with a connect-only
+GatewayClient. That client never starts or signals a local daemon on tunnel failure.
+The previous local renderer is restored on exit. Errors return `{ok:false,error}`.
+
+`workspace.diff` is an additive read-only RPC with no required parameters. It
+uses the active session's cwd (or the daemon project before initialization), never
+a client-supplied filesystem path. It returns `{kind:'clean'}`, `{kind:'error',message}`
+or `{kind:'ok',diff:{lines,files,insertions,deletions,truncated,untracked,untrackedTruncated}}`.
+Lines have `kind`, `text`, and optional `oldLine`/`newLine`. Untracked text is
+represented as additions, so it supports the same file navigation as tracked changes.
+Git output, duration and rendered rows are bounded; symlinks are not followed.
 
 `slash.exec` also exposes local extension management: `skills search <query>`,
 `skills browse`, `skills install <directory-or-SKILL.md>`, `plugins install
@@ -1370,8 +1379,8 @@ Remote handoff now bootstraps a dedicated user-owned installation through SSH.
 It checks GitHub main, builds a missing revision with locked dependencies in a
 staging directory, verifies the CLI, and promotes it only after success. A setup
 lock prevents concurrent installation; errors preserve previous releases. Bun
-1.3+ is installed when absent/outdated. SSH retains terminal ownership during
-setup and the remote TUI; exiting restores the local renderer. No provider
+1.3+ is installed when absent/outdated. SSH transports RPC only; the local TUI
+owns the terminal. Exiting restores the previous local renderer. No provider
 credentials, project files, or existing Xerxes installations are overwritten.
 
 Bang-command adapter responses preserve native `{code,stdout,stderr}` even when

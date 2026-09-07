@@ -344,6 +344,8 @@ interface Pending {
 type RpcObject = Record<string, any>
 
 export interface GatewayClientOptions {
+  /** SSH-forwarded socket: connect only; never launch or signal a local daemon. */
+  externalSocketPath?: string
   /** Bun executable used when the client must launch a daemon. */
   bunBinary?: string
   /** Bun TypeScript CLI entry used when the client must launch a daemon. */
@@ -364,6 +366,7 @@ export interface GatewayClientOptions {
 export class GatewayClient extends EventEmitter {
   readonly sessionKey: string
   private readonly projectDir: string
+  private readonly externalSocketPath: string | undefined
   private readonly bunBinary: string | undefined
   private readonly bunDaemonPath: string | undefined
   private readonly expectedDaemonBuildId: string
@@ -394,7 +397,8 @@ export class GatewayClient extends EventEmitter {
     this.bunDaemonPath = opts.bunDaemonPath?.trim() || undefined
     this.expectedDaemonBuildId =
       opts.expectedDaemonBuildId?.trim() || process.env.XERXES_EXPECTED_DAEMON_BUILD_ID?.trim() || ''
-    this.projectDir = resolveProjectDir(opts.projectDir)
+    this.externalSocketPath = opts.externalSocketPath
+    this.projectDir = this.externalSocketPath ? (opts.projectDir || '/') : resolveProjectDir(opts.projectDir)
     this.sessionKey = opts.sessionKey ?? `tui:${randomKey()}`
     this.activeSessionKey = this.sessionKey
   }
@@ -418,6 +422,20 @@ export class GatewayClient extends EventEmitter {
   }
 
   private async startOnce(): Promise<void> {
+    if (this.externalSocketPath) {
+      if (!await this.tryConnect(this.externalSocketPath)) throw new Error('Remote daemon tunnel is unavailable. Reconnect with /machine.')
+      try {
+        const identity = await this.probeDaemonIdentity()
+        if (identity.runtime !== 'bun-typescript' || positiveInteger(identity.daemon_protocol) !== 35) {
+          throw new Error('Remote daemon protocol is incompatible; update Xerxes on both machines.')
+        }
+      } catch (error) {
+        await this.detachSocketSilently()
+        throw error
+      }
+      this.emitClient('gateway.ready', { socketPath: this.externalSocketPath, spawned: false })
+      return
+    }
     const { socketPath, pidPath } = daemonPaths(this.projectDir)
 
     if (await this.tryConnect(socketPath)) {
@@ -1796,8 +1814,8 @@ export class GatewayClient extends EventEmitter {
     return {
       ...withUsage,
       cwd,
-      head_hash: withUsage.head_hash || (await localGitHead(cwd)),
-      version: withUsage.version || localProjectVersion(cwd)
+      head_hash: withUsage.head_hash || (this.externalSocketPath ? '' : await localGitHead(cwd)),
+      version: withUsage.version || (this.externalSocketPath ? '' : localProjectVersion(cwd))
     }
   }
 

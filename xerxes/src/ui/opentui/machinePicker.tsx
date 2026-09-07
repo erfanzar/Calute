@@ -155,7 +155,7 @@ export function MachinePicker({ t, onCancel, connect = connectRemoteMachine }: M
       </box>)}</box>}
       {error ? <text flexShrink={0} fg={t.color.error} wrapMode="word">{error}</text> : null}
       {notice ? <text flexShrink={0} fg={t.color.text} wrapMode="word">{notice}</text> : null}
-      {!compact && !editing ? <box marginTop={1}><text flexShrink={0} fg={t.color.muted}>Automatically installs and updates Xerxes. Exit there to return here.</text></box> : null}
+      {!compact && !editing ? <box marginTop={1}><text flexShrink={0} fg={t.color.muted}>Local rendering · remote execution over SSH. Exit to return here.</text></box> : null}
       <box border={['top']} borderColor={t.color.border} paddingTop={compact ? 0 : 1} marginTop={1} flexShrink={0}><text flexShrink={0} fg={t.color.muted} truncate wrapMode="none">{busy ? editing ? 'Saving…' : 'Connecting…' : editing ? 'Tab next · Enter save · Esc back' : machines.length ? '↑↓ select · Enter connect · N add · Esc close' : 'Enter add workspace · Esc close'}</text></box>
       </box>
     </ModalShell>

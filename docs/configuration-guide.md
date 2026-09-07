@@ -1765,12 +1765,14 @@ alias or `user@hostname`; configure identity files, ports and jump hosts in
 `~/.ssh/config`. The remote project path must be absolute. Saved workspaces live
 in `~/.xerxes/machines.json` (or `$XERXES_HOME/machines.json`).
 
-Connecting suspends the local renderer and opens an SSH terminal running Xerxes
-inside the remote project. The remote host needs Xerxes on its login-shell PATH
-and its own provider configuration. Exiting that remote TUI returns to the local
-picker/chat; local sessions and running work remain with the local daemon. This
-is an SSH terminal handoff, not file synchronization or migration of the local
-conversation. Host verification and authentication use normal interactive SSH.
+Connecting prepares the remote daemon and forwards its private Unix socket over
+SSH. A local TUI renders the remote workspace, so typing, scrolling and menus
+stay local. The remote machine executes tools and holds its provider settings,
+files and sessions. Exit this view to restore the previous local picker/chat.
+Local work stays with its local daemon; files and conversations are not migrated.
+SSH uses your configured identities and jump hosts with BatchMode authentication;
+authenticate and verify the host with `ssh <alias>` first if necessary. Installation
+and updates remain managed under `~/.xerxes/remote-runtime` on the remote host.
 
 `/custom-agents` (also `/agents edit`) opens a project specialist editor. Press
 **N** to create a Markdown definition, **Enter** to edit an existing definition,

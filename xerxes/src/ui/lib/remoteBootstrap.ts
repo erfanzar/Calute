@@ -2,8 +2,22 @@
 // Licensed under the Apache License, Version 2.0.
 
 /** Executed by SSH on the selected host. Installs only in a dedicated user-owned directory. */
-export function remoteBootstrapScript(workspacePath: string): string {
+export function remoteBootstrapScript(workspacePath: string, mode: 'tui' | 'daemon' = 'tui'): string {
   const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+  const prepare = `
+const { dirname, resolve } = await import('node:path');
+const { pathToFileURL } = await import('node:url');
+const cli = process.argv.at(-1);
+const dist = dirname(cli);
+const { GatewayClient, daemonPaths, resolveProjectDir } = await import(pathToFileURL(resolve(dist, '../src/ui/gatewayClient.ts')).href);
+const projectDir = resolveProjectDir(process.cwd());
+const expectedDaemonBuildId = (await Bun.file(resolve(dist, 'build-id')).text()).trim();
+const gateway = new GatewayClient({ projectDir, bunBinary: process.execPath, bunDaemonPath: cli, expectedDaemonBuildId });
+await gateway.start();
+console.log('XERXES_REMOTE_READY ' + JSON.stringify({ projectDir, socketPath: daemonPaths(projectDir).socketPath }));
+gateway.close();
+process.exit(0);
+`
   return `set -eu
 cd ${quote(workspacePath)}
 PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
@@ -56,5 +70,5 @@ if [ ! -f "$release/.ready" ] || ! bun_ready; then
   trap - EXIT INT TERM HUP
 fi
 printf 'Xerxes · ready. Opening remote workspace…\\n'
-exec bun "$release/xerxes/dist/cli.js"`
+${mode === 'daemon' ? `exec bun -e ${quote(prepare)} "$release/xerxes/dist/cli.js"` : 'exec bun "$release/xerxes/dist/cli.js"'}`
 }

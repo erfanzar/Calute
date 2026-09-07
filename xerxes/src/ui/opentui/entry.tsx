@@ -88,6 +88,7 @@ if (TERMUX_TUI_MODE) {
 }
 
 const gw = new GatewayClient({
+  externalSocketPath: process.env.XERXES_REMOTE_SOCKET,
   projectDir: process.env.XERXES_PROJECT_DIR || process.env.XERXES_CWD
 })
 

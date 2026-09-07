@@ -138,6 +138,16 @@ describe('DiffPanelHotkey', () => {
 })
 
 describe('DiffPanelOverlay', () => {
+  it('opens an untracked file section with keyboard navigation at desktop width', async () => {
+    activeDiffResult = { kind: 'ok', diff: { files: 2, insertions: 1, deletions: 0, truncated: false, untracked: ['new.ts'], untrackedTruncated: false,
+      lines: [{ kind: 'file', text: 'tracked.ts' }, ...contextRows(1, 100), { kind: 'file', text: 'new.ts' }, { kind: 'hunk', text: '@@ -0,0 +1 @@' }, { kind: 'add', text: '+visible untracked content', newLine: 1 }] } }
+    const setup = await testRender(<DiffPanelOverlay onClose={() => {}} t={DEFAULT_THEME} />, { width: 220, height: 65 })
+    try {
+      await act(async () => { await Bun.sleep(10) }); await setup.flush()
+      await act(async () => { setup.mockInput.pressKey(']') }); await setup.flush()
+      expect(setup.captureCharFrame()).toContain('visible untracked content')
+    } finally { act(() => setup.renderer.destroy()) }
+  })
   afterEach(() => {
     resetPanelWidth()
   })

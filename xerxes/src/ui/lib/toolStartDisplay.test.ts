@@ -1,10 +1,29 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 import { describe, expect, it } from 'vitest'
+import { buildToolTrailLine } from './text.js'
 
-import { spawnRosterFromLine, summarizeToolStartDisplay } from './toolStartDisplay.js'
+import { reconcileSpawnRoster, spawnRosterFromLine, summarizeToolStartDisplay } from './toolStartDisplay.js'
 
 describe('summarizeToolStartDisplay', () => {
+  it('preserves comma-rich agent titles and overflow through transcript summaries', () => {
+    const titles = ['SFT, embedding, reward, PRM trainers', 'On-policy/seq KD, GOLD, SSD', 'Review "quoted" code', ...Array.from({ length: 6 }, (_, i) => `worker-${i}`)]
+    const display = summarizeToolStartDisplay('SpawnAgents', '', JSON.stringify({ agents: titles.map(title => ({ title })), wait: true }))
+    expect(spawnRosterFromLine(buildToolTrailLine('SpawnAgents', display.context))).toEqual({ names: titles.slice(0, 8), extra: 1 })
+  })
+
+  it('does not cut off identities in a long roster', () => {
+    const titles = Array.from({ length: 8 }, (_, i) => `${i}: ${'long title '.repeat(12)}, end`)
+    const display = summarizeToolStartDisplay('SpawnAgents', '', JSON.stringify({ agents: titles.map(title => ({ title })) }))
+    expect(spawnRosterFromLine(buildToolTrailLine('SpawnAgents', display.context))?.names).toEqual(titles)
+    expect(summarizeToolStartDisplay('SpawnAgents', display.context, '{"agents":[')).toEqual(display)
+  })
+
+  it('reconciles legacy title fragments against real agents', () => {
+    const names = ['SFT', 'embedding', 'reward', 'PRM trainers', 'reviewer']
+    const aliases = new Map([['sft, embedding, reward, prm trainers', {}], ['reviewer', {}]])
+    expect(reconcileSpawnRoster(names, aliases)).toEqual(['SFT, embedding, reward, PRM trainers', 'reviewer'])
+  })
   it('summarizes SpawnAgents without exposing prompt arguments', () => {
     const args = JSON.stringify({
       agents: [
