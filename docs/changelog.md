@@ -7,6 +7,19 @@ describe the earlier implementation and are not current setup instructions.
 
 ---
 
+## 0.4.3 — 2026-09-07
+
+- Redesigned operational TUI dialogs, forms, empty states, and capability guides.
+- Added SSH config host discovery, remote project folder browsing, and automatic
+  installation and updates of managed remote Xerxes builds.
+- Added Plugin Creator mode with native TypeScript plugin examples and Bun tests.
+- Exposed custom-agent editing and skill/plugin controls, with project specialist
+  discovery and Claude-style agent workflows.
+- Improved goal configuration, provider/model discovery, reasoning visibility,
+  session restoration, and attachment handling.
+- Fixed bang-command output and exit codes; command results now receive a model
+  follow-up and remain available when restoring the conversation.
+
 ## 0.4.0 — 2026-09-03
 
 - Published the native distribution under the scoped npm identity
