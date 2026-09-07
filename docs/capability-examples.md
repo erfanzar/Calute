@@ -113,3 +113,13 @@ For browser tools, supply an already-running Chromium-compatible browser endpoin
 | `/help` | Find commands and keyboard shortcuts. |
 
 These examples are walkthroughs, not proof of live external connectivity. The plugin reference test uses a temporary manifest, makes no network calls and leaves real plugin configuration untouched.
+
+### Run a shell command and discuss the result
+
+Type `!ls` (or another `!command`) to execute it in the project directory.
+Xerxes displays stdout/stderr and nonzero exit codes, then asks the model to
+review the result without rerunning the command. The submitted context retains
+the command and output for later turns and session restoration. `{!pwd}` inside
+a normal prompt substitutes command output without creating a separate follow-up.
+If the model is already working, a new `!command` waits in the queue so its
+follow-up does not race the active turn.

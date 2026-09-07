@@ -15,8 +15,8 @@ export type SubmitDecision =
 
 /**
  * Decide what an Enter press means, given the trimmed draft, whether the agent
- * is mid-turn, and how many items are queued. Slash/shell commands bypass this
- * (they run immediately); this governs plain messages and the empty-Enter
+ * is mid-turn, and how many items are queued. Slash commands bypass this;
+ * shell commands have their own busy-session queue guard. This governs plain messages and the empty-Enter
  * interrupt/drain gesture.
  */
 export function decideSubmit(draft: string, busy: boolean, queueLen: number): SubmitDecision {

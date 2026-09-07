@@ -11,9 +11,6 @@ document records the remaining unsupported control surfaces for that path.
 ## Explicitly Stubbed in the TUI
 
 - `terminal.resize`: needs a daemon-visible terminal geometry update endpoint.
-- `shell.exec`: bang-command execution is not exposed through daemon slash.
-  The UI reports an explicit nonzero result instead of a false successful
-  exit; use an agent turn with the native process tool surface instead.
 - `clipboard.paste`, `paste.collapse`, `input.detect_drop`: local TUI helpers only.
 - `voice.toggle`, `voice.record`: needs voice capture/transcription endpoints.
 - `plugins.manage`: needs plugin install/enable/disable RPCs.
@@ -28,6 +25,11 @@ document records the remaining unsupported control surfaces for that path.
 - `model.disconnect`, `model.save_key`: needs provider credential management RPCs.
 
 ## Supported by the Bun v35 Cutover
+
+- `shell.exec` maps to native `slash` bang commands. The adapter preserves
+  stdout, stderr and exit codes. Standalone `!command` shows the result and
+  submits it as context for a model follow-up in the same session. Inline
+  `{!command}` interpolation only substitutes output into its enclosing prompt.
 
 - `session.create`, `session.resume`, `session.activate` map to `initialize`.
 - `prompt.submit` maps to `turn.submit`. Pending `/image <path>` attachments

@@ -312,6 +312,13 @@ export function shellResultFromSlashResponse(response: Record<string, unknown>):
   readonly stderr: string
   readonly stdout: string
 } {
+  if (typeof response.code === 'number' && Number.isInteger(response.code)) {
+    return {
+      code: response.code,
+      stdout: typeof response.stdout === 'string' ? response.stdout : '',
+      stderr: typeof response.stderr === 'string' ? response.stderr : ''
+    }
+  }
   if (response.ok === false) {
     return {
       code: 127,

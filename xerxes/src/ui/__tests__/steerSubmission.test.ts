@@ -258,3 +258,41 @@ describe('steer submission acknowledgement', () => {
     }
   })
 })
+
+it.each([0, 2])('shows shell output and starts one model follow-up for exit %s', async code => {
+  const request = vi.fn(async (method: string) => method === 'shell.exec' ? { code, stdout: 'src\nREADME.md', stderr: code ? 'partial failure' : '' } : { ok: true })
+  patchUiState({ busy: false, sid: 'session-a' })
+  const fixture = await mountSubmission(request)
+  try {
+    await act(async () => { fixture.submission.dispatchSubmission('!ls'); await Bun.sleep(0) })
+    await fixture.rendered.flush()
+    expect(fixture.sys).toHaveBeenCalledWith(code ? 'src\nREADME.md\npartial failure' : 'src\nREADME.md')
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(request).toHaveBeenLastCalledWith('prompt.submit', expect.objectContaining({ session_id: 'session-a', text: expect.stringContaining('stdout:\nsrc\nREADME.md'), display_text: expect.stringContaining('README.md') }))
+    expect(getUiState().busy).toBe(true)
+  } finally { act(() => fixture.rendered.renderer.destroy()) }
+})
+
+it('keeps visible output and releases busy state if shell follow-up is rejected', async () => {
+  const request = vi.fn(async (method: string) => { if (method === 'shell.exec') return { code: 0, stdout: 'files', stderr: '' }; throw new Error('provider unavailable') })
+  patchUiState({ busy: false, sid: 'session-a' })
+  const fixture = await mountSubmission(request)
+  try {
+    await act(async () => { fixture.submission.dispatchSubmission('!ls'); await Bun.sleep(0) }); await fixture.rendered.flush()
+    expect(fixture.sys).toHaveBeenCalledWith('files')
+    expect(fixture.sys).toHaveBeenCalledWith('error: provider unavailable')
+    expect(getUiState().busy).toBe(false)
+  } finally { act(() => fixture.rendered.renderer.destroy()) }
+})
+
+it('queues a bang command while the model is working instead of racing its follow-up', async () => {
+  const request = vi.fn()
+  patchUiState({ busy: true, sid: 'session-a' })
+  const fixture = await mountSubmission(request)
+  try {
+    act(() => fixture.submission.dispatchSubmission('!ls'))
+    expect(request).not.toHaveBeenCalled()
+    expect(fixture.queueRef.current[0]?.submitText).toBe('!ls')
+    expect(getUiState().busy).toBe(true)
+  } finally { act(() => fixture.rendered.renderer.destroy()) }
+})

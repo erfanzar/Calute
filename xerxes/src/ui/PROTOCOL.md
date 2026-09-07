@@ -1373,3 +1373,9 @@ lock prevents concurrent installation; errors preserve previous releases. Bun
 1.3+ is installed when absent/outdated. SSH retains terminal ownership during
 setup and the remote TUI; exiting restores the local renderer. No provider
 credentials, project files, or existing Xerxes installations are overwritten.
+
+Bang-command adapter responses preserve native `{code,stdout,stderr}` even when
+`ok:false` denotes a nonzero process exit. The TUI displays these streams before
+submitting one `turn.submit` through `prompt.submit`, carrying command/output as
+context and retaining output in `display_text`. Session switches and explicit
+interrupts suppress late automatic follow-ups. Interpolation remains output-only.

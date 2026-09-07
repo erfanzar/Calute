@@ -360,6 +360,10 @@ describe('isResponseFrame', () => {
 })
 
 describe('shellResultFromSlashResponse', () => {
+  it('preserves native stdout, stderr and nonzero exit codes', () => {
+    expect(shellResultFromSlashResponse({ ok: true, code: 0, stdout: 'src\nREADME.md\n', stderr: '' })).toEqual({ code: 0, stdout: 'src\nREADME.md\n', stderr: '' })
+    expect(shellResultFromSlashResponse({ ok: false, code: 2, stdout: 'partial\n', stderr: 'failed\n' })).toEqual({ code: 2, stdout: 'partial\n', stderr: 'failed\n' })
+  })
   it('does not turn an unsupported Bun bang command into a false code-0 success', () => {
     expect(shellResultFromSlashResponse({ ok: false, error: 'Bang commands are not supported.' })).toEqual({
       code: 127,
