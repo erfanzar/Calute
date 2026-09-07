@@ -2370,6 +2370,14 @@ export class DaemonServer {
         return { ok: true, review: await workspaces.inspect(params.workspace_id) };
       } catch (error) { return { ok: false, error: errorMessage(error) }; }
     }
+    if (method === "background.status") {
+      const owner = this.terminalOwnerSessionId(connection, params);
+      return {
+        ok: true,
+        shells: (this.terminalRegistry?.list(owner) ?? []).filter(terminal => terminal.running).length,
+        watchers: (this.monitors?.list(owner) ?? []).filter(watch => watch.state === 'watching').length,
+      };
+    }
     if (method === "terminal.list") {
       const ownerSessionId = this.terminalOwnerSessionId(connection, params);
       return { ok: true, terminals: this.terminalRegistry?.list(ownerSessionId) ?? [] };

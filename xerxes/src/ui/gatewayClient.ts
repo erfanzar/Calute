@@ -901,6 +901,7 @@ export class GatewayClient extends EventEmitter {
         }) as Promise<T>
 
       case 'tool.inventory':
+      case 'background.status':
       case 'snapshot.list':
       case 'snapshot.preview':
       case 'snapshot.restoreFile':

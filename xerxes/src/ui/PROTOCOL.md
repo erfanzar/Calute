@@ -1369,6 +1369,13 @@ Lines have `kind`, `text`, and optional `oldLine`/`newLine`. Untracked text is
 represented as additions, so it supports the same file navigation as tracked changes.
 Git output, duration and rendered rows are bounded; symlinks are not followed.
 
+`background.status` is a read-only session-scoped RPC returning
+`{ok:true,shells:number,watchers:number}`. It counts currently running terminal
+registry entries and monitors in the `watching` state, without reading output or
+consuming events. The gateway maps `session_id` to `session_key`. The composer
+refreshes every two seconds even while idle, discards late replies after a session
+switch, and opens terminals/monitors when their blue counts are clicked.
+
 `slash.exec` also exposes local extension management: `skills search <query>`,
 `skills browse`, `skills install <directory-or-SKILL.md>`, `plugins install
 <module.ts>`, and `plugins enable|disable <name-or-path>`. Host availability,

@@ -9,6 +9,9 @@ describe the earlier implementation and are not current setup instructions.
 
 ## Unreleased
 
+- Added live blue shell/watcher counts beside the composer settings, including
+  while idle. Click a count to inspect background work; completed work clears.
+
 - Remote workspaces now render locally over a private SSH-forwarded daemon
   socket. Tunnel failures return to the original local workspace.
 - F7 collects changes on the daemon host and includes navigable untracked-file

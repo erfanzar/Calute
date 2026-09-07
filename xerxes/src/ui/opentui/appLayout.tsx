@@ -5,6 +5,7 @@
 // scrollbox transcript (native sticky-scroll), a native <textarea>
 // composer, approval/confirm/clarify prompts, and compact application chrome.
 import { DialogHeader, DialogFooter } from './dialogChrome.js'
+import { BackgroundStatus } from './backgroundStatus.js'
 import type { KeyBinding, KeyEvent, ScrollBoxRenderable, TextareaRenderable, TextRenderable } from '@opentui/core'
 import { useBlur, useFocus, useKeyboard, usePaste, useTerminalDimensions } from '@opentui/react'
 import { useStore } from '@nanostores/react'
@@ -1283,6 +1284,7 @@ export function Composer({ composer }: Pick<AppLayoutProps, 'composer'>) {
         </Box>
         <Box flexDirection="column" flexShrink={0} paddingX={1}>
           <Box flexDirection="column" flexShrink={0} width="100%">
+            <Box flexDirection="row" flexWrap="wrap" flexShrink={0}>
             <Text wrap="wrap">
               <Span color={modeIsDefault ? t.ds.secondary : t.color.accent}>{'◆ ' + modeLabel + ' mode'}</Span>
               <Span color={t.ds.separator}>{' · '}</Span>
@@ -1296,6 +1298,8 @@ export function Composer({ composer }: Pick<AppLayoutProps, 'composer'>) {
                 </Span>
               )}
             </Text>
+            <BackgroundStatus sessionId={ui.sid} t={t} />
+            </Box>
             {narrow ? (
               <Text color={yoloEnabled ? t.color.warn : t.ds.meta} wrap="wrap">
                 {writePolicyLabel(ui.info?.permission_mode)}

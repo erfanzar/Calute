@@ -9969,3 +9969,27 @@ test('workspace.diff reads untracked content in the daemon project without trust
     expect(response.result).toMatchObject({ kind: 'ok', diff: { untracked: expect.arrayContaining(['new.ts']), lines: expect.arrayContaining([{ kind: 'add', text: '+export const remote = true', newLine: 1 }]) } });
   } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
 });
+
+test('background.status counts live session-owned shells and watchers while idle', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xr-background-status-'));
+  const history = new RunHistory(join(directory, 'runs.sqlite'));
+  const terminals = new TerminalRegistry();
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const monitors = new TerminalMonitors(terminals, history, () => {});
+  const server = new DaemonServer({ socketPath: join(directory, 'rpc.sock'), runtime, terminalRegistry: terminals, monitors });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'rpc.sock'));
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'session.open', params: { session_key: 'background-owner' } });
+    await client.next(frame => frame.id === 1);
+    const owner = runtime.sessionStatus('background-owner')!.id;
+    const shell = terminals.open({ id: 'background-shell', ownerSessionId: owner, cwd: directory, command: 'build', kind: 'background' });
+    terminals.open({ id: 'another-session', ownerSessionId: 'other', cwd: directory, command: 'build', kind: 'background' });
+    const watch = monitors.start(owner, { terminalId: 'background-shell', match: 'done' });
+    const status = async (id: number) => { client.send({ jsonrpc: '2.0', id, method: 'background.status', params: {} }); return (await client.next(frame => frame.id === id)).result; };
+    expect(await status(2)).toEqual({ ok: true, shells: 1, watchers: 1 });
+    shell.close(0);
+    monitors.stop(owner, watch.id);
+    expect(await status(3)).toEqual({ ok: true, shells: 0, watchers: 0 });
+  } finally { client.close(); monitors.close(); await server.stop(); history.close(); await rm(directory, { recursive: true, force: true }); }
+});
