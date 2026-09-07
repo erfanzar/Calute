@@ -326,7 +326,7 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    help: 'open remote workspaces over SSH; add or remove saved machines',
+    help: 'remote workspaces: choose SSH config hosts and browse project folders',
     name: 'machine',
     group: 'tools',
     run: async (arg, ctx) => {

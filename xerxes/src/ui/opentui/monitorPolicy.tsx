@@ -8,6 +8,7 @@ import { useOptionalGateway } from '../app/gatewayContext.js'
 import type { MonitorView } from '../lib/monitors.js'
 import type { Theme } from '../theme.js'
 import { Box, Text } from './primitives.js'
+import { DialogHeader, DialogFooter, SettingRow } from './dialogChrome.js'
 
 export function MonitorPolicy({ t, monitor, onClose, onSaved }: { t: Theme; monitor: MonitorView; onClose: () => void; onSaved: () => void }) {
   const gateway = useOptionalGateway()
@@ -40,13 +41,13 @@ export function MonitorPolicy({ t, monitor, onClose, onSaved }: { t: Theme; moni
     else save()
   })
   return <Box flexDirection="column" flexGrow={1} minHeight={0}>
-    <Text bold>Reaction policy · {monitor.match}</Text>
+    <DialogHeader t={t} title={<> Reaction policy · {monitor.match}</>} />
     <scrollbox style={{ flexGrow: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
-      {['Lifetime attempts', 'Timeout seconds', 'Lifetime token threshold'].map((label, index) => <Text key={label} wrap="wrap" color={field === index ? t.color.accent : t.ds.secondary}>{field === index ? '› ' : '  '}{label}: {values[index] || 'unlimited'}</Text>)}
+      {['Lifetime attempts', 'Timeout seconds', 'Lifetime token threshold'].map((label, index) => <SettingRow key={label} t={t} selected={field === index} label={label}>{values[index] || 'unlimited'}</SettingRow>)}
       <textarea key={field} ref={input} focused={!busy} minHeight={1} maxHeight={2} onContentChange={() => { const text = input.current?.plainText ?? ''; setValues(previous => previous.map((value, index) => index === field ? text : value)) }} />
       <Text wrap="wrap">Usage history is retained. Saving may start pending reactions. In-flight calls may overshoot token thresholds.</Text>
       {error ? <Text color={t.color.warn} wrap="wrap">{error}</Text> : null}
     </scrollbox>
-    <Text>{busy ? 'Saving…' : 'Tab field · Enter save · Esc back'}</Text>
+    <DialogFooter t={t}><Text>{busy ? 'Saving…' : 'Tab field · Enter save · Esc back'}</Text></DialogFooter>
   </Box>
 }

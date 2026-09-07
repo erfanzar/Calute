@@ -4,6 +4,7 @@
 // Native OpenTUI view consuming the controller's AppLayoutProps contract:
 // scrollbox transcript (native sticky-scroll), a native <textarea>
 // composer, approval/confirm/clarify prompts, and compact application chrome.
+import { DialogHeader, DialogFooter } from './dialogChrome.js'
 import type { KeyBinding, KeyEvent, ScrollBoxRenderable, TextareaRenderable, TextRenderable } from '@opentui/core'
 import { useBlur, useFocus, useKeyboard, usePaste, useTerminalDimensions } from '@opentui/react'
 import { useStore } from '@nanostores/react'
@@ -1691,10 +1692,21 @@ function openTuiScrollAdapter(scrollbox: ScrollBoxRenderable): ScrollBoxHandle {
 
 function InfoOverlay({ kind }: { kind: 'pluginsHub' | 'skillsHub' }) {
   const t = useStore($uiTheme)
-  const { width } = useTerminalDimensions()
+  const { width, height } = useTerminalDimensions()
+  const guideScroll = useRef<ScrollBoxRenderable | null>(null)
   const close = () => patchOverlayState({ [kind]: false })
 
   useKeyboard(event => {
+    if (event.name === 'home' || event.name === 'end') {
+      event.preventDefault(); event.stopPropagation()
+      guideScroll.current?.scrollTo(event.name === 'home' ? 0 : Number.MAX_SAFE_INTEGER)
+      return
+    }
+    if (['up', 'down', 'pageup', 'pagedown'].includes(event.name)) {
+      event.preventDefault(); event.stopPropagation()
+      guideScroll.current?.scrollBy((event.name === 'up' || event.name === 'pageup' ? -1 : 1) * (event.name.startsWith('page') ? Math.max(1, height - 10) : 1))
+      return
+    }
     if (event.name === 'escape' || event.sequence === 'q') {
       event.preventDefault()
       event.stopPropagation()
@@ -1702,61 +1714,31 @@ function InfoOverlay({ kind }: { kind: 'pluginsHub' | 'skillsHub' }) {
     }
   })
 
-  const title = kind === 'skillsHub' ? 'Native skills' : 'Native plugins'
-
-  return (
-    <box
-      alignItems="center"
-      backgroundColor="#000000cc"
-      flexDirection="column"
-      height="100%"
-      justifyContent="center"
-      left={0}
-      position="absolute"
-      top={0}
-      width="100%"
-      zIndex={180}
-    >
-      <box
-        backgroundColor={t.color.statusBg}
-        flexDirection="column"
-        flexShrink={0}
-        padding={2}
-        width={overlayPanelWidth(width, OVERLAY_PANEL_SPECS.info)}
-      >
-        <box flexDirection="row" flexShrink={0} justifyContent="space-between">
-          <text fg={t.color.accent} flexShrink={0}>
-            <b>{title}</b>
-          </text>
-          <text fg={t.color.muted} flexShrink={0}>
-            esc
-          </text>
-        </box>
-        {kind === 'skillsHub' ? (
-          <>
-            <text fg={t.color.muted} flexShrink={0}>
-              Run /skills to discover skills available to this session.
-            </text>
-            <text fg={t.color.muted} flexShrink={0}>
-              /skills install &lt;local-path&gt; adds a bundle; /skill &lt;name&gt; activates it.
-            </text>
-          </>
-        ) : (
-          <>
-            <text fg={t.color.muted} flexShrink={0}>
-              Run /plugins to inspect loaded native plugins and commands.
-            </text>
-            <text fg={t.color.muted} flexShrink={0}>
-              /plugins install &lt;local-module.ts&gt; · enable &lt;name&gt; · disable &lt;name&gt;
-            </text>
-          </>
-        )}
-        <text fg={t.color.muted} flexShrink={0}>
-          Esc/q close
-        </text>
-      </box>
-    </box>
-  )
+  const skills = kind === 'skillsHub'
+  const title = skills ? 'Native skills' : 'Native plugins'
+  const cards = skills ? [
+    ['Discover', '/skills', 'Find instructions and workflows available to this session.'],
+    ['Add a skill', '/skills install <local-path>', 'Install a local bundle with its examples and reference files.'],
+    ['Use it', '/skill <name>', 'Activate a skill for the work in front of you.'],
+  ] : [
+    ['Inspect', '/plugins', 'See installed native tools and their status.'],
+    ['Create', '/plugin-creator', 'Build a tool plugin with tests and usage examples.'],
+    ['Install', '/plugins install <local-module.ts>', 'Enable a reviewed local module. Keep its source in place.'],
+    ['Manage', '/plugins enable <name> · disable <name>', 'Choose which installed plugins are available.'],
+  ]
+  return <box alignItems="center" backgroundColor="#000000cc" height="100%" justifyContent="center" left={0} position="absolute" top={0} width="100%" zIndex={180}>
+    <Box backgroundColor={t.color.statusBg} borderStyle="round" borderColor={t.color.border} flexDirection="column" paddingX={2} width={overlayPanelWidth(width, OVERLAY_PANEL_SPECS.info)} height={Math.min(height - 2, skills ? 31 : 37)}>
+      <DialogHeader t={t} title={title} subtitle={skills ? 'Reusable expertise for the way you work.' : 'Extend your agent with tools of your own.'} />
+      <scrollbox ref={guideScroll} flexGrow={1} minHeight={0} contentOptions={{ flexDirection: 'column' }}>
+        {cards.map(([label, command, description]) => <Box key={label} flexDirection="column" flexShrink={0} padding={1} marginBottom={1} backgroundColor={t.color.completionMetaBg}>
+          <Text bold color={t.color.text}>{label}</Text>
+          <Text color={t.color.accent} wrap="wrap">{command}</Text>
+          <Text color={t.ds.secondary} wrap="wrap">{description}</Text>
+        </Box>)}
+      </scrollbox>
+      <DialogFooter t={t}><Text color={t.ds.secondary}>↑↓ scroll · Close to run a command · Esc/q close</Text></DialogFooter>
+    </Box>
+  </box>
 }
 
 // ── Layout root ─────────────────────────────────────────────────────────────

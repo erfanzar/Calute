@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useOptionalGateway } from '../app/gatewayContext.js'
 import type { Theme } from '../theme.js'
 import { Box, Text } from './primitives.js'
+import { DialogHeader, DialogFooter } from './dialogChrome.js'
 type Delivery = { id: string; platform: string; recipient: string; state: string; attempts: number; content?: string; error?: string | null }
 function parse(value: unknown): Delivery {
   if (!value || typeof value !== 'object') throw new Error('Invalid delivery response')
@@ -71,7 +72,7 @@ export function DeliveryPanel({ t, scheduleId, onClose }: { t: Theme; scheduleId
     } else if (key.name === 'pageup' || key.name === 'pagedown') scroll.current?.scrollBy(key.name === 'pageup' ? -10 : 10)
   })
   return <Box flexDirection="column" flexGrow={1} minHeight={0}>
-    <Text bold>Deliveries · {Math.max(0, rows.findIndex(row => row.id === selected) + 1)}/{rows.length}</Text>
+    <DialogHeader t={t} title={<> Deliveries · {Math.max(0, rows.findIndex(row => row.id === selected) + 1)}/{rows.length}</>} />
     {error ? <Text color={t.color.warn} wrap="wrap">{error}</Text> : null}
     <scrollbox ref={scroll} style={{ flexGrow: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
       {detail ? <>
@@ -83,7 +84,7 @@ export function DeliveryPanel({ t, scheduleId, onClose }: { t: Theme; scheduleId
     </scrollbox>
     {confirm ? <Text color={t.color.warn} wrap="wrap">{confirm === 'sent' ? 'Confirm you verified this reached the destination.' : 'Allow retry after checking the destination. A duplicate message is possible.'} Enter confirms · Esc cancels</Text> : <>
       <Text color={t.ds.secondary}>{busy ? 'Working…' : detail?.state === 'pending' ? 'S send saved output' : detail?.state === 'uncertain' ? 'A mark sent · T allow retry' : 'No delivery action available'}</Text>
-      <Text color={t.ds.secondary}>↑↓ select · R refresh · Esc back</Text>
+      <DialogFooter t={t}><Text color={t.ds.secondary}>↑↓ select · R refresh · Esc back</Text></DialogFooter>
     </>}
   </Box>
 }

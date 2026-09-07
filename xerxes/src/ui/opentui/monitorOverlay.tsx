@@ -12,13 +12,14 @@ import { overlayPanelSize } from './overlayLayout.js'
 import { MonitorPolicy } from './monitorPolicy.js'
 import { MonitorCreate } from './monitorCreate.js'
 import { Box, Text } from './primitives.js'
+import { DialogHeader, DialogFooter, DialogEmpty, DialogSection } from './dialogChrome.js'
 
 export function MonitorOverlay({ t }: { t: Theme }) {
   const gateway = useOptionalGateway()
   const terminal = useTerminalDimensions()
   const [editing, setEditing] = useState<MonitorView | null>(null)
   const [creating, setCreating] = useState(false)
-  const size = overlayPanelSize(terminal, { maxWidth: creating ? 120 : 180, minWidth: 32, ...(creating ? { desiredHeight: 32 } : {}) })
+  const size = overlayPanelSize(terminal, { maxWidth: creating ? 120 : 124, maxHeight: 38, minWidth: 32, ...(creating ? { desiredHeight: 32 } : {}) })
   const [rows, setRows] = useState<MonitorView[]>([])
   const [selected, setSelected] = useState('')
   const [detail, setDetail] = useState<MonitorView | null>(null)
@@ -88,23 +89,23 @@ export function MonitorOverlay({ t }: { t: Theme }) {
     else scroll.current?.scrollBy((key.name === 'pageup' ? -1 : 1) * Math.max(1, size.height - 10))
   })
   const wide = size.width >= 100
-  const count = wide ? Math.max(1, Math.floor((size.height - 6) / 2)) : 3
+  const count = wide ? Math.max(1, Math.floor((size.height - 13) / 2)) : 3
   const start = Math.max(0, rows.findIndex(row => row.id === selected) - count + 1)
   return <box position="absolute" left={0} top={0} width="100%" height="100%" zIndex={150} backgroundColor="#000000cc" alignItems="center" justifyContent="center">
-    <Box width={size.width} height={size.height} flexDirection="column" paddingX={1} borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
+    <Box width={!rows.length && !creating && !editing ? Math.min(88, size.width) : size.width} height={!rows.length && !creating && !editing ? Math.min(24, size.height) : size.height} flexDirection="column" paddingX={1} borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
       {editing ? <MonitorPolicy t={t} monitor={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); setRefresh(value => value + 1) }} /> : creating ? <MonitorCreate t={t} onClose={() => setCreating(false)} onCreated={id => { setCreating(false); setSelected(id); setRefresh(value => value + 1) }} /> : <>
-      <Text bold color={t.color.text}>Monitors · {rows.filter(row => row.state === 'watching').length} watching</Text>
+      <DialogHeader t={t} title={<>Monitors · {rows.filter(row => row.state === 'watching').length} watching</>} subtitle="Watch for changes. Keep the important events in view." />
       {error ? <Text color={t.color.warn} wrap="wrap">{error}</Text> : null}
-      <Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0}>
+      {!rows.length ? <DialogEmpty t={t} title="No watches in this session." description="Watch a file, terminal or connected source." action="+ N  Create monitor" onAction={() => setCreating(true)} symbol="◎" /> : (<Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0}>
         <Box width={wide ? '35%' : '100%'} height={wide ? '100%' : Math.min(6, rows.length * 2 + 1)} flexDirection="column" paddingRight={1}>
           {rows.length ? rows.slice(start, start + count).map(row => <Box key={row.id} height={2} flexDirection="column" backgroundColor={row.id === selected ? t.ds.selected : undefined} onMouseDown={() => setSelected(row.id)}>
             <Text color={t.color.text} wrap="truncate-end">{row.source?.kind === 'file' ? `File changes · ${row.source.path}` : row.source?.kind === 'websocket' ? `Websocket · ${row.source.url}` : row.source?.kind === 'webhook' ? `Webhook · ${row.source.name}` : row.match}</Text>
             <Text color={t.ds.secondary} wrap="truncate-end">{row.state} · {row.source?.kind === 'file' ? row.source.workspace : row.source?.kind === 'websocket' ? 'server push' : row.source?.kind === 'webhook' ? 'configured source' : row.terminalId}</Text>
-          </Box>) : <Text color={t.ds.secondary}>No watches in this session.</Text>}
+          </Box>) : <DialogEmpty t={t} title="No watches in this session." description="Watch a file, terminal or connected source." action="+ N  Create monitor" onAction={() => setCreating(true)} symbol="◎" />}
         </Box>
         <scrollbox ref={scroll} style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
           {detail ? <Box flexDirection="column" flexShrink={0}>
-            <Text bold color={t.color.text} wrap="wrap">{detail.source?.kind === 'file' ? `File changes: ${detail.source.path}` : detail.source?.kind === 'websocket' ? `Websocket: ${detail.source.url}` : detail.source?.kind === 'webhook' ? `Webhook: ${detail.source.name}` : `Match: ${detail.match}`}</Text>
+            <DialogSection t={t}>SOURCE</DialogSection><Text bold color={t.color.text} wrap="wrap">{detail.source?.kind === 'file' ? `File changes: ${detail.source.path}` : detail.source?.kind === 'websocket' ? `Websocket: ${detail.source.url}` : detail.source?.kind === 'webhook' ? `Webhook: ${detail.source.name}` : `Match: ${detail.match}`}</Text>
             <Text color={t.ds.secondary} wrap="wrap">{detail.state} · {detail.reaction}</Text>
             {detail.source?.kind === 'file' ? <Text color={t.ds.secondary} wrap="wrap">Workspace: {detail.source.workspace} · metadata changes only</Text> : null}
             {detail.source?.kind === 'websocket' ? <Text color={t.ds.secondary} wrap="wrap">Text-only server push · duplicates suppressed · reconnect gaps possible</Text> : null}
@@ -113,12 +114,13 @@ export function MonitorOverlay({ t }: { t: Theme }) {
             {detail.sourceStatus ? <Text color={t.ds.secondary} wrap="wrap">{detail.sourceStatus}</Text> : null}
             {detail.error ? <Text color={t.color.warn} wrap="wrap">{detail.error}</Text> : null}
             {detail.omittedEvents ? <Text color={t.ds.secondary}>Earlier events: {detail.omittedEvents} · inspect Runs for history</Text> : null}
-            <Text color={t.color.text} wrap="wrap">{detail.events.join('\n\n') || 'No matching events yet.'}</Text>
+            <DialogSection t={t}>RECENT EVENTS</DialogSection><Text color={t.color.text} wrap="wrap">{detail.events.join('\n\n') || 'No matching events yet.'}</Text>
           </Box> : <Text color={t.ds.secondary}>Select a watch to inspect.</Text>}
         </scrollbox>
-      </Box>
-      <Text color={t.ds.secondary}>{busy ? 'Applying cancellation…' : size.width < 60 ? actionLabel : `N new · ↑↓ select · ${actionLabel}`}</Text>
-      <Text color={t.ds.secondary}>{size.width < 60 ? 'E limits · N new · Esc close' : 'E edit limits · R refresh · PgUp/Dn · Esc close'}</Text>
+      </Box>)}
+
+      <DialogFooter t={t}><Text color={t.ds.secondary}>{busy ? 'Applying cancellation…' : !rows.length ? 'N new · R refresh · Esc close' : size.width < 60 ? actionLabel : `N new · ↑↓ select · ${actionLabel}`}</Text>
+      {rows.length ? <Text color={t.ds.secondary}>{size.width < 60 ? 'E limits · N new · Esc close' : 'E edit limits · R refresh · PgUp/Dn · Esc close'}</Text> : null}</DialogFooter>
       </>}
     </Box>
   </box>

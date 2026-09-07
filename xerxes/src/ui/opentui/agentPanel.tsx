@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 /** @jsxImportSource @opentui/react */
 
+import { DialogEmpty } from './dialogChrome.js'
 import { useStore } from '@nanostores/react'
 import type { KeyEvent, ScrollBoxRenderable } from '@opentui/core'
 import { useKeyboard, useTerminalDimensions } from '@opentui/react'
@@ -913,12 +914,7 @@ function AgentPanelBody({
       </Box>
       ) : (
         // The empty panel has a compact frame and only the close action.
-        <Box alignItems="center" flexDirection="column" flexGrow={1} flexShrink={1} justifyContent="center" minHeight={0}>
-          <Text bold color={t.ds.title}>No agents yet</Text>
-          <Text color={t.ds.secondary}>
-            Delegated work appears here.
-          </Text>
-        </Box>
+        <DialogEmpty t={t} title="No agents yet" description="Delegated work appears here." symbol="✦" />
       )}
       {/* Truncate rather than wrap: on a narrow panel this hint wrapped to two
           rows and, now that the frame is bounded, those rows came out of the

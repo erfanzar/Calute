@@ -11,6 +11,7 @@ import { patchOverlayState } from '../app/overlayStore.js'
 import type { Theme } from '../theme.js'
 import { overlayPanelSize } from './overlayLayout.js'
 import { Box, Text } from './primitives.js'
+import { DialogHeader, DialogFooter, DialogEmpty, DialogSection } from './dialogChrome.js'
 
 import { DeliveryPanel } from './deliveryPanel.js'
 import { RunOverlay } from './runOverlay.js'
@@ -39,7 +40,7 @@ export function ScheduleOverlay({ t, followupsOnly = false }: { t: Theme; follow
   const [deliveryId, setDeliveryId] = useState<string | null>(null)
   const [historyId, setHistoryId] = useState<string | null>(null)
   const [editing, setEditing] = useState<ScheduleDraft | 'new' | null>(null)
-  const size = overlayPanelSize(terminal, { maxWidth: editing ? 132 : 180, minWidth: 32, ...(editing ? { desiredHeight: 38 } : {}) })
+  const size = overlayPanelSize(terminal, { maxWidth: editing ? 132 : 124, maxHeight: 40, minWidth: 32, ...(editing ? { desiredHeight: 38 } : {}) })
   const [jobs, setJobs] = useState<Job[]>([])
   const [selected, setSelected] = useState('')
   const [error, setError] = useState('')
@@ -96,27 +97,33 @@ export function ScheduleOverlay({ t, followupsOnly = false }: { t: Theme; follow
     } else scroll.current?.scrollBy((key.name === 'pageup' ? -1 : 1) * Math.max(1, size.height - 10))
   })
   const wide = size.width >= 100
-  const count = wide ? Math.max(1, size.height - 7) : 3
+  const count = wide ? Math.max(1, size.height - 14) : 3
   const start = Math.max(0, jobs.findIndex(row => row.id === selected) - count + 1)
   if (historyId) return <RunOverlay t={t} scheduleId={historyId} onClose={() => setHistoryId(null)} />
   return <box position="absolute" left={0} top={0} width="100%" height="100%" zIndex={150} backgroundColor="#000000cc" alignItems="center" justifyContent="center">
-    <Box width={size.width} height={size.height} flexDirection="column" paddingX={1} borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
+    <Box width={!jobs.length && !editing && !deliveryId ? Math.min(88, size.width) : size.width} height={!jobs.length && !editing && !deliveryId ? Math.min(24, size.height) : size.height} flexDirection="column" paddingX={1} borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
       {deliveryId ? <DeliveryPanel t={t} scheduleId={deliveryId} onClose={() => { setDeliveryId(null); setRefresh(value => value + 1) }} /> : editing ? <ScheduleForm t={t} followup={followupsOnly} initial={editing === 'new' ? undefined : editing} onClose={() => setEditing(null)} onSaved={id => { setEditing(null); setSelected(id); setRefresh(value => value + 1) }} /> : <>
-      <Text bold color={t.color.text}>{followupsOnly ? "Follow-ups · this conversation" : "Schedules · current workspace"}</Text>
+      <DialogHeader t={t} title={followupsOnly ? "Follow-ups · this conversation" : "Schedules · current workspace"} subtitle="Set a rhythm for your work. Review results when you return." />
       {error ? <Text color={t.color.warn} wrap="wrap">{error}</Text> : null}
-      <Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0}>
+      {!jobs.length ? <DialogEmpty t={t} title={followupsOnly ? "No conversation follow-ups." : "No workspace schedules."} description="Schedule a task and return to its results." action="+ N  Create schedule" onAction={() => setEditing('new')} symbol="◷" /> : (<Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0} gap={wide ? 2 : 0}>
         <Box width={wide ? '35%' : '100%'} flexDirection="column" paddingRight={1}>
-          {jobs.length ? jobs.slice(start, start + count).map(row => <Text key={row.id} color={row.id === selected ? t.color.accent : t.color.text} wrap="truncate-end">{row.id === selected ? '› ' : '  '}{row.paused ? 'Ⅱ ' : '● '}{row.prompt}</Text>) : <Text color={t.ds.secondary}>{followupsOnly ? "No conversation follow-ups. Press N to create one." : "No workspace schedules."}</Text>}
+          {jobs.length ? jobs.slice(start, start + count).map(row => <Text key={row.id} color={row.id === selected ? t.color.accent : t.color.text} wrap="truncate-end">{row.id === selected ? '› ' : '  '}{row.paused ? 'Ⅱ ' : '● '}{row.prompt}</Text>) : <DialogEmpty t={t} title={followupsOnly ? "No conversation follow-ups." : "No workspace schedules."} description="Give a recurring task its own schedule." action="+ N  Create schedule" onAction={() => setEditing('new')} symbol="◷" />}
         </Box>
         <scrollbox ref={scroll} style={{ flexGrow: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
           {job ? <Box flexDirection="column" flexShrink={0}>
-            <Text bold wrap="wrap">{job.prompt}</Text>
+                        {typeof job.metadata?.last_error === 'string' ? <Text color={t.color.warn} wrap="wrap">{job.metadata.last_error}</Text> : null}
+            {job.metadata?.execution_recovery_required === true ? <Text color={t.color.warn} wrap="wrap">Review run output before resuming. Resume acknowledges possible prior effects; a one-shot may execute again.</Text> : null}
+            {job.metadata?.delivery_state === 'failed' ? <>
+              <Text color={t.color.warn} wrap="wrap">Output delivery failed: {String(job.metadata.delivery_error ?? 'Unknown delivery error')}</Text>
+              {typeof job.metadata.delivery_archive === 'string' ? <Text color={t.ds.secondary} wrap="wrap">Archived: {job.metadata.delivery_archive}</Text> : null}
+            </> : null}
+<DialogSection t={t}>TASK</DialogSection><Text bold wrap="wrap">{job.prompt}</Text>
             <Text wrap="wrap">{job.paused ? 'Paused' : 'Enabled'} · {job.execution_state}</Text>
-            <Text wrap="wrap">Schedule: {job.interval_seconds != null ? `Every ${job.interval_seconds}s` : job.schedule ? `${job.schedule} (${job.timezone ?? 'UTC'})` : 'One-shot'}</Text>
+            <DialogSection t={t}>TIMING</DialogSection><Text wrap="wrap">Schedule: {job.interval_seconds != null ? `Every ${job.interval_seconds}s` : job.schedule ? `${job.schedule} (${job.timezone ?? 'UTC'})` : 'One-shot'}</Text>
             <Text wrap="wrap">Next: {job.next_run_at || 'Not scheduled'}</Text>
             <Text wrap="wrap">Missed runs: {job.missed_run_policy ?? "coalesce"} · Allowance: {job.misfire_grace_seconds ?? 300}s · Overlap: forbidden</Text>
             {job.metadata?.last_missed_run ? <Text color={t.color.warn} wrap="wrap">An overdue occurrence was skipped. Review timing before resuming a one-shot.</Text> : null}
-            <Text wrap="wrap">Delivery: {job.deliver && job.deliver !== "none" && job.deliver !== "workspace" ? `${job.deliver} → ${job.recipient || "recipient missing"}` : "Archive only"}</Text>
+            <DialogSection t={t}>DELIVERY</DialogSection><Text wrap="wrap">Delivery: {job.deliver && job.deliver !== "none" && job.deliver !== "workspace" ? `${job.deliver} → ${job.recipient || "recipient missing"}` : "Archive only"}</Text>
             <Text wrap="wrap">Target: {job.target_session_id ? "Conversation " + job.target_session_id : "Independent"}</Text>
             {job.stop_condition ? <Text wrap="wrap">Stop when: {job.stop_condition}</Text> : null}
             {job.metadata?.followup_completion ? <Text color={t.color.ok} wrap="wrap">Condition reported met by model. Future wakes stopped; explicit resume rearms.</Text> : null}
@@ -124,27 +131,22 @@ export function ScheduleOverlay({ t, followupsOnly = false }: { t: Theme; follow
               const value = item && typeof item === 'object' ? item as Record<string, unknown> : {}
               return typeof value.evidence === 'string' ? <Text key={index} wrap="wrap">Model report ({String(value.at ?? '')}): {value.evidence}</Text> : null
             }) : null}
-            <Text wrap="wrap">Expiry: {job.expires_at ?? "none"} (new attempts only)</Text>
+            <DialogSection t={t}>LIMITS & USAGE</DialogSection><Text wrap="wrap">Expiry: {job.expires_at ?? "none"} (new attempts only)</Text>
             <Text wrap="wrap">Lifetime attempts: {job.runs_started ?? 0} / {job.max_runs ?? "unlimited"}</Text>
             <Text wrap="wrap">Model calls per run: {job.max_model_calls ?? "unlimited"}</Text>
             <Text wrap="wrap">{scheduleUsageLabel(job.metadata?.token_usage)}</Text>
             <Text wrap="wrap">{scheduleTokensLabel(parseScheduleTokens((job as Job & { token_budget?: unknown }).token_budget))}</Text>
             <Text wrap="wrap">Token threshold blocks new calls; in-flight calls may overshoot.</Text>
-            <Text wrap="wrap">Last: {job.last_run_at || 'Never'}</Text>
+            <DialogSection t={t}>LAST RUN</DialogSection><Text wrap="wrap">Last: {job.last_run_at || 'Never'}</Text>
             <Text wrap="wrap">Timeout: {job.timeout_seconds == null ? 'daemon default' : `${job.timeout_seconds}s`} · One-shot retries: {job.max_retries ?? 'daemon default'}</Text>
-            {typeof job.metadata?.last_error === 'string' ? <Text color={t.color.warn} wrap="wrap">{job.metadata.last_error}</Text> : null}
-            {job.metadata?.execution_recovery_required === true ? <Text color={t.color.warn} wrap="wrap">Review run output before resuming. Resume acknowledges possible prior effects; a one-shot may execute again.</Text> : null}
-            {job.metadata?.delivery_state === 'failed' ? <>
-              <Text color={t.color.warn} wrap="wrap">Output delivery failed: {String(job.metadata.delivery_error ?? 'Unknown delivery error')}</Text>
-              {typeof job.metadata.delivery_archive === 'string' ? <Text color={t.ds.secondary} wrap="wrap">Archived: {job.metadata.delivery_archive}</Text> : null}
-            </> : null}
             <Text color={t.ds.secondary} wrap="wrap">Pause stops future runs. Cancel requests cleanup of the active run.</Text>
           </Box> : <Text color={t.ds.secondary} wrap="wrap">Press N to create a job. Jobs run while the owning daemon is online.</Text>}
         </scrollbox>
-      </Box>
-      <Text color={t.ds.secondary}>D deliveries</Text>
+      </Box>)}
+
+      <DialogFooter t={t}>{jobs.length ? <><Text color={t.ds.secondary}>D deliveries</Text>
       <Text color={t.ds.secondary}>P pause/resume · G run · X cancel</Text>
-      <Text color={t.ds.secondary}>N new · E edit · H history · Esc</Text>
+      <Text color={t.ds.secondary}>N new · E edit · H history · Esc</Text></> : <Text color={t.ds.secondary}>N new · R refresh · Esc close</Text>}</DialogFooter>
       </>}
     </Box>
   </box>

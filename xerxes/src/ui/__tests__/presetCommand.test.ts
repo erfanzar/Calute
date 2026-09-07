@@ -6,6 +6,20 @@ import { describe, expect, it } from 'vitest'
 import { findSlashCommand } from '../app/slash/registry.js'
 
 describe('/preset slash command', () => {
+  it('opens plugin creator with its preset and refuses switching during a busy turn', () => {
+    const sessions: string[] = []
+    let busy = true
+    const ctx = { session: {
+      guardBusySessionSwitch: () => busy,
+      newSession: (_message: string, _title: string, preset: string) => sessions.push(preset),
+    } } as never
+    const command = findSlashCommand('plugin-creator')!
+    command.run('', ctx, 'plugin-creator')
+    expect(sessions).toEqual([])
+    busy = false
+    command.run('', ctx, 'plugin-creator')
+    expect(sessions).toEqual(['plugin-creator'])
+  })
   it('lists the DSH-style roster and selects Creator mode through typed RPCs', async () => {
     const calls: Array<{ method: string; params: Record<string, unknown> }> = []
     const pages: string[] = []

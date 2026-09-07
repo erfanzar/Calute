@@ -1,5 +1,7 @@
 # Bun / TypeScript examples
 
+See [capability examples](../docs/capability-examples.md) for TUI walkthroughs covering plugins, specialists, skills, models, goals, terminals, schedules, monitors and machines. `/plugin-creator` starts plugin authoring; [plugins/text-stats.ts](plugins/text-stats.ts) is a portable reference.
+
 Each example is a native Bun/TypeScript program. The TypeScript versions use the native runtime directly and default to a local,
 deterministic LLM or host port, so running an example never reads provider
 credentials from the environment or makes a network call.

@@ -624,6 +624,18 @@ function hardcodedBuiltinDefinitions(): ReadonlyMap<string, AgentDefinition> {
       isolation: '',
     },
     {
+      name: 'plugin-creator',
+      description: 'Build and test native Xerxes tool plugins with usage examples.',
+      systemPrompt: 'You are in Xerxes Plugin Creator mode. Load authoring-tool-plugins before writing. Create a native TypeScript register(registry) tool module, Bun tests and README examples. Preserve existing files. Run tests. Managed installation supports tool plugins only. Give /plugins install instructions; install only when requested.',
+      model: '',
+      tools: standardTools,
+      allowedTools: null,
+      excludeTools: [],
+      source: 'built-in',
+      maxDepth: 5,
+      isolation: '',
+    },
+    {
       name: 'general-purpose',
       description: 'General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks.',
       systemPrompt: '',

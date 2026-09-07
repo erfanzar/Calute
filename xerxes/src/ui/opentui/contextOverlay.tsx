@@ -8,6 +8,7 @@ import { useOptionalGateway } from '../app/gatewayContext.js'
 import { patchOverlayState } from '../app/overlayStore.js'
 import { overlayPanelSize } from './overlayLayout.js'
 import { Box, Text } from './primitives.js'
+import { DialogHeader, DialogFooter, DialogSection } from './dialogChrome.js'
 import type { Theme } from '../theme.js'
 
 const sections = ['instructions', 'memory', 'conversation', 'tools', 'compaction'] as const
@@ -37,7 +38,7 @@ function parse(value: unknown): ContextPage {
 }
 export function ContextOverlay({ t }: { t: Theme }) {
   const gateway = useOptionalGateway()
-  const size = overlayPanelSize(useTerminalDimensions(), { maxWidth: 180, minWidth: 32 })
+  const size = overlayPanelSize(useTerminalDimensions(), { maxWidth: 128, minWidth: 32, maxHeight: 42 })
   const [section, setSection] = useState(0)
   const [offset, setOffset] = useState(0)
   const [refresh, setRefresh] = useState(0)
@@ -94,22 +95,22 @@ export function ContextOverlay({ t }: { t: Theme }) {
   const summary = page?.sections.find(item => item.id === page.section)
   return <box position="absolute" left={0} top={0} width="100%" height="100%" zIndex={150} backgroundColor="#000000cc" alignItems="center" justifyContent="center">
     <Box width={size.width} height={size.height} paddingX={1} flexDirection="column" borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
-      <Text bold color={t.color.text}>Context · {loading ? 'loading…' : page?.section ?? sections[section]}</Text>
+      <DialogHeader t={t} title={<>Context · {loading ? 'loading…' : page?.section ?? sections[section]}</>} subtitle="Understand what the agent sees. Inspect sources and memory." />
       <Text color={t.ds.secondary} wrap="wrap">{summary ? summary.available ? `${summary.count} entries · ${page?.section === 'compaction' ? 'not in model context' : '~' + summary.estimated_tokens + ' tokens'} · ${summary.provenance}` : 'Not assembled yet' : 'Read-only inspection'}</Text>
       {error ? <Text color={t.color.warn} wrap="wrap">{error}</Text> : null}
       {notice ? <Text color={t.ds.secondary} wrap="wrap">{notice}</Text> : null}
       <scrollbox ref={scroll} style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
         <Text color={t.ds.secondary} wrap="wrap">{page?.note ?? 'Local estimates; no provider request is made.'}</Text>
         {page?.entries.map((entry, index) => <Box key={entry.index} flexDirection="column" flexShrink={0} marginTop={1}>
-          <Text bold color={t.color.text} wrap="wrap">{entry.control && index === selected ? '› ' : ''}{entry.title}{entry.control ? entry.control.pinned ? ' · pinned' : entry.control.excluded ? ' · excluded' : ' · optional source' : page.section === 'compaction' ? '' : ' · ~' + entry.estimated_tokens + ' tokens'}</Text>
+          <DialogSection t={t}><span>{entry.control && index === selected ? '› ' : ''}{entry.title}{entry.control ? entry.control.pinned ? ' · pinned' : entry.control.excluded ? ' · excluded' : ' · optional source' : page.section === 'compaction' ? '' : ' · ~' + entry.estimated_tokens + ' tokens'}</span></DialogSection>
           {!entry.control || index === selected ? <Text color={t.color.text} wrap="wrap">{entry.text}</Text> : null}
           {entry.truncated && (!entry.control || index === selected) ? <Text color={t.color.warn}>Excerpt truncated at 8000 characters</Text> : null}
         </Box>)}
       </scrollbox>
-      <Text color={t.ds.secondary}>Tab section · N/P page · R refresh</Text>
+      <DialogFooter t={t}><Text color={t.ds.secondary}>Tab section · N/P page · R refresh</Text>
       {page?.section === 'memory' ? <Text color={t.ds.secondary} wrap="wrap">J/K select · I pin/unpin · X exclude/include</Text> : null}
       {page?.section === 'conversation' ? <Text color={t.ds.secondary} wrap="wrap">Branch after closing: /branch --through-turn N</Text> : null}
-      <Text color={t.ds.secondary}>↑↓ scroll · Esc close</Text>
+      <Text color={t.ds.secondary}>↑↓ scroll · Esc close</Text></DialogFooter>
     </Box>
   </box>
 }

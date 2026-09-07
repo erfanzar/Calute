@@ -4,6 +4,7 @@
 import { mkdir, readFile, rename, rm } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { withFileLock } from '../session/daemonTranscript.js'
+import { machineDiscovery, type MachineDiscovery } from './machineDiscovery.js'
 
 export interface MachineWorkspace {
   readonly alias: string
@@ -49,9 +50,14 @@ async function readMachines(path: string): Promise<MachineWorkspace[]> {
 }
 
 /** Persistent registry shared by daemons; returning a target does not claim a connection succeeded. */
-export async function runMachineCommand(path: string, input: string): Promise<Record<string, unknown>> {
+export async function runMachineCommand(path: string, input: string, discovery: MachineDiscovery = machineDiscovery): Promise<Record<string, unknown>> {
   try {
     const [action = 'list', ...args] = machineArguments(input)
+    if (action === 'hosts' && !args.length) return { ok: true, hosts: await discovery.hosts() }
+    if (action === 'browse' && (args.length === 1 || args.length === 2)) {
+      const folder = args[1] ? Buffer.from(args[1], 'base64url').toString('utf8') : ''
+      return { ok: true, ...await discovery.browse(args[0]!, folder) }
+    }
     if (action === 'list' && !args.length) {
       const machines = await readMachines(path)
       return { ok: true, machines, output: ['REMOTE WORKSPACES', ...machines.map(m => `${m.alias} · ${m.target} · ${m.workspacePath}`), ...(machines.length ? [] : ['No remote workspaces saved yet.']), '', USAGE, 'Connect opens Xerxes over SSH in this terminal. Exit the remote TUI to return to your local chat.', 'The remote host needs Xerxes installed and its provider configured. SSH uses your existing config.'].join('\n') }

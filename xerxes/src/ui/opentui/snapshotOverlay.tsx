@@ -13,6 +13,7 @@ import type { Theme } from '../theme.js'
 import { DiffRow } from './diffPanel.js'
 import { overlayPanelSize } from './overlayLayout.js'
 import { Box, Text } from './primitives.js'
+import { DialogHeader, DialogFooter, DialogEmpty } from './dialogChrome.js'
 
 interface Snapshot { id: string; label: string; created_at: string; session_id?: string; turn_index?: number }
 interface Preview { id: string; revision: string; diff: string; truncated: boolean; path?: string; action?: 'restore' | 'remove' }
@@ -124,19 +125,19 @@ export function SnapshotOverlay({ t }: { t: Theme }) {
   const start = Math.max(0, index - count + 1)
   const codeWidth = Math.max(1, size.width - (wide ? 46 : 8), ...parsed.lines.map(line => Bun.stringWidth(line.text) + 18))
   return <box position="absolute" left={0} top={0} width="100%" height="100%" zIndex={150} backgroundColor="#000000cc" alignItems="center" justifyContent="center">
-    <Box width={size.width} height={size.height} paddingX={1} flexDirection="column" borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
-      <Text bold color={t.color.text}>Snapshot timeline · {rows.length}</Text>
+    <Box width={!rows.length && !confirm && !recovery.length ? Math.min(88, size.width) : size.width} height={!rows.length && !confirm && !recovery.length ? Math.min(24, size.height) : size.height} paddingX={1} flexDirection="column" borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
+      <DialogHeader t={t} title={<>Snapshot timeline · {rows.length}</>} subtitle="Browse saved file states and preview a restore." />
       <Text color={t.ds.secondary} wrap="truncate-end">Workspace files · conversation unchanged</Text>
       {error ? <Text color={t.color.warn} wrap="truncate-end">{error}</Text> : null}
       {recovery.length ? <Text color={t.color.warn} wrap='truncate-end'>{recovery.length} unfinished restore(s) · B backup</Text> : null}
       {notice ? <Text color={t.color.accent} wrap="truncate-end">{notice}</Text> : null}
-      <Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0}>
+      {!rows.length ? <DialogEmpty t={t} title={loading ? "Loading…" : "No snapshots."} description="Save a file state you can return to." action="Use /snapshot to capture one." symbol="▣" /> : (<Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0}>
         <Box width={wide ? 38 : '100%'} height={wide ? '100%' : 2} flexDirection="column" flexShrink={0}>
           {rows.slice(start, start + count).map(row => <Box key={row.id} flexDirection="column" flexShrink={0} backgroundColor={row.id === selected ? t.color.selectionBg : undefined} onMouseDown={() => { if (!busy.current && !confirm) { setSelected(row.id); setFilePath(undefined); setFocusDiff(false) } }}>
             <Text color={t.color.text} wrap="truncate-end">{row.id === selected ? '› ' : '  '}{row.label || 'Snapshot'}</Text>
             <Text color={t.ds.secondary} wrap="truncate-end">{row.turn_index === undefined ? 'Manual' : `Before turn ${row.turn_index}`} · {row.created_at}{row.session_id ? ` · ${row.session_id}` : ''}</Text>
           </Box>)}
-          {!rows.length ? <Text color={t.ds.secondary} wrap="wrap">{loading ? 'Loading…' : 'No snapshots. Use /snapshot to capture one.'}</Text> : null}
+          {!rows.length ? <DialogEmpty t={t} title={loading ? 'Loading…' : 'No snapshots.'} description="Save a file state you can return to." action="Use /snapshot to capture one." symbol="▣" /> : null}
         </Box>
         <Box flexDirection="column" flexGrow={1} minHeight={0} minWidth={0}>
           <Text color={t.color.accent} wrap="truncate-end">{focusDiff ? '› ' : ''}{filePath === undefined ? `All changed files (${files.length})` : `${preview?.action === 'remove' ? 'Remove' : 'Restore'}: ${filePath}`}{preview?.truncated ? ' · truncated' : ''}</Text>
@@ -145,9 +146,11 @@ export function SnapshotOverlay({ t }: { t: Theme }) {
             {!preview ? <Text color={t.ds.secondary}>{selected && !error ? 'Loading preview…' : 'Select a snapshot'}</Text> : !preview.diff ? <Text color={t.ds.secondary}>No captured-file changes.</Text> : null}
           </scrollbox>
         </Box>
-      </Box>
-      <Text color={t.ds.secondary} wrap="truncate-end">Ignored uncaptured files excluded.</Text>
+      </Box>)}
+
+      <DialogFooter t={t}><Text color={t.ds.secondary} wrap="truncate-end">Ignored uncaptured files excluded.</Text>
       {confirm ? <Box flexDirection="column"><Text color={t.color.warn} wrap="wrap">{preview?.path === undefined ? 'Restore all captured files?' : `${preview.action === 'remove' ? 'Remove' : 'Restore'} ${preview.path}?`} Backup is saved first.</Text><Text color={t.color.accent}>Y restore · Esc cancel</Text></Box> : <Text color={t.ds.secondary} wrap="wrap">{applying ? 'Restoring…' : size.width < 60 ? '↑↓ select · F file · A restore\nTab diff · R refresh · Esc close' : '↑↓ select · Tab diff · F file · A restore · R refresh · Esc close'}</Text>}
+      </DialogFooter>
     </Box>
   </box>
 }

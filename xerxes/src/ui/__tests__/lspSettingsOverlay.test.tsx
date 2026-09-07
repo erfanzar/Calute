@@ -49,7 +49,7 @@ it('creates a server by entering language, suffixes and command', async () => {
   const press = async (key: string) => { await act(async () => screen.mockInput.pressKey(key)); await screen.flush() }
   const enter = async (text: string) => { await act(async () => screen.mockInput.typeText(text)); await press('RETURN') }
   try {
-    await vi.waitFor(async () => { await screen.flush(); expect(screen.captureCharFrame()).toContain('F2 adds one') })
+    await vi.waitFor(async () => { await screen.flush(); expect(screen.captureCharFrame()).toContain('F2  Add server') })
     await press('F2'); await enter('typescript')
     await press('RETURN'); await enter('typescript')
     await press('TAB'); await press('RETURN'); await enter('[".ts"]')

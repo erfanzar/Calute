@@ -35,6 +35,7 @@ export const FEATURES_GUIDE = [
   '/custom-agents Create or edit .xerxes/agents specialists. N new · Enter edit · Ctrl+S save.',
   '/skills       List skills; search <query> or install <local-directory-or-SKILL.md>.',
   '/plugins      List plugins; install <local-module.ts>, enable <name>, disable <name>.',
+  '/plugin-creator Start a plugin authoring chat. Try: build a text-statistics tool with tests.',
   '/browser      Connect to an already-running Chromium CDP endpoint.',
   '/reload       Reload configuration and project definitions after edits.',
   '              External connections require your configuration; this guide does not test access.',

@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useOptionalGateway } from '../app/gatewayContext.js'
 import type { Theme } from '../theme.js'
 import { Box, Text } from './primitives.js'
+import { DialogHeader, DialogFooter } from './dialogChrome.js'
 interface Note { note: string; revision: number }
 interface Response { ok: boolean; routing_note?: Note; error?: string }
 export function RoutingNoteEditor({ t, profile, model, onClose }: { t: Theme; profile: string; model: string; onClose: () => void }) {
@@ -52,13 +53,13 @@ export function RoutingNoteEditor({ t, profile, model, onClose }: { t: Theme; pr
     else if (key.name === 'f5' && !notes.length) setReload(value => value + 1)
   })
   return <Box flexDirection="column" flexGrow={1} minHeight={0}>
-    <Text bold>Routing preferences</Text>
+    <DialogHeader t={t} title={<> Routing preferences</>} />
     <Text wrap="wrap">{profile} · {field ? model : 'All models in this provider profile'}</Text>
     <Text wrap="wrap">User guidance for agent selection. These notes do not enforce limits. Blank saves remove guidance.</Text>
     <scrollbox style={{ flexGrow: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
       {notes.length ? <textarea key={field} ref={input} focused={!busy} minHeight={4} maxHeight={10} onContentChange={() => { const note = input.current?.plainText ?? ''; setNotes(previous => previous.map((value, index) => index === field ? { ...value, note } : value)) }} /> : <Text>{error ? 'Notes unavailable · F5 retry' : 'Loading notes…'}</Text>}
       {error ? <Text wrap="wrap" color={t.color.warn}>{error}</Text> : null}
     </scrollbox>
-    <Text wrap="wrap">{busy ? 'Saving…' : 'Tab provider/model · F2 save selected note · Esc back'}</Text>
+    <DialogFooter t={t}><Text wrap="wrap">{busy ? 'Saving…' : 'Tab provider/model · F2 save selected note · Esc back'}</Text></DialogFooter>
   </Box>
 }

@@ -10,6 +10,30 @@ import { MachinePicker } from '../opentui/machinePicker.js'
 import { DEFAULT_THEME } from '../theme.js'
 
 describe('machine picker', () => {
+  it.each([[220, 65], [50, 18]])('creates a workspace through the form at %sx%s and retains failed drafts', async (width, height) => {
+    let fail = true
+    const machine = { alias: 'gpu', target: 'me@host', workspacePath: '/work/my repo' }
+    const rpc = vi.fn(async (_method: string, args: { command: string }) => args.command === 'machine list' ? { ok: true, machines: [] } : fail ? { ok: false, error: 'Name already exists' } : { ok: true, machines: [machine] })
+    const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><MachinePicker t={DEFAULT_THEME} onCancel={() => undefined} /></GatewayProvider>, { width, height })
+    const press = async (key: string) => { await act(async () => { screen.mockInput.pressKey(key); await Bun.sleep(key === 'ESCAPE' ? 80 : 0) }); await screen.flush() }
+    try {
+      await act(async () => { await Bun.sleep(0) }); await screen.flush()
+      expect(screen.captureCharFrame()).toContain('Add workspace')
+      await press('RETURN')
+      for (const [i, value] of ['gpu', 'me@host', '/work/my repo'].entries()) {
+        await act(async () => screen.mockInput.typeText(value)); await screen.flush()
+        if (i < 2) await press('TAB')
+      }
+      await press('RETURN')
+      expect(rpc).toHaveBeenLastCalledWith('slash.exec', { command: 'machine add "gpu" "me@host" "/work/my repo"' })
+      expect(screen.captureCharFrame()).toContain('Name already exists')
+      expect(screen.captureCharFrame()).toContain('/work/my repo')
+      fail = false
+      await press('RETURN')
+      expect(screen.captureCharFrame()).toContain('gpu · me@host')
+      expect(screen.captureCharFrame()).not.toContain('Name already exists')
+    } finally { act(() => screen.renderer.destroy()) }
+  })
   it('connects through the saved-machine RPC and keeps failures in the picker', async () => {
     const machine = { alias: 'gpu', target: 'host', workspacePath: '/work/repo' }
     const rpc = vi.fn(async (_method: string, args: { command: string }) => args.command === 'machine list' ? { ok: true, machines: [machine] } : { ok: true, machine })
@@ -40,4 +64,55 @@ it('shows setup guidance and closes with Escape in a narrow terminal', async () 
     act(() => setup.renderer.keyInput.processParsedKey({ name: 'escape', raw: '\u001b', sequence: '\u001b', ctrl: false, shift: false, meta: false, option: false, eventType: 'press', source: 'raw' }))
     expect(onCancel).toHaveBeenCalledOnce()
   } finally { act(() => setup.renderer.destroy()) }
+})
+
+it.each([[220, 65], [50, 18]])('chooses SSH hosts and remote folders at %sx%s', async (width, height) => {
+  const rpc = vi.fn(async (_method: string, args: { command: string }) => {
+    if (args.command === 'machine list') return { ok: true, machines: [] }
+    if (args.command === 'machine hosts') return { ok: true, hosts: ['gpu'] }
+    if (args.command === 'machine browse gpu') return { ok: true, path: '/home/me', directories: ['project folder'] }
+    if (args.command.startsWith('machine browse')) return { ok: true, path: '/home/me/project folder', directories: [] }
+    return { ok: true, machines: [{ alias: 'compute', target: 'gpu', workspacePath: '/home/me/project folder' }] }
+  })
+  const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><MachinePicker t={DEFAULT_THEME} onCancel={() => undefined} /></GatewayProvider>, { width, height })
+  const press = async (key: string) => { await act(async () => { screen.mockInput.pressKey(key); await Bun.sleep(key === 'ESCAPE' ? 80 : 0) }); await screen.flush() }
+  try {
+    await act(async () => { await Bun.sleep(0) }); await screen.flush()
+    await press('RETURN')
+    await act(async () => screen.mockInput.typeText('compute')); await screen.flush()
+    await press('TAB'); await press('F2')
+    expect(screen.captureCharFrame()).toContain('Choose SSH host')
+    expect(screen.captureCharFrame()).toContain('gpu')
+    await press('RETURN')
+    expect(screen.captureCharFrame()).toContain('compute')
+    await press('TAB'); await press('F2')
+    expect(screen.captureCharFrame()).toContain('/home/me')
+    await press('RETURN')
+    expect(screen.captureCharFrame()).toContain('No subfolders')
+    await act(async () => { screen.renderer.keyInput.processParsedKey({ name: 'space', raw: ' ', sequence: ' ', ctrl: false, shift: false, meta: false, option: false, eventType: 'press', source: 'raw' }) }); await screen.flush()
+    expect(screen.captureCharFrame()).toContain('/home/me/project folder')
+    await press('F2'); await press('ESCAPE')
+    expect(screen.captureCharFrame()).toContain('/home/me/project folder')
+    await press('RETURN')
+    expect(rpc).toHaveBeenLastCalledWith('slash.exec', { command: 'machine add "compute" "gpu" "/home/me/project folder"' })
+  } finally { act(() => screen.renderer.destroy()) }
+})
+
+it('leaves a pending browse and ignores its late response', async () => {
+  let complete!: (result: unknown) => void
+  const rpc = vi.fn(async (_method: string, args: { command: string }) => args.command === 'machine list' ? { ok: true, machines: [] } : new Promise(resolve => { complete = resolve }))
+  const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><MachinePicker t={DEFAULT_THEME} onCancel={() => undefined} /></GatewayProvider>, { width: 100, height: 30 })
+  const press = async (key: string) => { await act(async () => { screen.mockInput.pressKey(key); await Bun.sleep(key === 'ESCAPE' ? 80 : 0) }); await screen.flush() }
+  try {
+    await act(async () => { await Bun.sleep(0) }); await screen.flush()
+    await press('RETURN'); await press('TAB')
+    await act(async () => screen.mockInput.typeText('gpu')); await screen.flush()
+    await press('TAB'); await press('F2')
+    expect(screen.captureCharFrame()).toContain('Loading')
+    await press('ESCAPE')
+    await act(async () => { complete({ ok: true, path: '/late', directories: [] }); await Bun.sleep(0) }); await screen.flush()
+    expect(screen.captureCharFrame()).toContain('Add workspace')
+    expect(screen.captureCharFrame()).not.toContain('/late')
+    expect(screen.captureCharFrame()).toContain('gpu')
+  } finally { act(() => screen.renderer.destroy()) }
 })

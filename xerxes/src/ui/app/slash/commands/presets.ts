@@ -15,6 +15,14 @@ interface PresetRow extends RpcResult {
 
 export const presetCommands: SlashCommand[] = [
   {
+    name: 'plugin-creator',
+    help: 'start a plugin authoring session with examples and Bun verification',
+    run: (_argument, ctx) => {
+      if (ctx.session.guardBusySessionSwitch('start Plugin Creator mode')) return
+      ctx.session.newSession('Plugin Creator ready — describe the tool you want. Example: build a text-statistics plugin with tests and installation instructions.', 'Plugin Creator', 'plugin-creator')
+    },
+  },
+  {
     name: 'creator',
     help: 'start a fresh visible Creator mode session',
     run: (_argument, ctx) => {

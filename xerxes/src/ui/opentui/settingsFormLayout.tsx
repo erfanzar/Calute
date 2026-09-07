@@ -27,7 +27,7 @@ export function SettingsFormLayout({ t, title, subtitle, fields, selected, onSel
   const visible = compact ? fields.slice(Math.max(0, index - 1), index + 2) : fields
   return <Box flexDirection="column" flexGrow={1} minHeight={0} paddingX={terminal.width >= 70 ? 1 : 0}>
     <Box borderStyle="single" borderSides={['bottom']} borderColor={t.color.border} paddingBottom={compact ? 0 : 1} flexShrink={0} flexDirection="column">
-      <Text bold color={t.color.text}>{title}</Text>
+      <Text bold color={t.color.text}><span fg={t.color.accent}>✦ </span>{title}</Text>
       {!compact ? <Text color={t.ds.meta} wrap="wrap">{subtitle}</Text> : null}
     </Box>
     <Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0} paddingTop={compact ? 0 : 1} gap={wide ? 2 : 0}>
@@ -40,7 +40,7 @@ export function SettingsFormLayout({ t, title, subtitle, fields, selected, onSel
         </Box>)}
       </scrollbox>
       <Box width={wide ? '38%' : '100%'} flexShrink={0} flexDirection="column" minHeight={0}>
-        <Box borderStyle="round" borderColor={t.color.accent} paddingX={1} paddingY={compact ? 0 : 1} flexDirection="column" flexShrink={0}>
+        <Box borderStyle="round" borderColor={t.color.accent} backgroundColor={t.color.completionMetaBg} paddingX={1} paddingY={compact ? 0 : 1} flexDirection="column" flexShrink={0}>
           <Text color={t.color.accent}>{`EDIT · ${index + 1}/${fields.length}`}</Text>
           <Text bold color={t.color.text} wrap="wrap">{active?.label}</Text>
           {editor || <Text color={t.color.text} wrap="wrap">{active?.value}</Text>}

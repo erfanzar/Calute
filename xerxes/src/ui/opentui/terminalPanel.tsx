@@ -1,6 +1,7 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 /** @jsxImportSource @opentui/react */
+import { DialogEmpty } from './dialogChrome.js'
 import type { ScrollBoxRenderable } from '@opentui/core'
 import { useStore } from '@nanostores/react'
 import { useKeyboard, usePaste, useTerminalDimensions } from '@opentui/react'
@@ -260,12 +261,7 @@ function TerminalListView({
 
   if (!entries.length) {
     return (
-      <Box flexDirection="column">
-        <Text color={t.color.muted}>No terminals yet</Text>
-        <Text color={t.color.muted} dimColor>
-          Shell commands and background processes Xerxes starts appear here.
-        </Text>
-      </Box>
+      <DialogEmpty t={t} title="No terminals yet" description="Shell commands and background processes Xerxes starts appear here." symbol=">_" />
     )
   }
 

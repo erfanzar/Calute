@@ -9,6 +9,7 @@ import { patchOverlayState } from '../app/overlayStore.js'
 import type { Theme } from '../theme.js'
 import { overlayPanelSize } from './overlayLayout.js'
 import { Box, Text } from './primitives.js'
+import { DialogHeader, DialogFooter, DialogSection, SettingRow } from './dialogChrome.js'
 import { RoutingNoteEditor } from './routingNoteEditor.js'
 const tiers = ['light', 'balanced', 'smart'] as const
 interface Tier { model: string; provider_profile: string; reasoning_effort: string }
@@ -16,7 +17,7 @@ interface Settings { default?: string; light?: string | Partial<Tier>; balanced?
 interface Response { ok: boolean; revision: number; settings?: Settings; profiles?: { name: string; provider: string; model: string }[]; error?: string }
 export function AgentSettingsOverlay({ t }: { t: Theme }) {
   const gateway = useOptionalGateway()
-  const size = overlayPanelSize(useTerminalDimensions(), { maxWidth: 130, minWidth: 32 })
+  const size = overlayPanelSize(useTerminalDimensions(), { maxWidth: 110, minWidth: 32, maxHeight: 34 })
   const [rows, setRows] = useState<Tier[]>(tiers.map(() => ({ model: '', provider_profile: '', reasoning_effort: '' })))
   const [noteTarget, setNoteTarget] = useState<{ profile: string; model: string } | null>(null)
   const [field, setField] = useState(0)
@@ -144,15 +145,15 @@ export function AgentSettingsOverlay({ t }: { t: Theme }) {
   })
   return <box position="absolute" left={0} top={0} width="100%" height="100%" zIndex={150} backgroundColor="#000000cc" alignItems="center" justifyContent="center"><Box width={size.width} height={size.height} backgroundColor={t.color.statusBg} borderStyle="round" borderColor={t.color.border} padding={1} flexDirection="column">
     {noteTarget ? <RoutingNoteEditor t={t} {...noteTarget} onClose={() => setNoteTarget(null)} /> : <>
-    <Text bold>Configuration · Agent modes</Text>
-    <Text>{tiers.map((tier, i) => i === row ? `[${tier.toUpperCase()}]` : tier).join(' · ')}</Text>
+    <DialogHeader t={t} title="Configuration · Agent modes" subtitle="Match each task to the right amount of intelligence." />
+    <Box flexDirection="row" gap={1} flexShrink={0}>{tiers.map((tier, i) => <Box key={tier} paddingX={1} backgroundColor={i === row ? t.color.completionCurrentBg : undefined}><Text bold={i === row} color={i === row ? t.color.accent : t.ds.secondary}>{i === row ? `[${tier.toUpperCase()}]` : tier}</Text></Box>)}</Box>
     <Text wrap="wrap">Default: {defaultMode} · F2 change · F4 disable selected mode</Text>
     <scrollbox style={{ flexGrow: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
       <Text wrap="wrap" color={t.ds.secondary}>Blank provider/effort: inherit. Empty tier: disabled.</Text>
       <Text wrap="wrap">Provider profiles: {loaded?.profiles?.map(profile => `${profile.name} (${profile.provider})`).join(' · ') || 'Loading…'}</Text>
       {tiers.map((tier, i) => i !== row ? null : <Box key={tier} flexDirection="column" marginTop={1}>
-        <Text bold>{tier.toUpperCase()}</Text>
-        {keys.map((name, j) => <Text key={name} color={field === i * 3 + j ? t.color.accent : t.color.text} wrap="wrap">{field === i * 3 + j ? '›' : ' '} {['Provider profile', 'Model ID', 'Reasoning effort'][j]}: {rows[i]?.[name] || '(inherit / unset)'}</Text>)}
+        <DialogSection t={t}>{tier.toUpperCase()}</DialogSection>
+        {keys.map((name, j) => <SettingRow key={name} t={t} selected={field === i * 3 + j} label={['Provider profile', 'Model ID', 'Reasoning effort'][j]!}>{rows[i]?.[name] || '(inherit / unset)'}</SettingRow>)}
       </Box>)}
       {loaded ? <textarea key={field} ref={input} focused={!busy} minHeight={1} maxHeight={2} onContentChange={() => { const text = input.current?.plainText ?? ''; setRows(current => current.map((value, i) => i === row ? { ...value, [key]: text } : value)) }} /> : null}
       {choices.length > 0 ? <Text wrap="wrap" color={t.ds.secondary}>↑/↓ choose: {choices.slice(Math.max(0, choices.indexOf(selected[key]) - 2), Math.max(0, choices.indexOf(selected[key]) - 2) + 6).map(value => value || '(inherit)').join(' · ')}{choices.length > 6 ? ' …' : ''}</Text> : null}
@@ -160,7 +161,7 @@ export function AgentSettingsOverlay({ t }: { t: Theme }) {
       {optionsError && key === 'reasoning_effort' ? <Text wrap="wrap" color={t.color.warn}>{optionsError}</Text> : null}
       {error ? <Text wrap="wrap" color={t.color.warn}>{error}</Text> : null}
     </scrollbox>
-    <Text wrap="wrap">{busy ? 'Saving…' : 'Tab field/mode · F6 routing notes · Enter save · Esc close'}</Text>
+    <DialogFooter t={t}><Text wrap="wrap">{busy ? 'Saving…' : 'Tab field/mode · F6 routing notes · Enter save · Esc close'}</Text></DialogFooter>
     </>}
   </Box></box>
 }

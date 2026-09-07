@@ -114,3 +114,13 @@ smaller widths. Compact hints and omit duplicate headings in narrow layouts.
 Keep Escape and output scrolling reachable in a 40-column terminal. Retain the
 overlay on turn completion and clear it only on explicit dismissal or session
 teardown.
+
+## Operational dialogs
+
+Use `ui/opentui/dialogChrome.tsx` for operational settings and inspectors. A dialog has a title and short purpose, one content region, and a separate keyboard footer. Settings separate labels from values; selected fields use the selection surface. Group long details under short section labels and put actionable failures before routine metadata.
+
+Empty schedules, monitors, workspaces, snapshots, custom agents and server settings use a bounded card rather than an empty master/detail split. Show one useful next step. A creation button must open the same editor as its keyboard shortcut; never decorate an inert command as a clickable control. Hide actions that require a selected item when the list is empty.
+
+On terminals shorter than 26 rows, drop decorative header/footer spacing and put field labels and values on one line. Keep errors, cancellation and the selected input visible. MCP/LSP editors scroll the selected field into view and edit next to its label. Their saved launch values and credentials remain hidden.
+
+The style applies to runs, schedules/follow-ups, monitors and reaction limits, context, snapshots, workspaces/recovery, deliveries, agent modes and routing notes, custom agents, and MCP/LSP settings. Skill/plugin guides use scrollable cards with Home/End, arrows and page navigation. Model/reasoning pickers share the title surface; terminal and agent inspectors share the empty-state treatment. Preserve the welcome layout, full-width conversation, and dedicated diff/output rendering.

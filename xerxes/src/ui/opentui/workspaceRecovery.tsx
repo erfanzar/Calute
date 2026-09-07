@@ -8,6 +8,7 @@ import { useOptionalGateway } from '../app/gatewayContext.js'
 import { listWorkspaceIntegrations, inspectWorkspaceIntegration, recoverWorkspaceIntegration, type WorkspaceIntegration } from '../lib/workspaces.js'
 import type { Theme } from '../theme.js'
 import { Box, Text } from './primitives.js'
+import { DialogHeader, DialogFooter } from './dialogChrome.js'
 
 export function WorkspaceRecovery({ t, width, height, close }: { t: Theme; width: number; height: number; close: () => void }) {
   const gateway = useOptionalGateway()
@@ -72,7 +73,7 @@ export function WorkspaceRecovery({ t, width, height, close }: { t: Theme; width
   })
   const count = Math.max(1, Math.floor((height - 12) / 2)), start = Math.max(0, selected - count + 1)
   return <Box width={width} height={height} paddingX={1} flexDirection="column" borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
-    <Text bold color={t.color.text}>Integration recovery · Page {pages.length + 1}</Text>
+    <DialogHeader t={t} title={<> Integration recovery · Page {pages.length + 1}</>} />
     <Text color={t.ds.secondary} wrap="wrap">Restore interrupted applies. Completed applies cannot be undone here.</Text>
     {message ? <Text color={t.color.warn} wrap="wrap">{message}</Text> : null}
     {confirm ? <Box flexDirection="column" flexShrink={0}><Text color={t.color.warn} wrap="wrap">{row?.status === 'preparing' ? 'Abandon incomplete preparation? Destination files stay unchanged.' : lockOnly ? 'Release a leftover lock? Current files will be preserved.' : `Restore original files in ${row?.destination}? Newer edits will be preserved.`}</Text><Box onMouseDown={recover}><Text color={t.color.accent}>Y confirm · Esc cancel</Text></Box></Box> : null}
@@ -88,6 +89,6 @@ export function WorkspaceRecovery({ t, width, height, close }: { t: Theme; width
     {row?.error ? <Text color={t.color.warn} wrap="wrap">{row.error}</Text> : null}
     {recoverable ? <Box onMouseDown={() => { if (!busy.current) setConfirm(true) }}><Text color={t.color.accent}>{row.status === 'preparing' ? 'B · Abandon preparation' : lockOnly ? 'B · Release leftover lock' : 'B · Restore original files'}</Text></Box> : null}
     <Text color={t.ds.secondary}>↑↓ select · N/P pages · R refresh</Text>
-    <Text color={t.ds.secondary}>Esc back to workspace review</Text>
+    <DialogFooter t={t}><Text color={t.ds.secondary}>Esc back to workspace review</Text></DialogFooter>
   </Box>
 }

@@ -48,7 +48,7 @@ it('creates a server from an empty configuration using the keyboard', async () =
   const rpc = vi.fn(async (method: string) => method === 'mcp.settings.get' ? { ...settings, servers: [] } : { ok: true, revision: 'c'.repeat(64) })
   const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><McpSettingsOverlay t={DARK_THEME} /></GatewayProvider>, { width: 120, height: 36 })
   try {
-    await vi.waitFor(async () => { await screen.flush(); expect(screen.captureCharFrame()).toContain('F2 adds one') })
+    await vi.waitFor(async () => { await screen.flush(); expect(screen.captureCharFrame()).toContain('F2  Add server') })
     await act(async () => screen.mockInput.pressKey('F2'))
     await screen.flush()
     await act(async () => screen.mockInput.typeText('new-server'))

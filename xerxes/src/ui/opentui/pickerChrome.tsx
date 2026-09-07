@@ -58,7 +58,7 @@ export function ModalShell({
         paddingTop={1}
         width={panelWidth}
       >
-        <box flexDirection="row" flexShrink={0} paddingLeft={2} paddingRight={2}>
+        <box backgroundColor={t.color.completionMetaBg} flexDirection="row" flexShrink={0} paddingLeft={2} paddingRight={2}>
           {/* The left title must yield to right-side state. A width="100%"
               text beside another text made the latter paint over the border
               in wide/tall terminals (the clipped `esc` seen in the picker). */}

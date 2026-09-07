@@ -5,6 +5,8 @@ Licensed under the Apache License, Version 2.0.
 
 # Xerxes TUI ⇄ Daemon Wire Protocol
 
+`/plugin-creator` is a client session shortcut, like `/creator`: it uses the existing new-session flow with `agent_preset: "plugin-creator"`. It adds no RPC method or wire format. Busy-session switching remains guarded and prior sessions remain saved.
+
 This is the frozen contract between the **TypeScript/OpenTUI frontend** (`xerxes/src/ui/`)
 and the **Bun TypeScript daemon** (`xerxes/src/cli.ts daemon`). The
 frontend owns the screen; the daemon owns sessions, tools, model calls, and
@@ -1344,6 +1346,15 @@ Additive v35 RPCs under `agentPreset.*` use the selected session's project:
 Each machine is `{alias,target,workspacePath}`. `machine add <name> <ssh-target>
 <absolute-path>` and `machine remove <name>` mutate the user registry;
 `machine connect <name>` resolves a saved machine and returns `{ok,machine}`.
+`machine hosts` returns `{ok,hosts:string[]}` discovered from concrete Host aliases
+in the daemon user's `~/.ssh/config` and Include files. No config is modified.
+`machine browse <ssh-target> [base64url-utf8-path]` returns
+`{ok,path,directories:string[],truncated:boolean}`; an omitted path means remote home.
+Directory names are immediate children, including hidden folders. Listings stop at
+1,000 entries and 1 MiB, with a 15-second SSH deadline. Browsing uses BatchMode and
+strict host-key verification. Errors return `{ok:false,error}`; cancelled TUI
+pickers discard late replies. F2 on the host/folder field opens these pickers;
+Escape restores the unfinished form. These are read-only slash RPC extensions.
 Arguments may be single- or double-quoted. Resolution does not prove connectivity
 or change daemon session ownership. The terminal client suspends its renderer
 and launches interactive SSH for the returned target, then restores the local

@@ -10,11 +10,12 @@ import { cancelRun, acknowledgeRun, inspectRun, listRunPage, type RunDetail, typ
 import type { Theme } from '../theme.js'
 import { overlayPanelSize } from './overlayLayout.js'
 import { Box, Text } from './primitives.js'
+import { DialogHeader, DialogFooter, DialogEmpty, DialogSection } from './dialogChrome.js'
 
 export function RunOverlay({ t, scheduleId, onClose }: { t: Theme; scheduleId?: string; onClose?: () => void }) {
   const gateway = useOptionalGateway()
   const terminal = useTerminalDimensions()
-  const size = overlayPanelSize(terminal, { maxWidth: 180, minWidth: 32 })
+  const size = overlayPanelSize(terminal, { maxWidth: 132, minWidth: 32, maxHeight: 42 })
   const kinds = ['', 'agent', 'terminal', 'schedule', 'monitor']
   const states = ['', 'running', 'failed', 'interrupted', 'cancelled', 'succeeded']
   const [kindIndex, setKindIndex] = useState(0)
@@ -142,8 +143,8 @@ export function RunOverlay({ t, scheduleId, onClose }: { t: Theme; scheduleId?: 
   const selectedIndex = runs.findIndex(run => run.id === selected)
   const start = Math.max(0, selectedIndex - visibleCount + 1)
   return <box position="absolute" left={0} top={0} width="100%" height="100%" zIndex={150} backgroundColor="#000000cc" alignItems="center" justifyContent="center">
-    <Box width={size.width} height={size.height} flexDirection="column" paddingX={1} borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
-      <Text bold color={t.color.text}>{scheduleId ? 'Schedule history' : 'Runs'} · {workspaceScope ? 'Workspace' : 'Session'}{unread ? ' · Unread' : ''} · {runs.length} · Page {pages.length + 1}</Text>
+    <Box width={!runs.length && !attentionRows.length && !nextRows.length ? Math.min(88, size.width) : size.width} height={!runs.length && !attentionRows.length && !nextRows.length ? Math.min(24, size.height) : size.height} flexDirection="column" paddingX={1} borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
+      <DialogHeader t={t} title={<>{scheduleId ? 'Schedule history' : 'Runs'} · {workspaceScope ? 'Workspace' : 'Session'}{unread ? ' · Unread' : ''} · {runs.length} · Page {pages.length + 1}</>} subtitle="A record of your work, with results ready to review." />
       <Text color={t.ds.secondary}>K {scheduleId ? 'schedule' : kind || 'all kinds'} · S {state || 'all states'}</Text>
       {attentionRows.length ? <Box flexDirection="column" flexShrink={0} onMouseDown={() => { onClose ? onClose() : patchOverlayState({ runs: false }) }}>
         <Text color={t.color.warn} wrap="truncate-end">Session attention · {attentionTotal} · E chat</Text>
@@ -154,12 +155,12 @@ export function RunOverlay({ t, scheduleId, onClose }: { t: Theme; scheduleId?: 
         {nextRows.map(job => <Box key={job.id} flexDirection="column" flexShrink={0}><Text color={t.color.text} wrap="truncate-end">{job.title}</Text><Text color={t.ds.secondary} wrap="truncate-end">{job.nextRunAt}</Text></Box>)}
       </Box> : null}
       {error ? <Text color={t.color.warn} wrap="wrap">{error}</Text> : null}
-      <Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0}>
+      {!runs.length ? <DialogEmpty t={t} title={loading ? "Loading runs…" : unread ? "No unread results." : "No recorded runs in this session yet."} description="Results from agents, terminals and schedules appear here." symbol="≡" /> : (<Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0}>
         <Box width={wide ? '38%' : '100%'} height={wide ? '100%' : listHeight} flexDirection="column" paddingRight={1}>
           {runs.length ? runs.slice(start, start + visibleCount).map(run => <Box key={run.id} flexDirection="column" height={2} backgroundColor={run.id === selected ? t.ds.selected : undefined} onMouseDown={() => setSelected(run.id)}>
             <Text color={run.unread ? t.color.accent : t.color.text} wrap="truncate-end">{run.unread ? '●' : '·'} {run.title}</Text>
             <Text color={t.ds.secondary} wrap="truncate-end">{run.kind} · {run.state}{workspaceScope ? ` · ${run.ownerSessionId.slice(0, 8)}` : ''}</Text>
-          </Box>) : <Text color={t.ds.secondary} wrap="wrap">{loading ? 'Loading runs…' : unread ? 'No unread results.' : 'No recorded runs in this session yet.'}</Text>}
+          </Box>) : <DialogEmpty t={t} title={loading ? 'Loading runs…' : unread ? 'No unread results.' : 'No recorded runs in this session yet.'} description="Agent, terminal and scheduled results appear here." symbol="≡" />}
         </Box>
         <scrollbox ref={scroll} style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
           {wide || !detail ? <Text bold color={t.color.text} wrap="wrap">{detail?.title ?? (selected ? 'Loading result…' : 'Select a run to inspect its result.')}</Text> : null}
@@ -175,12 +176,13 @@ export function RunOverlay({ t, scheduleId, onClose }: { t: Theme; scheduleId?: 
             </Box> : null}
             {detail.error ? <Text color={t.color.warn} wrap="wrap">{detail.error}</Text> : null}
             {detail.outputTruncated ? <Text color={t.ds.secondary}>Earlier output was omitted.</Text> : null}
-            <Text color={t.color.text} wrap="wrap">{detail.output || 'No output recorded.'}</Text>
+            {terminal.height >= 26 ? <DialogSection t={t}>OUTPUT</DialogSection> : null}<Text color={t.color.text} wrap="wrap">{detail.output || 'No output recorded.'}</Text>
           </Box> : null}
         </scrollbox>
-      </Box>
-      <Text color={t.ds.secondary}>{acknowledging ? 'Acknowledging…' : size.width < 70 ? 'N/P pages · ↑↓ · K kind · S state' : 'K kind · S state · N/P pages · ↑↓ select · U unread · A acknowledge · W scope · R refresh'}</Text>
-      <Text color={t.ds.secondary}>{size.width < 70 ? 'A ack · U unread · W scope · Esc close' : 'PgUp/PgDn scroll result · Esc close'}</Text>
+      </Box>)}
+
+      <DialogFooter t={t}><Text color={t.ds.secondary}>{acknowledging ? 'Acknowledging…' : size.width < 70 ? 'N/P pages · ↑↓ · K kind · S state' : 'K kind · S state · N/P pages · ↑↓ select · U unread · A acknowledge · W scope · R refresh'}</Text>
+      <Text color={t.ds.secondary}>{size.width < 70 ? 'A ack · U unread · W scope · Esc close' : 'PgUp/PgDn scroll result · Esc close'}</Text></DialogFooter>
     </Box>
   </box>
 }
