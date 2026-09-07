@@ -96,7 +96,7 @@ Open `/machine` and press **N** (or **Enter** when empty) to add a workspace usi
 /machine
 ```
 
-Select `compute`, press **Enter** and authenticate through your SSH configuration. The remote host needs Xerxes installed and providers configured. Exit remote Xerxes to return locally. This opens a remote terminal; it does not migrate conversations or synchronize files. `/machine remove compute` removes the saved entry.
+Select `compute`, press **Enter** and authenticate through your SSH configuration. Connection automatically installs Bun if missing or too old, and builds the latest published GitHub main revision under ~/.xerxes/remote-runtime. Unchanged builds are reused; older releases and existing installations are preserved. Setup requires Git (and curl, bash, unzip if Bun needs installing). Providers still need remote authentication; local credentials are never copied. Setup errors are logged in ~/.xerxes/remote-runtime/setup.log. Exit remote Xerxes to return locally. This opens a remote terminal; it does not migrate conversations or synchronize files. `/machine remove compute` removes the saved entry.
 
 For browser tools, supply an already-running Chromium-compatible browser endpoint with `/browser connect <endpoint>`. Ask “Read the current page title.” Xerxes attaches to the supplied CDP endpoint; it does not launch a browser.
 

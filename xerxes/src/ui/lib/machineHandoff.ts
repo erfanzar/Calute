@@ -3,6 +3,7 @@
 import { spawn } from 'node:child_process'
 
 import { withTerminalSuspended } from './terminalRuntime.opentui.js'
+import { remoteBootstrapScript } from './remoteBootstrap.js'
 
 export interface RemoteMachine {
   alias: string
@@ -25,8 +26,7 @@ const quoteShell = (value: string): string => `'${value.replaceAll("'", "'\\''")
 
 export function remoteMachineCommand(machine: RemoteMachine): string {
   const validated = parseRemoteMachine(machine)
-  const script = `cd ${quoteShell(validated.workspacePath)} && exec xerxes`
-  return `exec "\${SHELL:-/bin/sh}" -lc ${quoteShell(script)}`
+  return `exec sh -c ${quoteShell(remoteBootstrapScript(validated.workspacePath))}`
 }
 
 /** SSH owns the terminal only while the local renderer is suspended. */
@@ -51,7 +51,7 @@ export async function connectRemoteMachine(
       cleanup()
       if (options.signal?.aborted) reject(new Error('Remote connection cancelled'))
       else if (code === 0) resolve()
-      else reject(new Error(`SSH exited ${signal ? `with signal ${signal}` : `with code ${code ?? 'unknown'}`}. Check the host and that Xerxes is installed there.`))
+      else reject(new Error(`SSH exited ${signal ? `with signal ${signal}` : `with code ${code ?? 'unknown'}`}. Check SSH access or ~/.xerxes/remote-runtime/setup.log on the remote host.`))
     })
   }))
 }

@@ -1365,3 +1365,11 @@ UI when SSH exits. Errors return `{ok:false,error}`.
 <module.ts>`, and `plugins enable|disable <name-or-path>`. Host availability,
 validation and import errors are returned explicitly. Plugin management is an
 injected daemon host capability; the production CLI supplies it.
+
+Remote handoff now bootstraps a dedicated user-owned installation through SSH.
+It checks GitHub main, builds a missing revision with locked dependencies in a
+staging directory, verifies the CLI, and promotes it only after success. A setup
+lock prevents concurrent installation; errors preserve previous releases. Bun
+1.3+ is installed when absent/outdated. SSH retains terminal ownership during
+setup and the remote TUI; exiting restores the local renderer. No provider
+credentials, project files, or existing Xerxes installations are overwritten.

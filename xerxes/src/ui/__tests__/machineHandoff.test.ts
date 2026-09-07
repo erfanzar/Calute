@@ -14,7 +14,7 @@ describe('machine SSH handoff', () => {
     const suspend = vi.fn(async (run: () => Promise<void>) => { await run() })
     await connectRemoteMachine(machine, { spawnProcess: launch as unknown as typeof spawn, suspend })
     expect(launch).toHaveBeenCalledWith('ssh', ['-t', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', '--', machine.target, remoteMachineCommand(machine)], { stdio: 'inherit' })
-    expect(remoteMachineCommand(machine)).toContain('exec "${SHELL:-/bin/sh}" -lc')
+    expect(remoteMachineCommand(machine)).toContain('exec sh -c')
     expect(suspend).toHaveBeenCalledOnce()
   })
   it('rejects malformed machine responses before spawning', async () => {

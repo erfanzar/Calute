@@ -60,7 +60,7 @@ export async function runMachineCommand(path: string, input: string, discovery: 
     }
     if (action === 'list' && !args.length) {
       const machines = await readMachines(path)
-      return { ok: true, machines, output: ['REMOTE WORKSPACES', ...machines.map(m => `${m.alias} · ${m.target} · ${m.workspacePath}`), ...(machines.length ? [] : ['No remote workspaces saved yet.']), '', USAGE, 'Connect opens Xerxes over SSH in this terminal. Exit the remote TUI to return to your local chat.', 'The remote host needs Xerxes installed and its provider configured. SSH uses your existing config.'].join('\n') }
+      return { ok: true, machines, output: ['REMOTE WORKSPACES', ...machines.map(m => `${m.alias} · ${m.target} · ${m.workspacePath}`), ...(machines.length ? [] : ['No remote workspaces saved yet.']), '', USAGE, 'Connect opens Xerxes over SSH in this terminal. Exit the remote TUI to return to your local chat.', 'Connect installs/updates a managed Xerxes build automatically. Configure provider authentication on the remote host. SSH uses your existing config.'].join('\n') }
     }
     if (action === 'connect' && args.length === 1) {
       const machine = (await readMachines(path)).find(m => m.alias === args[0])
