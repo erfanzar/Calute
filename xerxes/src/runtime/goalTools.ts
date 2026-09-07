@@ -143,13 +143,13 @@ export const GOAL_TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
         required: ['objective'],
         properties: {
           objective: { type: 'string', description: 'The completion objective, as the human stated it.' },
-          current_milestone: { type: 'string', maxLength: 1000, description: 'Optional current work milestone. Progress context only, not completion evidence.' },
+          current_milestone: { type: ['string', 'null'], maxLength: 1000, description: 'Optional current work milestone; null means no milestone. Progress context only, not completion evidence.' },
           criteria: criterionSchema(),
           max_duration_ms: { type: 'integer', minimum: 1, description: 'Optional wall-time limit in milliseconds from goal creation, including paused time. Set only from the human request.' },
           max_total_tokens: { type: 'integer', minimum: 1, description: 'Optional total counted token admission cap. Starts with provider calls after goal creation; includes descendants and cache tokens. Already admitted concurrent calls can exceed the cap. Set only from the human request.' },
           max_goal_rounds: {
             type: 'integer',
-            description: `Total automatic continuation rounds allowed. Defaults to ${DEFAULT_MAX_GOAL_ROUNDS}.`,
+            description: 'Optional automatic continuation limit. Unlimited when omitted. Set only if the human explicitly requests a round limit.',
           },
         },
       },
@@ -161,7 +161,8 @@ export const GOAL_TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
       name: 'update_goal',
       description:
         'Change the current goal. Call get_goal first and copy its exact goal_id and revision. '
-        + 'Replacements belong only to action "edit"; blocked_reason is required only for action "blocked".',
+        + 'Replacements belong only to action "edit"; blocked_reason is required only for action "blocked". '
+        + 'For resume send only goal_id, revision and action. Use unlimited only when the human requests no limits.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -171,8 +172,8 @@ export const GOAL_TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
           revision: { type: 'integer', description: 'Exact revision from get_goal.' },
           action: {
             type: 'string',
-            enum: ['edit', 'pause', 'resume', 'complete', 'blocked', 'record_evidence', 'milestone'],
-            description: 'Lifecycle transition to apply.',
+            enum: ['edit', 'pause', 'resume', 'unlimited', 'complete', 'blocked', 'record_evidence', 'milestone'],
+            description: 'Lifecycle transition. resume only resumes and never edits caps. unlimited removes all caps only when the human asks; then resume if blocked.',
           },
           objective: { type: 'string', description: 'Replacement objective; action "edit" only.' },
           current_milestone: { type: ['string', 'null'], maxLength: 1000, description: 'Current work milestone; milestone or edit action only. Null clears it. Does not change objective, budgets, evidence, or phase.' },
@@ -200,6 +201,10 @@ export function goalPolicyPrompt(blockedAfterConsecutiveRounds: number): string 
     'Use the goal tools for one long-running completion objective in the current session. create_goal may',
     'infer goal intent from a direct human request in any language; do not create a goal for routine',
     'single-turn work. Call get_goal before update_goal and copy its exact goal_id and revision.',
+    'Goals are unlimited by default. Omit max_goal_rounds, max_duration_ms, and max_total_tokens unless',
+    'the human explicitly requests that specific limit. Never invent a token budget or a safety cap.',
+    'When the human requests unlimited work, use update_goal action unlimited to clear existing limits.',
+    'For resume use only goal_id, revision and action. Resume never raises or removes a budget.',
     'Declare concrete criteria when creating a goal. Attach evidence with record_evidence using the exact',
     'tool_call_id of a successful completed call in this session and explain its relevance. Every declared',
     'criterion needs evidence before completion. Execution success is not automatic proof of relevance.',
@@ -256,8 +261,7 @@ export function registerGoalTools(
       const maxDurationMs = optionalInteger(inputs, 'max_duration_ms')
       const maxTotalTokens = optionalInteger(inputs, 'max_total_tokens')
       const criteria = criteriaInput(inputs.criteria)
-      const currentMilestone = milestoneInput(inputs)
-      if (currentMilestone === null) throw new ValidationError('current_milestone', 'omit it when creating a goal without a milestone')
+      const currentMilestone = milestoneInput(inputs) ?? undefined
       return wrap(() => {
         const goal = createGoal(
           host.metadata(context),
@@ -273,20 +277,26 @@ export function registerGoalTools(
     update_goal: (inputs, context) => {
       assertMainAgent(context)
       const action = requiredString(inputs, 'action')
-      if (inputs.current_milestone !== undefined && action !== 'edit' && action !== 'milestone') throw new ValidationError('current_milestone', 'is only accepted for action edit or milestone')
-      if (action === 'milestone' && Object.keys(inputs).some(key => !['goal_id', 'revision', 'action', 'current_milestone'].includes(key))) throw new ValidationError('action', 'milestone changes only current_milestone')
-      if (inputs.criteria !== undefined && action !== 'edit') throw new ValidationError('criteria', 'is only accepted for action edit')
-      if (inputs.max_duration_ms !== undefined && action !== 'edit') throw new ValidationError('max_duration_ms', 'is only accepted for action edit')
-      if (inputs.max_total_tokens !== undefined && action !== 'edit') throw new ValidationError('max_total_tokens', 'is only accepted for action edit')
+      // Lifecycle-only actions cannot edit data. Some providers fill every schema field;
+      // discard those extra fields explicitly rather than failing before the transition.
+      const lifecycleOnly = action === 'resume' || action === 'pause' || action === 'unlimited'
+      const ignoredFields = lifecycleOnly ? Object.keys(inputs).filter(key => !['goal_id', 'revision', 'action'].includes(key)) : []
+      if (lifecycleOnly) inputs = { goal_id: inputs.goal_id!, revision: inputs.revision!, action }
+      const meaningful = (value: unknown) => value !== undefined && value !== null && value !== '' && !(Array.isArray(value) && value.length === 0)
+      if (meaningful(inputs.current_milestone) && action !== 'edit' && action !== 'milestone') throw new ValidationError('current_milestone', 'is only accepted for action edit or milestone')
+      if (action === 'milestone' && Object.keys(inputs).some(key => !['goal_id', 'revision', 'action', 'current_milestone'].includes(key) && meaningful(inputs[key]))) throw new ValidationError('action', 'milestone changes only current_milestone')
+      if (meaningful(inputs.criteria) && action !== 'edit') throw new ValidationError('criteria', 'is only accepted for action edit')
+      if (meaningful(inputs.max_duration_ms) && action !== 'edit') throw new ValidationError('max_duration_ms', 'is only accepted for action edit')
+      if (meaningful(inputs.max_total_tokens) && action !== 'edit') throw new ValidationError('max_total_tokens', 'is only accepted for action edit')
       const ref = { id: requiredString(inputs, 'goal_id'), revision: requiredIntegerField(inputs, 'revision') }
       const metadata = host.metadata(context)
       const sessionId = host.sessionId(context)
 
-      if (action === 'edit' || action === 'pause' || action === 'resume') {
+      if (action === 'edit' || action === 'pause' || action === 'resume' || action === 'unlimited') {
         assertHumanAuthority(host, context, `update_goal action ${action}`)
       }
 
-      return wrap(() => {
+      const result = wrap(() => {
         switch (action) {
           case 'edit': {
             const objective = optionalString(inputs, 'objective')
@@ -320,9 +330,18 @@ export function registerGoalTools(
           }
           case 'pause':
             return view(pauseGoal(metadata, sessionId, ref, now()))
-          case 'resume':
-            host.validateResume?.(context, expectCurrentGoal(metadata, sessionId, ref))
+          case 'unlimited':
+            return view(editGoal(metadata, sessionId, ref, { maxGoalRounds: DEFAULT_MAX_GOAL_ROUNDS, maxDurationMs: null, maxTotalTokens: null }, now()))
+          case 'resume': {
+            const current = expectCurrentGoal(metadata, sessionId, ref)
+            try { host.validateResume?.(context, current) }
+            catch (error) {
+              return { ok: false, code: 'GOAL_RESUME_DENIED', error: error instanceof Error ? error.message : String(error),
+                ...view(current),
+                recovery: 'Resume does not change limits. If the human requested unlimited work, call update_goal action unlimited, then get_goal and resume with the new revision. Otherwise request an explicit limit change; do not retry this unchanged resume.' }
+            }
             return view(resumeGoal(metadata, sessionId, ref, now()))
+          }
           case 'complete': {
             assertConcludeAuthority(host, context, 'complete', expectCurrentGoal(metadata, sessionId, ref))
             // Declared criteria are checked in the domain. Legacy goals without
@@ -345,9 +364,10 @@ export function registerGoalTools(
             return withWrapup(host, context, view(blocked), blocked.objective, message)
           }
           default:
-            throw new ValidationError('action', 'must be edit, pause, resume, complete, blocked, record_evidence, or milestone', action)
+            throw new ValidationError('action', 'must be edit, pause, resume, unlimited, complete, blocked, record_evidence, or milestone', action)
         }
       })
+      return ignoredFields.length ? { ...(result as Record<string, unknown>), ignored_fields: ignoredFields, notice: `Action ${action} ignores unrelated fields; use edit for replacements. Resume never changes limits.` } : result
     },
   }
 

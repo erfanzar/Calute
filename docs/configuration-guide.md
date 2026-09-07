@@ -1741,3 +1741,60 @@ injection checks still apply; `/skills diagnostics` shows rejected files.
 Other workspace skill roots retain their existing trust requirements.
 Skill names and command names share a namespace; existing discovery roots keep
 their precedence. Project commands cannot replace built-in slash commands.
+
+### Discovering capabilities
+
+The welcome screen includes a small `Explore capabilities · /features` hint.
+Type `/features` to open a read-only guide to agents, terminals, monitors,
+schedules, follow-ups, review tools and configuration. The guide gives entry
+commands and notes setup requirements for remote workspaces and local extensions. It does not start jobs or submit a model prompt. Close the
+guide to return to your conversation; `/help` remains the full command reference.
+
+### Remote workspaces and extension controls
+
+`/machine` opens the saved-workspace picker. Add a workspace with:
+
+```text
+/machine add compute my-ssh-alias "/home/me/My Project"
+/machine connect compute
+/machine remove compute
+```
+
+Names use letters, digits, underscores or hyphens. The target is an SSH config
+alias or `user@hostname`; configure identity files, ports and jump hosts in
+`~/.ssh/config`. The remote project path must be absolute. Saved workspaces live
+in `~/.xerxes/machines.json` (or `$XERXES_HOME/machines.json`).
+
+Connecting suspends the local renderer and opens an SSH terminal running Xerxes
+inside the remote project. The remote host needs Xerxes on its login-shell PATH
+and its own provider configuration. Exiting that remote TUI returns to the local
+picker/chat; local sessions and running work remain with the local daemon. This
+is an SSH terminal handoff, not file synchronization or migration of the local
+conversation. Host verification and authentication use normal interactive SSH.
+
+`/custom-agents` (also `/agents edit`) opens a project specialist editor. Press
+**N** to create a Markdown definition, **Enter** to edit an existing definition,
+**Ctrl+S** to validate and save, and **Esc** to discard the draft. Definitions
+live in `.xerxes/agents/<name>.md`. The editor supports the same Claude-style
+frontmatter as automatic discovery. Invalid files and concurrent edits are
+reported without overwriting the saved definition or clearing the draft.
+Saved definitions are refreshed for subsequent delegation.
+
+`/skills search <query>` searches the discovered local and bundled catalog;
+`/skills browse` lists it. `/skills install /absolute/path/to/skill` installs a
+local bundle, or pass its `SKILL.md` path. Assets and references are copied, while
+existing names, unsupported filesystem entries, oversized bundles and failed
+skill scans are rejected. Use `/skills inspect <name>` to inspect the result and
+`/skill <name>` to invoke it. Shell preprocessing still requires `/skills trust`.
+
+`/plugins install /absolute/path/plugin.ts` registers and enables a local native
+tool module exporting `register(registry)`. Its path and enabled state persist;
+source files stay at their original location. Use `/plugins inspect <name>`,
+`/plugins disable <name>` and `/plugins enable <name>` to manage it. Enabled tools
+are exposed with the `plugin_` prefix on subsequent turns. Disabling prevents
+new invocations, including from an existing tool registry; it does not undo
+already-running plugin work. Installation imports executable code from the
+selected module. Install only modules you intend to run. Provider, channel and
+hook plugins require an embedding host and are rejected by this installer.
+These commands install local bundles/modules; they do not download marketplace
+packages.

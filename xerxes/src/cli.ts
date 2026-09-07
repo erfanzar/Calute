@@ -1,6 +1,7 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { ManagedPlugins } from "./extensions/managedPlugins.js";
 import { version } from "../package.json" with { type: "json" };
 import { mkdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -1010,6 +1011,8 @@ async function runDaemon(
   await skillRegistry.refresh(...defaultSkillDiscoveryRoots({
     cwd: projectDirectory ?? config.projectDirectory,
   }));
+  const managedPlugins = new ManagedPlugins(join(xerxesHome(), "managed-plugins.json"));
+  await managedPlugins.load();
   const declarativeForge = new DeclarativeToolForge();
   const agentPresetRoster = new AgentPresetRoster({
     projectDirectory: projectDirectory ?? config.projectDirectory,
@@ -1064,6 +1067,7 @@ async function runDaemon(
       ...(buildId ? { buildId } : {}),
       onSessionModeChange: (sessionId) => announceModeChange?.(sessionId),
       skillRegistry,
+      managedPlugins,
       mcpManager,
       declarativeForge,
       agentPresetRoster,
@@ -1100,6 +1104,7 @@ async function runDaemon(
     onConnected: () => { if (!stopping) runtime.reload({}); },
   }).catch(error => console.error(`mcp: ${errorMessage(error)}`));
   const daemon = new DaemonServer({
+    managedPlugins,
     agentSettingsDefaults: config.runtime.agent_intelligence,
     socketPath,
     runtime,
@@ -1639,6 +1644,7 @@ function daemonRuntime(
     /** Announce a model-driven interaction-mode change to attached clients. */
     readonly onSessionModeChange?: (sessionId: string, mode: string) => void;
     readonly skillRegistry?: SkillRegistry;
+    readonly managedPlugins?: ManagedPlugins;
     readonly mcpManager?: MCPManager;
     readonly declarativeForge?: DeclarativeToolForge;
     readonly agentPresetRoster?: AgentPresetRoster;
@@ -1783,6 +1789,7 @@ function daemonRuntime(
         ...settings,
       }),
     });
+    host.managedPlugins?.registerTools(tools);
     const computerUseTool = createMacOSComputerUseToolOptions({
       ...config.runtime,
       ...settings,

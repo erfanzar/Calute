@@ -108,11 +108,12 @@ export interface OverlayState {
   lspSettings: boolean
   mcpSettings: boolean
   contextInspector: boolean
+  machinePicker: boolean
+  customAgentEditor: boolean
   monitors: boolean
   runs: boolean
   snapshots: boolean
   workspaces: boolean
-  machinePicker: boolean
   modelPicker: boolean
   reasoningPicker: boolean
   pager: null | PagerState

@@ -71,6 +71,22 @@ beforeEach(() => {
   patchUiState({ info: { cwd: '/repo', model: 'sonnet-4.6', mode: 'code', permission_mode: 'default' } as never })
 })
 
+it.each([220, 80, 40])('shows current reasoning effort beside the model and updates it at %i columns', async width => {
+  patchUiState({ info: { cwd: '/repo', model: 'gpt-6-astra', mode: 'code', reasoning_effort: 'high', permission_mode: 'default' } as never })
+  const screen = await testRender(<Composer composer={props(width).composer} />, { width, height: 16 })
+  try {
+    await screen.flush()
+    expect(screen.captureCharFrame().replace(/\s+/g, ' ')).toContain('reasoning: high')
+    act(() => patchUiState(state => ({ ...state, info: { ...state.info!, reasoning_effort: 'low' } })))
+    await screen.flush()
+    expect(screen.captureCharFrame().replace(/\s+/g, ' ')).toContain('reasoning: low')
+    expect(screen.captureCharFrame()).not.toContain('reasoning: high')
+    act(() => patchUiState(state => ({ ...state, info: { ...state.info!, reasoning_effort: undefined } })))
+    await screen.flush()
+    expect(screen.captureCharFrame()).not.toContain('reasoning:')
+  } finally { act(() => screen.renderer.destroy()) }
+})
+
 it.each([
   ['runs', 'Runs · Workspace', 'run.list'],
   ['monitors', 'Monitors · 0 watching', 'monitor.list'],
@@ -141,9 +157,11 @@ describe('clean terminal layout', () => {
       const heading = tallFrame.split('\n').find(line => line.includes('What are we working on?'))!
       expect(heading.indexOf('What are we working on?')).toBe(6)
       expect(tallFrame).toContain('map this repo')
+      expect(tallFrame).toContain('Explore capabilities · /features')
       expect(wide.captureCharFrame()).toContain(DERAFSH_KAVIANI_COMPACT_ART[0]!)
       expect(short.captureCharFrame()).not.toContain(DERAFSH_KAVIANI_COMPACT_ART[0]!)
       expect(short.captureCharFrame()).toContain('map this repo')
+      expect(short.captureCharFrame()).toContain('/features')
       expect(short.captureCharFrame()).toContain('XERXES')
     } finally {
       act(() => {

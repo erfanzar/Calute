@@ -24,6 +24,7 @@
  */
 
 import {
+  DEFAULT_MAX_GOAL_ROUNDS,
   admitGoalRound,
   blockGoal,
   getGoal,
@@ -138,7 +139,7 @@ export function nextGoalRound(
 
 /** The one-line transcript label for an admitted round. */
 export function goalRoundLabel(goal: GoalView, round: number): string {
-  return `Goal round ${round}/${goal.maxGoalRounds} — ${goal.objective}`
+  return `Goal round ${round}/${goal.maxGoalRounds === DEFAULT_MAX_GOAL_ROUNDS ? 'unlimited' : goal.maxGoalRounds} — ${goal.objective}`
 }
 
 /**
@@ -152,7 +153,7 @@ export function goalRoundPrompt(goal: GoalView, round: number): string {
     '<goal_round>',
     `Objective: ${JSON.stringify(goal.objective)}`,
     ...(goal.currentMilestone === undefined ? [] : [`Current milestone (progress context, not proof): ${JSON.stringify(goal.currentMilestone)}`]),
-    `Round ${round} of ${goal.maxGoalRounds}.`,
+    goal.maxGoalRounds === DEFAULT_MAX_GOAL_ROUNDS ? `Round ${round}. No round limit.` : `Round ${round} of ${goal.maxGoalRounds}.`,
     '',
     'The current workspace, this session\'s tool results, and the durable goal state are authoritative —',
     'not your recollection of them. Continue the objective.',

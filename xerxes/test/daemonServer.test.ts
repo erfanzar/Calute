@@ -235,6 +235,28 @@ test("daemon preserves JSON-RPC v35 NDJSON responses and stream event framing", 
   }
 });
 
+test("project agent editor RPC scopes writes and preserves invalid drafts on disk", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "xerxes-project-agent-rpc-"));
+  const socketPath = join(directory, "daemon.sock");
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, "sessions") });
+  const server = new DaemonServer({ socketPath, runtime, projectDirectory: directory });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    const content = '---\nname: "reviewer"\ndescription: Review code\n---\nFind defects.';
+    client.send({ jsonrpc: "2.0", id: 1, method: "agentPreset.projectWrite", params: { content, revision: null } });
+    const saved = (await client.next(frame => frame.id === 1)).result as Record<string, unknown>;
+    expect(saved).toMatchObject({ ok: true, id: "reviewer", content });
+    client.send({ jsonrpc: "2.0", id: 2, method: "agentPreset.projectList", params: {} });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true, agents: [{ id: "reviewer" }] });
+    client.send({ jsonrpc: "2.0", id: 3, method: "agentPreset.projectWrite", params: { id: "reviewer", content: "---\nname: wrong\n---\nBroken", revision: saved.revision } });
+    expect((await client.next(frame => frame.id === 3)).result).toMatchObject({ ok: false });
+    client.send({ jsonrpc: "2.0", id: 4, method: "agentPreset.projectRead", params: { id: "reviewer" } });
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ ok: true, content, revision: saved.revision });
+    expect(await readFile(join(directory, ".xerxes/agents/reviewer.md"), "utf8")).toBe(content);
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("agent preset RPC mirrors DSH roster, authoring, defaults, and blank-session locking", async () => {
   const directory = await mkdtemp(join(tmpdir(), "xerxes-agent-presets-rpc-"));
   const socketPath = join(directory, "daemon.sock");

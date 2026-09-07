@@ -4,6 +4,23 @@ import { expect, test } from 'bun:test'
 import { modelInventory, type ModelInventoryPort } from '../src/runtime/modelInventory.js'
 const profiles = [{ name: 'local', provider: 'custom', model: 'small', active: true, api_key: 'never-return', base_url: 'secret-endpoint' }, { name: 'second', provider: 'custom', model: 'large', active: false }]
 const port: ModelInventoryPort = { profiles: () => profiles, discover: async () => ({ models: [{ id: 'small', context_limit: 32000, context_source: 'provider' }, { id: 'large' }], source: 'remote' }), reasoning: async () => ({ efforts: ['low', 'high'], source: 'provider_reported', shape: 'effort' }) }
+test('first-page retries recover from empty, stale and different-query revisions', async () => {
+  const providers = await modelInventory(port, {})
+  const current = await modelInventory(port, { provider_profile: 'local' })
+  for (const revision of ['', 'stale', providers.revision]) {
+    for (const offset of [undefined, 0]) {
+      const refreshed = await modelInventory(port, { provider_profile: 'local', query: '', include_usage: true, revision, ...(offset === undefined ? {} : { offset }) })
+      expect(refreshed.entries).toEqual(current.entries)
+      expect(refreshed.revision).toBe(current.revision)
+    }
+  }
+  const filtered = await modelInventory(port, { provider_profile: 'local', query: 'small', revision: current.revision })
+  expect(filtered.entries.map(entry => entry.model)).toEqual(['small'])
+  await expect(modelInventory(port, { provider_profile: 'local', offset: 1, revision: '' })).rejects.toThrow('omit revision')
+  const first = await modelInventory(port, { provider_profile: 'local', limit: 1, offset: 0, revision: 'stale' })
+  const next = await modelInventory(port, { provider_profile: 'local', offset: first.next_offset, revision: first.revision })
+  expect(next.entries.map(entry => entry.model)).toEqual(['small'])
+})
 test('profile inventory is bounded, counts providers and never exposes connection credentials', async () => {
   const result = await modelInventory(port, { limit: 1 })
   expect(result.configured_profiles).toBe(2)

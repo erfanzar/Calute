@@ -185,8 +185,8 @@ export class GoalError extends Error {
   }
 }
 
-/** Default cap when a create omits one. Deliberately finite. */
-export const DEFAULT_MAX_GOAL_ROUNDS = 24
+/** Unlimited sentinel preserves the numeric persisted and wire format. */
+export const DEFAULT_MAX_GOAL_ROUNDS = Number.MAX_SAFE_INTEGER
 /** No implicit wall-clock cap: omitted duration preserves legacy behavior. */
 export const MAX_GOAL_DURATION_MS = Number.MAX_SAFE_INTEGER
 /** No implicit token cap: omitted total tokens preserves legacy behavior. */
@@ -392,8 +392,8 @@ export interface EditGoalRequest {
   readonly objective?: string
   readonly currentMilestone?: string | null
   readonly maxGoalRounds?: number
-  readonly maxDurationMs?: number
-  readonly maxTotalTokens?: number
+  readonly maxDurationMs?: number | null
+  readonly maxTotalTokens?: number | null
   readonly criteria?: readonly GoalCriterionSpec[]
 }
 
@@ -471,16 +471,16 @@ export function editGoal(
     : requireMaxRounds(request.maxGoalRounds)
   const maxDurationMs = request.maxDurationMs === undefined
     ? current.maxDurationMs
-    : requireMaxDuration(request.maxDurationMs)
+    : request.maxDurationMs === null ? undefined : requireMaxDuration(request.maxDurationMs)
   if (maxDurationMs !== undefined) requireDeadline(current.createdAt, maxDurationMs)
   const maxTotalTokens = request.maxTotalTokens === undefined
     ? current.maxTotalTokens
-    : requireMaxTotalTokens(request.maxTotalTokens)
+    : request.maxTotalTokens === null ? undefined : requireMaxTotalTokens(request.maxTotalTokens)
   const objectiveChanged = objective !== current.objective
   const criteria = request.criteria === undefined
     ? copyCriteria(current.criteria, !objectiveChanged)
     : mergeCriteria(requireCriteria(request.criteria), current.criteria, !objectiveChanged)
-  const { currentMilestone: _oldMilestone, ...withoutMilestone } = current
+  const { currentMilestone: _oldMilestone, maxDurationMs: _oldDuration, maxTotalTokens: _oldTokens, ...withoutMilestone } = current
   const next: GoalSnapshot = {
     ...withoutMilestone,
     objective,

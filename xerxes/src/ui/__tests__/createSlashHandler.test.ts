@@ -6,6 +6,7 @@ import { createSlashHandler } from '../app/createSlashHandler.js'
 import { getOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { patchUiState, resetUiState } from '../app/uiStore.js'
 import type { Msg, SlashCatalog } from '../types.js'
+import { FEATURES_GUIDE } from '../../bridge/features.js'
 
 const flush = async () => {
   await Promise.resolve()
@@ -91,6 +92,41 @@ function makeContext(request: ReturnType<typeof vi.fn>, catalog: null | SlashCat
 }
 
 describe('createSlashHandler', () => {
+  it.each(['/custom-agents', '/agents edit'])('opens project specialist editing with %s without resetting chat', async input => {
+    patchUiState({ sid: 's1' })
+    const request = vi.fn()
+    const { context, send } = makeContext(request)
+    createSlashHandler(context)(input)
+    await flush()
+    expect(getOverlayState().customAgentEditor).toBe(true)
+    expect(send).toEqual([])
+    expect(context.session.resetVisibleHistory).not.toHaveBeenCalled()
+  })
+  it('opens the capabilities guide without a provider call or resetting the conversation', async () => {
+    patchUiState({ sid: 's1' })
+    const request = vi.fn(async () => ({ output: FEATURES_GUIDE }))
+    const { context, page, send } = makeContext(request)
+    createSlashHandler(context)('/features')
+    await flush()
+    expect(page.join('\n')).toContain('EXPLORE XERXES')
+    expect(page.join('\n')).toContain('/schedules')
+    expect(page.join('\n')).toContain('/machine')
+    expect(send).toEqual([])
+    expect(request).toHaveBeenCalledWith('slash.exec', { command: 'features', session_id: 's1' })
+    expect(context.session.resetVisibleHistory).not.toHaveBeenCalled()
+  })
+  it('opens the machine picker without erasing history', async () => {
+    patchUiState({ sid: 's1' })
+    const request = vi.fn(async () => ({ output: 'error: Remote workspace switching is not implemented in the TUI.' }))
+    const { context, sys, send } = makeContext(request)
+    createSlashHandler(context)('/machine')
+    await flush()
+    expect(request).not.toHaveBeenCalled()
+    expect(getOverlayState().machinePicker).toBe(true)
+    expect(send).toEqual([])
+    expect(context.session.resetVisibleHistory).not.toHaveBeenCalled()
+    expect(context.transcript.setHistoryItems).not.toHaveBeenCalled()
+  })
   it('routes repository setup and existing workflow trust through the daemon without erasing history', async () => {
     patchUiState({ sid: 's1' })
     const request = vi.fn(async () => ({ ok: true, queued: true }))
@@ -104,6 +140,17 @@ describe('createSlashHandler', () => {
     expect(send).toEqual([])
     expect(context.session.resetVisibleHistory).not.toHaveBeenCalled()
     expect(context.transcript.setHistoryItems).not.toHaveBeenCalled()
+  })
+  it('routes unlimited goals without replacing history or sending a model message', async () => {
+    patchUiState({ sid: 's1' })
+    const request = vi.fn(async () => ({ ok: true, text: 'Goal limits removed' }))
+    const { context, page, send } = makeContext(request)
+    createSlashHandler(context)('/goal unlimited')
+    await flush()
+    expect(request).toHaveBeenCalledWith('session.goal', { input: 'unlimited', session_id: 's1' })
+    expect(page).toEqual(['Goal limits removed'])
+    expect(send).toEqual([])
+    expect(context.session.resetVisibleHistory).not.toHaveBeenCalled()
   })
   it('routes milestone commands without replacing history or sending a model message', async () => {
     patchUiState({ sid: 's1' })
@@ -183,6 +230,11 @@ describe('createSlashHandler', () => {
     ['/skills diagnostics', 'skills diagnostics'],
     ['/plugins', 'plugins'],
     ['/plugins inspect fixture', 'plugins inspect fixture'],
+    ['/plugins install /tmp/module.ts', 'plugins install /tmp/module.ts'],
+    ['/plugins enable fixture', 'plugins enable fixture'],
+    ['/plugins disable fixture', 'plugins disable fixture'],
+    ['/skills search review', 'skills search review'],
+    ['/skills install /tmp/skill', 'skills install /tmp/skill'],
     ['/tools list', 'tools'],
     ['/image a native sunset', 'image a native sunset'],
     ['/voice status', 'voice status']

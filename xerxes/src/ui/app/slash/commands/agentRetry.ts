@@ -25,6 +25,8 @@ export const agentRetryCommands: SlashCommand[] = [
       const parts = arg.trim().split(/\s+/).filter(Boolean)
       const sub = parts[0]?.toLowerCase() ?? ''
 
+      if (sub === 'edit') { patchOverlayState({ customAgentEditor: true }); return }
+
       if (sub === 'retry') {
         const target = parts[1]?.trim()
 
@@ -72,6 +74,6 @@ export const agentRetryCommands: SlashCommand[] = [
 
       patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0, agentsInspectId: null })
     },
-    usage: '/agents [status|retry <name-or-id> [message]]'
+    usage: '/agents [edit|status|retry <name-or-id> [message]]'
   }
 ]

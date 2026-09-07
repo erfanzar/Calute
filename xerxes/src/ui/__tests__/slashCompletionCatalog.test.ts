@@ -42,7 +42,7 @@ describe('slash catalog completions', () => {
     expect(rows.slice(0, 6).map(row => row.display)).toEqual(['agents', 'goal', 'loop', 'monitors', 'runs', 'schedules'])
   })
 
-  it.each(['agents', 'goal', 'loop', 'monitors', 'runs', 'schedules'])('finds the local %s command by prefix without daemon discovery', name => {
+  it.each(['agents', 'goal', 'loop', 'monitors', 'runs', 'schedules', 'terminals', 'config', 'context', 'snapshots', 'workspaces', 'machine', 'custom-agents'])('finds the local %s command by prefix without daemon discovery', name => {
     const input = '/' + name.slice(0, 3)
     expect(tuiSlashCompletions(input, null)).toContainEqual(expect.objectContaining({ text: '/' + name }))
   })

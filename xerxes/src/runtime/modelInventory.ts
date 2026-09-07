@@ -64,7 +64,10 @@ export async function modelInventory(port: ModelInventoryPort, params: Record<st
   }
   signal?.throwIfAborted()
   const revision = Bun.hash(JSON.stringify({ profileName, query, source, warning, entries })).toString(16)
-  if ((offset > 0 && params.revision === undefined) || (params.revision !== undefined && params.revision !== revision)) throw new Error('Inventory changed or revision missing; restart at offset 0')
+  // Page zero starts a fresh snapshot, including when a caller carries the
+  // previous query/profile's token or fills an optional revision with "".
+  // Only continuation pages must match the catalog being paginated.
+  if (offset > 0 && params.revision !== revision) throw new Error('Inventory changed or revision missing. Retry with offset: 0 and omit revision; then use the returned revision and next_offset for subsequent pages.')
   const page = entries.slice(offset, offset + limit)
   const quota = params.include_usage === true && profileName !== undefined && port.quota
     ? await port.quota(profileName, signal) : unknownProfileQuota('Subscription usage was not requested or no adapter is available.')

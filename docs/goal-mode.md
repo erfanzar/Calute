@@ -17,6 +17,14 @@ shared is the design — phases, compare-and-set refs, whole-snapshot change
 events, process-local activation, round attribution, the authority split — and
 not the code.
 
+## Limits
+
+New goals have unlimited continuation rounds and no token or wall-time cap by default. The model should only set a cap when the human explicitly asks for one. Provider quotas, individual turn limits, cancellation, and failure handling still apply.
+
+Existing saved limits are preserved. To remove all caps without losing the objective, criteria, evidence, or progress, run `/goal unlimited`. If the goal was blocked or paused, then run `/goal resume`. Explicit limits remain available through `/goal --tokens 100000` and `/goal --duration 30m`.
+
+The numeric round field uses `Number.MAX_SAFE_INTEGER` for unlimited to preserve session and protocol compatibility; the TUI displays it as unlimited.
+
 ## What a goal is
 
 | Field | Meaning |
@@ -141,3 +149,14 @@ is not the same as exposing it. The default agent declares an explicit `tools:`
 allow-list, so a tool absent from that list is invisible to the model however
 correctly it was registered. The first live goal run spent its entire budget
 replying "objective complete, the update_goal tool is unavailable".
+
+Model tools use `update_goal` action `unlimited` to remove all saved caps when the
+human requests unlimited work. This preserves progress and phase; a blocked or
+paused goal then needs `get_goal` and `resume` with the new revision. Automatic
+goal rounds cannot remove or increase budgets themselves.
+
+`resume` and `pause` accept only lifecycle changes. Provider-filled extra fields
+are ignored and reported in `ignored_fields`; they cannot replace the objective,
+clear criteria or milestones, or raise a cap. Resume admission failures return
+`GOAL_RESUME_DENIED` with the current goal and recovery guidance, without changing
+its revision. A plain request to continue does not authorize a budget change.

@@ -8,7 +8,7 @@ export function registerModelInventoryTool(registry: ToolRegistry, host: ModelIn
   registry.register({ type: 'function', function: { name: 'list_available_models', description: 'Discover configured providers and actual model choices before delegating to an agent. Without provider_profile, lists configured profiles. With it, discovers models and runtime-supported reasoning levels, context and output capacities. Set include_usage with provider_profile to request profile-bound subscription usage; unavailable quota stays unknown. Use returned revision with subsequent page offsets; discovery does not change the conversation model.', parameters: { type: 'object', additionalProperties: false, properties: {
     include_usage: { type: 'boolean' },
     provider_profile: { type: 'string', maxLength: 512 }, query: { type: 'string', maxLength: 512 },
-    offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 50 }, revision: { type: 'string', maxLength: 512 },
+    offset: { type: 'integer', minimum: 0, description: 'Omit or use 0 for a fresh inventory. For another page, use next_offset from the previous response.' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, revision: { type: 'string', maxLength: 512, description: 'Only needed when offset is greater than 0. Copy the previous response revision for the same provider_profile and query. Offset 0 always refreshes, ignoring this token.' },
   } } } }, async (args, context, signal) => {
     if (!context.sessionId?.trim()) throw new Error('Model inventory requires a session')
     signal?.throwIfAborted()

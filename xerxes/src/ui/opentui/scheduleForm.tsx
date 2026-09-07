@@ -1,16 +1,16 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 /** @jsxImportSource @opentui/react */
-import { useKeyboard, useTerminalDimensions } from '@opentui/react'
+import { useKeyboard } from '@opentui/react'
 import type { TextareaRenderable } from '@opentui/core'
 import { useEffect, useRef, useState } from 'react'
 import { useOptionalGateway } from '../app/gatewayContext.js'
 import type { Theme } from '../theme.js'
-import { Box, Text } from './primitives.js'
+import { Text } from './primitives.js'
+import { SettingsFormLayout } from './settingsFormLayout.js'
 export interface ScheduleDraft { max_total_tokens?: number | null; stop_condition?: string | null; target_session_id?: string | null; expires_at?: string | null; max_runs?: number | null; runs_started?: number; max_model_calls?: number | null; deliver?: string; recipient?: string; missed_run_policy?: "coalesce" | "skip"; misfire_grace_seconds?: number; timezone?: string; id: string; revision: string; prompt: string; schedule: string; paused: boolean; next_run_at?: string; timeout_seconds?: number | null; max_retries?: number | null; interval_seconds?: number | null }
 export function ScheduleForm({ t, initial, onClose, onSaved, followup = false }: { t: Theme; followup?: boolean; initial?: ScheduleDraft; onClose: () => void; onSaved: (id: string) => void }) {
   const gateway = useOptionalGateway()
-  const compact = useTerminalDimensions().height < 26
   const [field, setField] = useState(0)
   const [totalTokens, setTotalTokens] = useState(String(initial?.max_total_tokens ?? ''))
   const [stopCondition, setStopCondition] = useState(initial?.stop_condition ?? "")
@@ -65,7 +65,7 @@ export function ScheduleForm({ t, initial, onClose, onSaved, followup = false }:
       }).then(result => {
         if (cancelled) return
         if (!result?.ok || !result.next_run_at) throw new Error(result?.error || 'Preview unavailable')
-        setPreview(`Next eligible run (UTC): ${result.next_run_at}`)
+        setPreview(`Next eligible run (UTC):\n${result.next_run_at}`)
       }).catch(failure => { if (!cancelled) setPreview(`Next run: ${String(failure)}`) })
     }, 250)
     return () => { cancelled = true; clearTimeout(timer) }
@@ -110,14 +110,14 @@ export function ScheduleForm({ t, initial, onClose, onSaved, followup = false }:
     else if (field === 7) setMissedPolicy(value => value === "skip" ? "coalesce" : "skip")
     else if (field === 3) setPaused(value => !value)
   })
-  const labels = ['Prompt', 'Timing', intervalMode ? 'Interval seconds' : once ? 'ISO time with timezone' : 'Cron', 'State', 'Timeout seconds', 'One-shot retries', 'Recurring timezone', 'Missed runs', 'Lateness allowance seconds', 'Delivery channel', 'Recipient or room ID', 'Model calls per run (blank: unlimited)', 'Lifetime attempts (blank: unlimited)', 'Expiry ISO time (blank: none)', 'Run in', 'Stop condition (blank: none)', 'Lifetime token threshold (blank: unlimited)']
+  const labels = ['Prompt', 'Timing', intervalMode ? 'Interval seconds' : once ? 'ISO time with timezone' : 'Cron', 'State', 'Timeout seconds', 'One-shot retries', 'Recurring timezone', 'Missed runs', 'Lateness allowance seconds', 'Delivery channel', 'Recipient or room ID', 'Model calls per run', 'Lifetime attempts', 'Expires at', 'Run in', 'Stop condition', 'Lifetime token threshold']
   const values = [prompt || '(required)', intervalMode ? 'Interval' : once ? 'One-shot' : 'Recurring', intervalMode ? interval : once ? at || '(required)' : cron, paused ? 'Paused' : 'Enabled', timeout, retries, timezone, missedPolicy === "skip" ? "Skip overdue occurrences" : "Run once after returning", grace, deliver, recipient || "(none)", modelCalls || "unlimited", maxRuns || "unlimited", expiresAt || "none", target === "session" ? "This conversation (attempt limit and expiry required)" : "Independent scheduled session", stopCondition || "none", totalTokens || "unlimited"]
-  return <Box flexDirection="column" flexGrow={1} minHeight={0}>
-    <Text color={t.ds.secondary}>Attempts used: {initial?.runs_started ?? 0} · retries and manual runs count</Text>
-    <Text bold>{initial ? 'Edit schedule' : followup ? 'New conversation follow-up' : 'New schedule'}</Text>
-    <scrollbox style={{ flexGrow: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
-      {labels.map((label, index) => compact && Math.abs(index - field) > 1 ? null : <Text key={label} color={field === index ? t.color.accent : t.ds.secondary} wrap="wrap">{field === index ? '› ' : '  '}{label}: {values[index]}</Text>)}
-      {editable ? <textarea key={field} ref={input} focused={!busy} minHeight={1} maxHeight={3} focusedBackgroundColor={t.color.statusBg} focusedTextColor={t.color.text} onContentChange={() => {
+  return <SettingsFormLayout t={t} title={initial ? 'Edit schedule' : followup ? 'New conversation follow-up' : 'New schedule'}
+    subtitle="Choose the work, timing and limits. New jobs start paused."
+    fields={labels.map((label, id) => ({ id, label, value: values[id]!, group: id < 4 ? '01  TASK & TIMING' : id < 9 ? '02  EXECUTION' : id < 11 ? '03  DELIVERY' : '04  BUDGET & LIFETIME' }))}
+    selected={field} onSelect={setField} busy={busy ? 'Saving…' : ''} error={error}
+    compactHelp={field === 9 ? <Text color={t.ds.meta} wrap="wrap">↑/↓ {destinations.map(value => value.name).join(' · ') || destinationError || 'none'}</Text> : undefined}
+    editor={editable ? <textarea key={field} ref={input} focused={!busy} placeholder={field === 0 ? 'Describe the task to run…' : 'Enter a value…'} minHeight={field === 0 ? 3 : 1} maxHeight={3} focusedBackgroundColor={t.color.statusBg} focusedTextColor={t.color.text} onContentChange={() => {
         const value = input.current?.plainText ?? ''
         if (field === 16) setTotalTokens(value)
         else if (field === 15) setStopCondition(value)
@@ -135,15 +135,18 @@ export function ScheduleForm({ t, initial, onClose, onSaved, followup = false }:
         else if (once) setAt(value)
         else setCron(value)
       }} /> : null}
+    help={<>
       {field === 9 ? <Text color={t.ds.secondary} wrap="wrap">↑/↓ choose: {destinations.map(value => `${value.name}${value.enabled ? "" : " (disabled)"}`).join(" · ") || "none"}. {destinationError}</Text> : null}
       {field === 16 ? <Text color={t.ds.secondary} wrap="wrap">Blocks new calls at measured usage across all attempts. In-flight calls may overshoot. Unknown historical usage blocks execution.</Text> : null}
       {field === 15 ? <Text color={t.ds.secondary} wrap="wrap">Session follow-ups only. The model checks this condition and records its evidence before stopping future wakes.</Text> : null}
-      {error ? <Text color={t.color.warn} wrap="wrap">{error}</Text> : null}
-      <Text color={t.ds.secondary} wrap="wrap">{preview}{paused ? ' · Paused: enable to run.' : ''}</Text>
-      <Text color={t.ds.secondary} wrap="wrap">Overlap: forbidden. Skip applies after the lateness allowance; missed one-shots pause for review.</Text>
-      <Text color={t.ds.secondary} wrap="wrap">New jobs start paused. Enable when ready. The owning daemon must be online.</Text>
-    </scrollbox>
-    <Text color={t.ds.secondary}>{busy ? 'Saving…' : 'Tab field · ←→ choose · Enter save'}</Text>
-    <Text color={t.ds.secondary}>Esc back</Text>
-  </Box>
+
+      <Text color={t.ds.secondary} wrap="wrap">{field === 0 ? 'Describe what the agent should do each time this job runs.' : field === 2 ? (intervalMode ? 'Seconds between runs.' : once ? 'Use an ISO timestamp with timezone.' : 'Five cron fields: minute hour day month weekday. 0 9 * * * runs daily at 09:00.') : 'Changes take effect when you save.'}</Text>
+    </>}
+    summary={<>
+      <Text color={paused ? t.color.warn : t.color.accent} wrap="wrap">{paused ? 'Paused · enable when ready' : 'Enabled · runs on schedule'}</Text>
+      <Text color={t.ds.secondary} wrap="wrap">{preview}</Text>
+      <Text color={t.ds.meta} wrap="wrap">Attempts used: {initial?.runs_started ?? 0} · retries and manual runs count</Text>
+      <Text color={t.ds.meta} wrap="wrap">Runs never overlap. The owning daemon must be online.</Text>
+    </>}
+  />
 }

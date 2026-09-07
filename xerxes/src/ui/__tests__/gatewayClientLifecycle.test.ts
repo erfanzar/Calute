@@ -1132,3 +1132,18 @@ describe('stale daemon rejection message', () => {
     expect(message).not.toContain('kill undefined')
   })
 })
+
+it('preserves structured machine payloads and typed failures through slash adaptation', async () => {
+  const client = new GatewayClient({ projectDir: process.cwd(), sessionKey: 'test:machine' })
+  const machine = { alias: 'compute', target: 'host', workspacePath: '/srv/repo' }
+  const wire = vi.fn(async (_method: string, params: Record<string, unknown> = {}) => {
+    if (params.command === '/machine list') return { ok: true, machines: [machine], output: 'Remote workspaces' }
+    if (params.command === '/machine connect compute') return { ok: true, machine }
+    return { ok: false, error: 'Unknown machine' }
+  })
+  ;(client as unknown as { rawRequest: typeof wire }).rawRequest = wire
+  expect(await client.request('slash.exec', { command: 'machine list' })).toMatchObject({ ok: true, machines: [machine] })
+  expect(await client.request('slash.exec', { command: 'machine connect compute' })).toMatchObject({ ok: true, machine })
+  expect(await client.request('slash.exec', { command: 'machine connect missing' })).toEqual({ ok: false, error: 'Unknown machine', output: 'error: Unknown machine' })
+  expect(wire).toHaveBeenCalledWith('slash', { command: '/machine connect compute' })
+})

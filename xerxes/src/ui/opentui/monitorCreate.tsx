@@ -8,7 +8,8 @@ import { useOptionalGateway } from '../app/gatewayContext.js'
 import { createMonitor, listMonitorWebhooks } from '../lib/monitors.js'
 import { listTerminals, type TerminalSummary } from '../lib/terminals.js'
 import type { Theme } from '../theme.js'
-import { Box, Text } from './primitives.js'
+import { Text } from './primitives.js'
+import { SettingsFormLayout } from './settingsFormLayout.js'
 
 export function MonitorCreate({ t, onClose, onCreated }: { t: Theme; onClose: () => void; onCreated: (id: string) => void }) {
   const gateway = useOptionalGateway()
@@ -94,18 +95,15 @@ export function MonitorCreate({ t, onClose, onCreated }: { t: Theme; onClose: ()
   })
   const labels = ['Source', 'Terminal', 'Match', 'Duration seconds', 'Automatic reactions', 'Max reactions', 'Reaction timeout seconds', 'Trigger', 'Lifetime token threshold', 'File path', 'Websocket URL', 'Webhook name']
   const shown = [sourceKind === 'file' ? 'File changes' : sourceKind === 'websocket' ? 'Websocket server push' : sourceKind === 'webhook' ? 'Configured webhook' : 'Terminal output', terminals[terminalIndex]?.label ?? 'No terminals', sourceKind === 'terminal' && completion ? '(unused for completion)' : values[2] || '(required)', values[3], react ? 'Enabled' : 'Notifications only', values[5], values[6], sourceKind === 'terminal' && completion ? 'Command completion' : sourceKind === 'file' ? 'Metadata changes' : 'Output match', values[8] || 'unlimited', values[9] || '(required)', values[10] || '(required)', webhooks[webhookIndex] || (sourceKind === 'webhook' ? '(no configured webhooks)' : '(required)')]
-  return <Box flexDirection="column" flexGrow={1} minHeight={0}>
-    <Text bold color={t.color.text}>New monitor</Text>
-    <scrollbox style={{ flexGrow: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
-      {visibleFields.map(index => <Text key={labels[index]} color={index === field ? t.color.accent : t.ds.secondary} wrap="wrap">{index === field ? '› ' : '  '}{labels[index]}: {shown[index]}</Text>)}
-      {editable ? <textarea key={field} ref={input} focused minHeight={1} maxHeight={2} focusedBackgroundColor={t.color.statusBg} focusedTextColor={t.color.text} onContentChange={() => {
+  return <SettingsFormLayout t={t} title="New monitor" subtitle="Choose a source, then decide when and how to react."
+    fields={visibleFields.map(id => ({ id, label: labels[id]!, value: shown[id]!, group: [0, 1, 2, 9, 10, 11].includes(id) ? 'SOURCE & MATCH' : 'REACTIONS & LIMITS' }))}
+    selected={field} onSelect={setField} busy={busy ? 'Creating…' : ''} error={error}
+    editor={editable ? <textarea key={field} ref={input} focused={!busy} minHeight={1} maxHeight={2} focusedBackgroundColor={t.color.statusBg} focusedTextColor={t.color.text} onContentChange={() => {
         const text = input.current?.plainText ?? ''
         setValues(previous => previous.map((value, index) => index === field ? text : value))
       }} /> : null}
-      {error ? <Text color={t.color.warn} wrap="wrap">{error}</Text> : null}
+    help={<>
       <Text color={t.ds.secondary} wrap="wrap">{sourceKind === 'file' ? 'File watches report metadata changes only; rapid changes may coalesce. Contents are never read.' : sourceKind === 'websocket' ? 'Websocket watches receive text-only server push. Duplicates are suppressed; reconnects may create observation gaps. URL credentials and query strings are unsupported.' : sourceKind === 'webhook' ? 'Webhook watches use a configured host source. Payloads are text-only; delivery gaps may occur during reconnects.' : 'Reactions share the session model. Token thresholds block new calls; in-flight calls may overshoot. Unknown usage blocks further reactions.'}</Text>
-    </scrollbox>
-    <Text color={t.ds.secondary}>{busy ? 'Creating…' : 'Tab field · ←→ choose · Enter save'}</Text>
-    <Text color={t.ds.secondary}>Esc back</Text>
-  </Box>
+</>}
+  />
 }

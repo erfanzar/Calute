@@ -252,3 +252,13 @@ test('a long-running goal compacts its log instead of losing its head', () => {
   expect(folded.goal?.objective).toBe('a very long haul')
   expect(getGoal(metadata, session)?.roundsStarted).toBe(400)
 })
+
+test('default goals keep admitting rounds beyond the old 24-round cap without token or time limits', () => {
+  const metadata = fresh()
+  createGoal(metadata, session, { objective: 'finish all the work' }, 1000)
+  for (let i = 0; i < 30; i++) expect(admitGoalRound(metadata, session, 1001 + i)).toBeDefined()
+  const goal = getGoal(metadata, session)!
+  expect(goal.roundsStarted).toBe(30)
+  expect(goal.maxTotalTokens).toBeUndefined()
+  expect(goal.maxDurationMs).toBeUndefined()
+})

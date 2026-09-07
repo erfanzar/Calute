@@ -1530,9 +1530,9 @@ export class GatewayClient extends EventEmitter {
     const command = raw.startsWith('/') || raw.startsWith('!') || raw.startsWith('#') ? raw : `/${raw}`
     const result = (await this.rawRequest('slash', { command })) as RpcObject
     if (result.ok === false) {
-      return { output: 'error: ' + String(result.error ?? 'command was rejected') }
+      return { ...result, output: 'error: ' + String(result.error ?? 'command was rejected') }
     }
-    return { output: typeof result.output === 'string' ? result.output : '' }
+    return { ...result, output: typeof result.output === 'string' ? result.output : '' }
   }
 
   private async shellExec(params: Record<string, unknown>): Promise<RpcObject> {

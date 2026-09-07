@@ -35,10 +35,11 @@ export function scheduleUsageLabel(value: unknown): string {
 export function ScheduleOverlay({ t, followupsOnly = false }: { t: Theme; followupsOnly?: boolean }) {
   const gateway = useOptionalGateway()
   const sid = useStore($uiState).sid
-  const size = overlayPanelSize(useTerminalDimensions(), { maxWidth: 180, minWidth: 32 })
+  const terminal = useTerminalDimensions()
   const [deliveryId, setDeliveryId] = useState<string | null>(null)
   const [historyId, setHistoryId] = useState<string | null>(null)
   const [editing, setEditing] = useState<ScheduleDraft | 'new' | null>(null)
+  const size = overlayPanelSize(terminal, { maxWidth: editing ? 132 : 180, minWidth: 32, ...(editing ? { desiredHeight: 38 } : {}) })
   const [jobs, setJobs] = useState<Job[]>([])
   const [selected, setSelected] = useState('')
   const [error, setError] = useState('')

@@ -11,6 +11,35 @@ import { ScheduleOverlay } from '../opentui/scheduleOverlay.js'
 import { DARK_THEME } from '../theme.js'
 const job = { id: 'daily', prompt: 'Review changes', schedule: '0 9 * * *', paused: false, execution_state: 'idle', next_run_at: '2026-09-06T09:00:00Z', metadata: { delivery_state: 'failed', delivery_error: 'Destination offline' } }
 afterEach(() => resetOverlayState())
+it('opens a bounded schedule editor with grouped settings and a separate preview on a large terminal', async () => {
+  const rpc = vi.fn(async () => ({ ok: true, jobs: [], next_run_at: '2099-01-01T09:00:00.000Z' }))
+  const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><ScheduleOverlay t={DARK_THEME} /></GatewayProvider>, { width: 220, height: 65 })
+  try {
+    await screen.flush()
+    act(() => screen.mockInput.pressKey('n'))
+    await screen.flush()
+    const frame = screen.captureCharFrame()
+    expect(frame).toContain('01  TASK & TIMING')
+    expect(frame).toContain('04  BUDGET & LIFETIME')
+    expect(frame).toContain('EDIT · 1/17')
+    expect(frame).toContain('RUN PREVIEW')
+    const lines = frame.split('\n')
+    expect(lines.findIndex(line => line.includes('New schedule'))).toBeGreaterThan(10)
+    expect(lines.find(line => line.includes('New schedule'))!.indexOf('New schedule')).toBeGreaterThan(40)
+    await act(async () => screen.mockInput.typeText('Review the repository'))
+    await screen.flush()
+    act(() => screen.mockInput.pressKey('TAB', { shift: true }))
+    await screen.flush()
+    expect(screen.captureCharFrame()).toContain('EDIT · 17/17')
+    act(() => screen.mockInput.pressKey('TAB'))
+    await screen.flush()
+    expect(screen.captureCharFrame()).toContain('Review the repository')
+    act(() => screen.mockInput.pressKey('ESCAPE'))
+    await screen.flush()
+    await vi.waitFor(async () => { await screen.flush(); expect(screen.captureCharFrame()).toContain('Schedules · current workspace') })
+    expect(rpc.mock.calls.some(([method]) => method === 'schedule.create')).toBe(false)
+  } finally { act(() => screen.renderer.destroy()) }
+})
 it.each([[220, 65], [110, 35], [60, 24], [40, 18]])('renders schedules at %ix%i', async (width, height) => {
   const rpc = vi.fn(async () => ({ ok: true, jobs: [job] }))
   const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><ScheduleOverlay t={DARK_THEME} /></GatewayProvider>, { width, height })

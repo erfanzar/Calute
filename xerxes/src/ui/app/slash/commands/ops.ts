@@ -12,11 +12,11 @@ const nativeUnavailable = (ctx: SlashRunCtx, detail: string) =>
 
 export const opsCommands: SlashCommand[] = [
   { name: 'loop', group: 'activity', help: 'manage bounded follow-ups for this conversation', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ loops: true, schedules: false }); else return runNativeSlash(ctx, `loop ${arg.trim()}`, 'Follow-ups') } },
-  { name: 'context', help: 'inspect context, pin memory and exclude stale recall', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ contextInspector: true }); else ctx.transcript.sys('usage: /context') } },
+  { name: 'context', group: 'info', help: 'inspect context, pin memory and exclude stale recall', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ contextInspector: true }); else ctx.transcript.sys('usage: /context') } },
   { name: 'mcp', help: 'inspect MCP health [status|reconnect <name>]', run: (arg, ctx) => runNativeSlash(ctx, `mcp ${arg.trim()}`, 'MCP connections') },
-  { name: 'snapshots', help: 'browse snapshot timeline [list]', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ snapshots: true }); else if (arg.trim() === 'list') runNativeSlash(ctx, 'snapshots', 'Snapshots'); else ctx.transcript.sys('usage: /snapshots [list]') } },
-  { name: 'workspaces', help: 'review retained agent workspaces [list|after <cursor>|inspect <id>]', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ workspaces: true }); else runNativeSlash(ctx, `workspaces ${arg.trim()}`, 'Agent workspaces') } },
-  { name: 'config', help: 'configure agents, MCP or LSP servers [agents|mcp|lsp]', run: (arg, ctx) => {
+  { name: 'snapshots', group: 'session', help: 'browse snapshot timeline [list]', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ snapshots: true }); else if (arg.trim() === 'list') runNativeSlash(ctx, 'snapshots', 'Snapshots'); else ctx.transcript.sys('usage: /snapshots [list]') } },
+  { name: 'workspaces', group: 'activity', help: 'review retained agent workspaces [list|after <cursor>|inspect <id>]', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ workspaces: true }); else runNativeSlash(ctx, `workspaces ${arg.trim()}`, 'Agent workspaces') } },
+  { name: 'config', group: 'config', help: 'configure agents, MCP or LSP servers [agents|mcp|lsp]', run: (arg, ctx) => {
     if (!arg.trim() || arg.trim() === 'agents') patchOverlayState({ agentSettings: true })
     else if (arg.trim() === 'lsp') patchOverlayState({ lspSettings: true })
     else if (arg.trim() === 'mcp') patchOverlayState({ mcpSettings: true })
@@ -259,7 +259,7 @@ export const opsCommands: SlashCommand[] = [
   },
 
   {
-    help: 'list, inspect or trust skills and project commands; show discovery diagnostics',
+    help: 'list, search, install local skills, inspect or trust skills and commands',
     name: 'skills',
     run: (arg, ctx) => {
       const [sub = '', ...rest] = arg.trim().split(/\s+/).filter(Boolean)
@@ -280,10 +280,7 @@ export const opsCommands: SlashCommand[] = [
       }
 
       if (lower === 'search' || lower === 'install' || lower === 'browse') {
-        return nativeUnavailable(
-          ctx,
-          'skill search, installation, and browsing are not exposed by the Bun daemon. Use /skills for discovered skills.'
-        )
+        return runNativeSlash(ctx, `skills ${arg.trim()}`, 'Skills')
       }
 
       if (rest.length) {
@@ -295,7 +292,7 @@ export const opsCommands: SlashCommand[] = [
   },
 
   {
-    help: 'list native plugins or inspect <name>',
+    help: 'list, inspect, install local tool modules, enable or disable plugins',
     name: 'plugins',
     run: (arg, ctx) => {
       const sub = arg.trim().split(/\s+/, 1)[0]?.toLowerCase()
@@ -305,10 +302,7 @@ export const opsCommands: SlashCommand[] = [
       }
       if (sub === 'inspect') return runNativeSlash(ctx, `plugins ${arg.trim()}`, 'Plugin inspection')
 
-      nativeUnavailable(
-        ctx,
-        'plugin installation and enable/disable controls are not exposed. Use /plugins to list loaded native plugins.'
-      )
+      return runNativeSlash(ctx, `plugins ${arg.trim()}`, 'Plugins')
     }
   },
 

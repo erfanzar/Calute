@@ -77,7 +77,7 @@ test('milestone tool updates cannot smuggle objective edits or use background au
   expect((await h.call('get_goal')).goal.currentMilestone).toBeUndefined()
 })
 
-function harness(options: { blockedAfter?: number; executions?: readonly unknown[] } = {}): Harness {
+function harness(options: { blockedAfter?: number; executions?: readonly unknown[]; validateResume?: GoalToolHost['validateResume'] } = {}): Harness {
   const metadata: Record<string, unknown> = {}
   let turn = { human: true, round: undefined as number | undefined, evidence: true }
   const host: GoalToolHost = {
@@ -87,6 +87,7 @@ function harness(options: { blockedAfter?: number; executions?: readonly unknown
     currentRound: () => turn.round,
     evidenceExecution: (_context, id) => options.executions?.find(record => !!record && typeof record === 'object' && (record as Record<string, unknown>).toolCallId === id),
     now: () => 1_000,
+    ...(options.validateResume ? { validateResume: options.validateResume } : {}),
   }
   const registry = new ToolRegistry()
   registerGoalTools(registry, host, options.blockedAfter === undefined ? {} : { blockedAfterConsecutiveRounds: options.blockedAfter })
@@ -304,4 +305,48 @@ test('empty-string and zero fillers count as omitted', async () => {
   const ref = { goal_id: created.goal.id, revision: created.goal.revision }
   const edited = await h.call('update_goal', { ...ref, action: 'edit', objective: '', max_goal_rounds: 9 })
   expect(edited.goal).toMatchObject({ objective: 'ship', maxGoalRounds: 9 })
+})
+
+test('screenshot resume payload ignores unrelated fields while retaining milestone, criteria and caps', async () => {
+  const h = harness()
+  await h.call('create_goal', { objective: 'run ten scans', current_milestone: 'scan four', max_total_tokens: 2_000_000,
+    max_duration_ms: 60_000, max_goal_rounds: 10, criteria: [{ id: 'verified', description: 'Run all scans' }] })
+  await h.call('update_goal', { ...await h.ref(), action: 'pause' })
+  const result = await h.call('update_goal', { ...await h.ref(), action: 'resume', objective: '', current_milestone: null,
+    criteria: [], criterion_id: '', tool_call_id: '', evidence_summary: '', max_goal_rounds: 24,
+    max_duration_ms: 86400000, max_total_tokens: 4000000, blocked_reason: '' })
+  expect(result.goal).toMatchObject({ phase: 'active', objective: 'run ten scans', currentMilestone: 'scan four',
+    maxTotalTokens: 2_000_000, maxDurationMs: 60_000, maxGoalRounds: 10,
+    criteria: [{ id: 'verified', description: 'Run all scans' }] })
+  expect(result.ignored_fields).toContain('max_total_tokens')
+  expect(result.notice).toContain('Resume never changes limits')
+})
+
+test('exhausted resume returns recovery and unlimited explicitly clears caps without losing the goal', async () => {
+  const h = harness({ validateResume: (_context, goal) => {
+    if (goal.maxTotalTokens !== undefined) throw new Error('Goal token budget exhausted (2090726/2000000)')
+  } })
+  const created = await h.call('create_goal', { objective: 'run ten scans', max_total_tokens: 2_000_000, max_duration_ms: 60000, max_goal_rounds: 24 })
+  await h.call('update_goal', { ...await h.ref(), action: 'blocked', blocked_reason: 'Token budget exhausted' })
+  const before = await h.ref()
+  const denied = await h.call('update_goal', { ...before, action: 'resume', current_milestone: null, max_total_tokens: 4_000_000 })
+  expect(denied).toMatchObject({ ok: false, code: 'GOAL_RESUME_DENIED', goal: { phase: 'blocked' } })
+  expect(denied.recovery).toContain('do not retry this unchanged resume')
+  expect(await h.ref()).toEqual(before)
+  h.setTurn({ human: false })
+  await expect(h.call('update_goal', { ...before, action: 'unlimited' })).rejects.toThrow('direct human turn')
+  h.setTurn({ human: true })
+  const uncapped = await h.call('update_goal', { ...before, action: 'unlimited' })
+  expect(uncapped.goal).toMatchObject({ id: created.goal.id, objective: 'run ten scans', phase: 'blocked', maxGoalRounds: Number.MAX_SAFE_INTEGER })
+  expect(uncapped.goal.maxTotalTokens).toBeUndefined()
+  expect(uncapped.goal.maxDurationMs).toBeUndefined()
+  expect((await h.call('update_goal', { ...await h.ref(), action: 'resume' })).goal.phase).toBe('active')
+})
+
+test('milestone actions tolerate empty provider placeholders but reject meaningful edits', async () => {
+  const h = harness()
+  await h.call('create_goal', { objective: 'ship', current_milestone: null })
+  const result = await h.call('update_goal', { ...await h.ref(), action: 'milestone', current_milestone: 'test', objective: '', criteria: [], blocked_reason: '' })
+  expect(result.goal.currentMilestone).toBe('test')
+  await expect(h.call('update_goal', { ...await h.ref(), action: 'milestone', current_milestone: null, max_total_tokens: 100 })).rejects.toThrow()
 })

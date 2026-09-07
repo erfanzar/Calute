@@ -18,6 +18,7 @@
  */
 
 import {
+  DEFAULT_MAX_GOAL_ROUNDS,
   clearGoal,
   createGoal,
   editGoal,
@@ -32,7 +33,7 @@ import {
 } from "../runtime/goalDomain.js";
 
 export const GOAL_USAGE =
-  "Usage: /goal [<objective>|clear|edit <objective>|pause|resume|milestone [<text>|clear]|--duration <Ns|Nm|Nh>|--tokens <count>]";
+  "Usage: /goal [<objective>|clear|edit <objective>|pause|resume|unlimited|milestone [<text>|clear]|--duration <Ns|Nm|Nh>|--tokens <count>]";
 
 export type GoalCommand =
   | { readonly kind: "show" }
@@ -41,6 +42,7 @@ export type GoalCommand =
   | { readonly kind: "invalid-edit" }
   | { readonly kind: "duration"; readonly value: string }
   | { readonly kind: "tokens"; readonly value: string }
+  | { readonly kind: "unlimited" }
   | { readonly kind: "pause" }
   | { readonly kind: "resume" }
   | { readonly kind: "milestone-show" }
@@ -66,6 +68,7 @@ export function parseGoalCommand(rawInput: string): GoalCommand {
   const control = input.toLowerCase();
   if (control === "clear") return { kind: "clear" };
   if (control === "pause") return { kind: "pause" };
+  if (control === "unlimited") return { kind: "unlimited" };
   if (control === "resume") return { kind: "resume" };
   if (control === "milestone") return { kind: "milestone-show" };
   if (/^milestone\s+clear$/iu.test(input)) return { kind: "milestone", value: null };
@@ -107,8 +110,8 @@ function renderGoal(title: string, goal: GoalView): GoalCommandResult {
       ...blocker,
       `Objective: ${goal.objective}`,
       ...(goal.currentMilestone === undefined ? [] : [`Milestone: ${goal.currentMilestone}`]),
-      `Rounds: ${goal.roundsStarted}/${goal.maxGoalRounds}`,
-      ...(goal.maxTotalTokens === undefined ? [] : [`Total token admission cap: ${goal.maxTotalTokens}`]),
+      `Rounds: ${goal.roundsStarted}/${goal.maxGoalRounds === DEFAULT_MAX_GOAL_ROUNDS ? 'unlimited' : goal.maxGoalRounds}`,
+      `Total token admission cap: ${goal.maxTotalTokens ?? 'unlimited'}`,
       ...(goal.maxDurationMs === undefined ? [] : [`Wall-time limit: ${goal.maxDurationMs}ms from creation (includes pauses)`]),
       `Activation: ${goal.activation}`,
       "",
@@ -181,6 +184,10 @@ export function runGoalCommand(
         const count = /^\d+$/u.test(command.value) ? Number(command.value) : 0;
         if (!Number.isSafeInteger(count) || count < 1) return { ok: false, text: 'Use /goal --tokens 100000 (a positive whole token count).' };
         return renderGoal('Goal token cap updated', editGoal(metadata, sessionId, refOf(current), { maxTotalTokens: count }, now));
+      }
+      case "unlimited": {
+        if (!current) return missingGoal("unlimited");
+        return renderGoal("Goal limits removed. Use /goal resume if blocked or paused.", editGoal(metadata, sessionId, refOf(current), { maxGoalRounds: DEFAULT_MAX_GOAL_ROUNDS, maxDurationMs: null, maxTotalTokens: null }, now));
       }
       case "pause":
         if (!current) return missingGoal("pause");

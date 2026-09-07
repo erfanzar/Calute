@@ -473,7 +473,7 @@ export function GoalOverlay({ t }: GoalOverlayProps) {
       <Box backgroundColor={t.color.statusBg} borderColor={t.color.border} borderStyle="round"
         flexDirection="column" width={size.width} height={size.height} paddingX={2} paddingY={terminal.height >= 24 ? 1 : 0}>
         <Text bold color={t.color.text}>Goal & Todos</Text>
-        <Text color={t.ds.secondary}>{goalPhase ?? 'No active goal'}{inspected ? ` · rounds ${inspected.roundsStarted}/${inspected.maxGoalRounds}` : ''} · {done}/{todos.length} done · {active} active</Text>
+        <Text color={t.ds.secondary}>{goalPhase ?? 'No active goal'}{inspected ? ` · rounds ${inspected.roundsStarted}/${inspected.maxGoalRounds === Number.MAX_SAFE_INTEGER ? 'unlimited' : inspected.maxGoalRounds}` : ''} · {done}/{todos.length} done · {active} active</Text>
         {timeLimit ? <Text color={timeLimit.expired ? t.color.warn : t.ds.secondary}>TIME LIMIT · elapsed {formatDuration(timeLimit.elapsedMs)} · remaining {formatDuration(timeLimit.remainingMs)}{timeLimit.expired ? ' · EXPIRED' : ''}</Text> : null}
         {tokenUsageLine ? <Text color={tokenUsageLine.warning ? t.color.warn : t.ds.secondary}>{tokenUsageLine.text}</Text> : null}
         {continuationLine ? <Text color={inspection?.continuation?.state === 'interrupted' ? t.color.warn : t.ds.secondary} wrap="wrap">{continuationLine}{inspection?.continuation?.state === 'queued' && inspected?.activation === 'disarmed' ? ' · /goal resume required' : ''}</Text> : null}

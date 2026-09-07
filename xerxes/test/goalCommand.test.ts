@@ -4,7 +4,7 @@
 import { expect, test } from "bun:test";
 
 import { parseGoalCommand, runGoalCommand } from "../src/daemon/goalCommand.js";
-import { completeGoal, getGoal, resetGoalActivations } from "../src/runtime/goalDomain.js";
+import { blockGoal, completeGoal, getGoal, resetGoalActivations } from "../src/runtime/goalDomain.js";
 
 function fresh(): Record<string, unknown> {
   resetGoalActivations();
@@ -152,3 +152,22 @@ test("editing a completed goal starts the next one rather than rewriting history
   expect(edited.text).toContain("Objective: second objective");
   expect(getGoal(metadata, "s1")?.phase).toBe("active");
 });
+
+test('unlimited removes persisted caps without losing progress and allows a blocked goal to resume', () => {
+  const metadata = fresh()
+  runGoalCommand(metadata, 'uncapped', 'finish the work', 1000)
+  runGoalCommand(metadata, 'uncapped', '--tokens 2000000', 1001)
+  runGoalCommand(metadata, 'uncapped', '--duration 30m', 1002)
+  runGoalCommand(metadata, 'uncapped', 'milestone verify results', 1003)
+  blockGoal(metadata, 'uncapped', getGoal(metadata, 'uncapped')!, { code: 'token-budget', message: 'Goal token budget exhausted (2090726/2000000)' }, 1004)
+  const before = getGoal(metadata, 'uncapped')!
+  const result = runGoalCommand(metadata, 'uncapped', 'unlimited', 1005)
+  expect(result.ok).toBe(true)
+  expect(result.text).toContain('Rounds: 0/unlimited')
+  expect(result.text).toContain('Total token admission cap: unlimited')
+  const restored = JSON.parse(JSON.stringify(metadata))
+  expect(getGoal(restored, 'uncapped')).toMatchObject({ id: before.id, objective: before.objective, currentMilestone: 'verify results', phase: 'blocked', roundsStarted: 0 })
+  expect(getGoal(restored, 'uncapped')?.maxTotalTokens).toBeUndefined()
+  expect(getGoal(restored, 'uncapped')?.maxDurationMs).toBeUndefined()
+  expect(runGoalCommand(restored, 'uncapped', 'resume', 1006).ok).toBe(true)
+})

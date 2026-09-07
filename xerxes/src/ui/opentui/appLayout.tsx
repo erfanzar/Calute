@@ -69,11 +69,12 @@ import { MonitorOverlay } from './monitorOverlay.js'
 import { ScheduleOverlay } from './scheduleOverlay.js'
 import { LspSettingsOverlay } from './lspSettingsOverlay.js'
 import { McpSettingsOverlay } from './mcpSettingsOverlay.js'
+import { MachinePicker } from './machinePicker.js'
+import { CustomAgentEditor } from './customAgentEditor.js'
 import { AgentSettingsOverlay } from './agentSettingsOverlay.js'
 import { SnapshotOverlay } from './snapshotOverlay.js'
 import { WorkspaceOverlay } from './workspaceOverlay.js'
 import { RunOverlay } from './runOverlay.js'
-import { MachinePicker } from './machinePicker.js'
 import { displayModeLabel, SessionHeader, SessionTabStrip, SessionTelemetryRow, WorkspaceFooter } from './appChrome.js'
 import { CompletionMenu } from './completionMenu.js'
 import { CopyPicker } from './copyPicker.js'
@@ -1285,6 +1286,9 @@ export function Composer({ composer }: Pick<AppLayoutProps, 'composer'>) {
               <Span color={modeIsDefault ? t.ds.secondary : t.color.accent}>{'◆ ' + modeLabel + ' mode'}</Span>
               <Span color={t.ds.separator}>{' · '}</Span>
               <Span color={t.ds.meta}>{modelLabel}</Span>
+              {ui.info?.reasoning_effort?.trim() ? (
+                <Span color={t.ds.meta}>{' · reasoning: ' + ui.info.reasoning_effort.trim()}</Span>
+              ) : null}
               {narrow ? null : (
                 <Span color={yoloEnabled ? t.color.warn : t.ds.meta}>
                   {' · ' + writePolicyLabel(ui.info?.permission_mode)}
@@ -1596,6 +1600,9 @@ export function StartupWelcome({
           <StartChipRow chip={chip} cols={cols - welcomePadding * 2} composer={composer} index={index} key={chip.id} t={t} />
         ))}
       </Box>
+      <Box flexShrink={0} marginTop={rows >= 40 ? 1 : 0}>
+        <Text color={t.ds.meta} wrap="wrap">Explore capabilities <Span color={t.color.accent}>· /features</Span></Text>
+      </Box>
     </Box>
   )
 }
@@ -1731,7 +1738,7 @@ function InfoOverlay({ kind }: { kind: 'pluginsHub' | 'skillsHub' }) {
               Run /skills to discover skills available to this session.
             </text>
             <text fg={t.color.muted} flexShrink={0}>
-              Run /skill &lt;name&gt; to activate one.
+              /skills install &lt;local-path&gt; adds a bundle; /skill &lt;name&gt; activates it.
             </text>
           </>
         ) : (
@@ -1740,7 +1747,7 @@ function InfoOverlay({ kind }: { kind: 'pluginsHub' | 'skillsHub' }) {
               Run /plugins to inspect loaded native plugins and commands.
             </text>
             <text fg={t.color.muted} flexShrink={0}>
-              Plugin mutation is not exposed by the native daemon.
+              /plugins install &lt;local-module.ts&gt; · enable &lt;name&gt; · disable &lt;name&gt;
             </text>
           </>
         )}
@@ -2087,22 +2094,12 @@ export function AppLayout({
       {overlay.schedules ? <ScheduleOverlay t={t} /> : null}
       {overlay.lspSettings ? <LspSettingsOverlay t={t} /> : null}
       {overlay.mcpSettings ? <McpSettingsOverlay t={t} /> : null}
+      {overlay.machinePicker ? <MachinePicker t={t} onCancel={() => patchOverlayState({ machinePicker: false })} /> : null}
+      {overlay.customAgentEditor ? <CustomAgentEditor t={t} onClose={() => patchOverlayState({ customAgentEditor: false })} /> : null}
       {overlay.agentSettings ? <AgentSettingsOverlay t={t} /> : null}
       {overlay.runs ? <RunOverlay t={t} /> : null}
       {overlay.snapshots ? <SnapshotOverlay t={t} /> : null}
       {overlay.workspaces ? <WorkspaceOverlay t={t} /> : null}
-      {overlay.machinePicker ? (
-        <MachinePicker
-          onSelect={machine => {
-            patchOverlayState({ machinePicker: false })
-            if (machine) {
-              // TODO: wire the selected machine into the daemon
-              console.log('Selected machine:', machine)
-            }
-          }}
-          t={t}
-        />
-      ) : null}
       {overlay.skillsHub ? <InfoOverlay kind='skillsHub' /> : null}
       {overlay.pluginsHub ? <InfoOverlay kind='pluginsHub' /> : null}
     </Box>

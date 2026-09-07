@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 import { recordCompaction } from '../context/compactionHistory.js'
+import { FEATURES_GUIDE } from '../bridge/features.js';
 import { inspectSessionContext } from '../context/inspection.js';
 import { readContextControls, updateContextControls } from '../context/controls.js';
 import { parseTerminalOutputCursor } from '../runtime/terminalOutput.js';
@@ -32,6 +33,7 @@ import {
   type AgentDefinition,
 } from "../agents/definitions.js";
 import { persistedSubagentSnapshotValues } from "../agents/subagentPersistence.js";
+import { listProjectAgents, readProjectAgent, writeProjectAgent } from "../agents/projectEditor.js";
 import { AgentPresetRoster, type AgentPresetEntry } from "../agents/presets.js";
 import { CodexSession, fetchCodexModelCatalog } from "../auth/codexAuth.js";
 import { profileQuota } from '../auth/profileUsage.js';
@@ -89,6 +91,7 @@ import { withModelCallBudget } from '../llms/callBudget.js';
 import { SessionOperationQueue } from '../runtime/sessionOperationQueue.js';
 import { readGoalWake, queueGoalWake, claimGoalWake, finishGoalWake, cancelGoalWake, recoverGoalWake } from '../runtime/goalWake.js';
 import { runGoalCommand } from "./goalCommand.js";
+import { machineArguments, runMachineCommand } from "./machineCommand.js";
 import {
   nextGoalRound,
   type AdmittedGoalRound,
@@ -117,6 +120,9 @@ import {
   getDefaultSlashPluginRegistry,
   type SlashPluginRegistry,
 } from "../extensions/slashPlugins.js";
+import { ManagedPlugins } from "../extensions/managedPlugins.js";
+import { installLocalSkill } from "../extensions/localSkillInstall.js";
+import { SkillsHub } from "../extensions/skillsHub.js";
 import { PluginRegistry } from "../extensions/plugins.js";
 import {
   JsonRpcParseError,
@@ -412,6 +418,9 @@ const HANDLED_CANONICAL_COMMANDS: ReadonlySet<string> = new Set([
   "history",
   "goal",
   "help",
+  "features",
+  "machine",
+  "custom-agents",
   "image",
   "init",
   "insights",
@@ -746,6 +755,7 @@ export interface DaemonServerOptions {
   readonly pidPath?: string;
   /** Native extension registry used by `/plugins`. */
   readonly pluginRegistry?: PluginRegistry;
+  readonly managedPlugins?: ManagedPlugins;
   /** Persistent native provider profile store. */
   readonly profileStore?: ProfileStore;
   readonly agentSettingsStore?: AgentSettingsStore;
@@ -766,6 +776,7 @@ export interface DaemonServerOptions {
   readonly skillDirectories?: readonly string[];
   /** Writable user-owned root used by the interactive `/skill-create` flow. */
   readonly skillDirectory?: string;
+  readonly machineSettingsPath?: string;
   /** Native skill registry used by `/skills`, `/skill`, and skill shorthand commands. */
   readonly skillRegistry?: SkillRegistry;
   /** Plugin slash commands share the daemon dispatch path rather than a Python fallback. */
@@ -887,6 +898,7 @@ export class DaemonServer {
   private readonly onShutdown: (() => void | Promise<void>) | undefined;
   private readonly pidPath: string | undefined;
   private readonly pluginRegistry: PluginRegistry;
+  private readonly managedPlugins: ManagedPlugins | undefined;
   private readonly pluginRegistryConfigured: boolean;
   private readonly providerFlows = new Map<
     DaemonTransportConnection,
@@ -921,6 +933,7 @@ export class DaemonServer {
     SkillCreateFlow
   >();
   private readonly skillDirectory: string;
+  private readonly machineSettingsPath: string;
   private readonly slashPluginRegistry: SlashPluginRegistry;
   private readonly snapshotManagerFactory: (
     workspaceDirectory: string,
@@ -955,6 +968,7 @@ export class DaemonServer {
   private websocketGateway: DaemonWebSocketGateway | undefined;
 
   constructor(options: DaemonServerOptions) {
+    this.machineSettingsPath = options.machineSettingsPath ?? join(xerxesHome(), 'machines.json');
     this.codexModelCatalog = options.codexModelCatalog ?? (async (profile, signal) => {
       const credential = await new CodexSession().credential(signal);
       return fetchCodexModelCatalog(credential, {
@@ -1064,6 +1078,7 @@ export class DaemonServer {
         new AgentMemory(session?.cwd ? { projectRoot: session.cwd } : {}));
     this.onRestart = options.onRestart;
     this.onShutdown = options.onShutdown;
+    this.managedPlugins = options.managedPlugins;
     this.pluginRegistry = options.pluginRegistry ?? new PluginRegistry();
     this.pluginRegistryConfigured = options.pluginRegistry !== undefined;
     this.skillDirectory = resolve(
@@ -2968,14 +2983,16 @@ export class DaemonServer {
     if (configAction) return { ok: true, kind: 'slash', completions: ['agents', 'mcp', 'lsp']
       .filter(action => action.startsWith(configAction[1] ?? ''))
       .map(action => ({ value: `/config ${action} `, label: action, meta: 'Settings' })) };
-    const pluginInspect = /^\/plugins\s+inspect\s+(\S*)$/.exec(text);
-    if (pluginInspect) return { ok: true, kind: 'slash', completions: this.pluginRegistry.pluginNames.sort()
-      .filter(name => name.toLowerCase().startsWith((pluginInspect[1] ?? '').toLowerCase()))
-      .map(name => ({ value: `/plugins inspect ${name} `, label: name, meta: 'Registered plugin' })) };
+    const pluginAction = /^\/plugins\s+(\S*)$/.exec(text);
+    if (pluginAction) return { ok: true, kind: 'slash', completions: ['list', 'inspect', 'install', 'enable', 'disable'].filter(action => action.startsWith(pluginAction[1] ?? '')).map(action => ({ value: '/plugins ' + action + ' ', label: action, meta: 'Native tool plugins' })) };
+    const pluginInspect = /^\/plugins\s+(inspect|enable|disable)\s+(\S*)$/.exec(text);
+    if (pluginInspect) return { ok: true, kind: 'slash', completions: [...this.pluginRegistry.pluginNames, ...(this.managedPlugins?.inventory().map(item => item.name) ?? [])].sort()
+      .filter(name => name.toLowerCase().startsWith((pluginInspect[2] ?? '').toLowerCase()))
+      .map(name => ({ value: `/plugins ${pluginInspect[1]} ${name} `, label: name, meta: 'Registered plugin' })) };
     const skillsAction = /^\/skills\s+(\S*)$/.exec(text);
     if (skillsAction) {
       const prefix = (skillsAction[1] ?? '').toLowerCase();
-      return { ok: true, kind: 'slash', completions: ['list', 'inspect', 'diagnostics', 'trust']
+      return { ok: true, kind: 'slash', completions: ['list', 'inspect', 'diagnostics', 'trust', 'search', 'browse', 'install']
         .filter(action => action.startsWith(prefix))
         .map(action => ({ value: `/skills ${action} `, label: action, meta: 'Local skill discovery' })) };
     }
@@ -3593,6 +3610,15 @@ export class DaemonServer {
     const cwd = session?.cwd ?? this.projectDirectory ?? process.cwd();
     const id = optionalString(params.agent_preset) ?? optionalString(params.id) ?? "";
     try {
+      if (method === "agentPreset.projectList") return { ok: true, agents: listProjectAgents(cwd) };
+      if (method === "agentPreset.projectRead") return { ok: true, ...readProjectAgent(cwd, id) };
+      if (method === "agentPreset.projectWrite") {
+        if (params.revision !== null && typeof params.revision !== "string") throw new Error("revision must be a string or null for a new agent");
+        if (typeof params.content !== "string") throw new Error("content must be a string");
+        const saved = await writeProjectAgent(cwd, id, params.content, params.revision);
+        this.runtime.reload({});
+        return { ok: true, ...saved };
+      }
       if (method === "agentPreset.list") {
         return {
           ok: true,
@@ -4276,6 +4302,8 @@ export class DaemonServer {
     }
 
     switch (name) {
+      case "features":
+        return { ok: true, output: FEATURES_GUIDE };
       case "help":
       case "commands":
         this.emitSlash(
@@ -4332,7 +4360,7 @@ export class DaemonServer {
       case "platforms":
         return this.listPlatforms(connection);
       case "plugins":
-        return this.listPlugins(connection, args);
+        return this.listPlugins(connection, args, session);
       case "skills":
         return this.listSkills(connection, session, args);
       case "skill":
@@ -4809,7 +4837,11 @@ export class DaemonServer {
       case "workspace":
         return this.showWorkspace(connection, session, args);
       case "machine":
-        return this.showMachinePicker(connection);
+        return await runMachineCommand(this.machineSettingsPath, args) as JsonRpcPayload;
+      case "custom-agents": {
+        const agents = listProjectAgents(session?.cwd ?? this.projectDirectory ?? process.cwd());
+        return { ok: true, agents, output: ['CUSTOM AGENTS', ...agents.map(agent => `${agent.id} · ${agent.error ?? agent.description}`), 'Open /custom-agents in the TUI: N creates, Enter edits, Ctrl+S saves.'].join('\n') };
+      }
       case "image":
         return this.generateImage(connection, args);
       case "paste":
@@ -5051,10 +5083,22 @@ export class DaemonServer {
     return { ok: true, toolsets };
   }
 
-  private listPlugins(connection: DaemonTransportConnection, args = ''): JsonRpcPayload {
-    const [action = 'list', ...parts] = args.trim().split(/\s+/).filter(Boolean);
-    const inventory = this.pluginRegistry.inventory();
-    const source = this.pluginRegistryConfigured ? 'host-registry' : 'unconfigured';
+  private async listPlugins(connection: DaemonTransportConnection, args = '', session?: DaemonSession): Promise<JsonRpcPayload> {
+    let parsed: string[];
+    try { parsed = machineArguments(args); } catch { return { ok: false, error: 'Unclosed quote in extension command' }; }
+    const [action = 'list', ...parts] = parsed;
+    if (action === "install" || action === "enable" || action === "disable") {
+      if (!parts.length) return { ok: false, error: "Usage: /plugins install <local-module.ts> | enable <name-or-path> | disable <name-or-path>" };
+      if (!this.managedPlugins) return { ok: false, error: "This embedding host has not configured plugin management" };
+      try {
+        const output = await this.managedPlugins.change(action, action === "install" ? resolve(session?.cwd ?? process.cwd(), parts.join(" ")) : parts.join(" "));
+        this.runtime.reload({});
+        this.emitSlash(connection, output);
+        return { ok: true };
+      } catch (error) { return { ok: false, error: errorMessage(error) }; }
+    }
+    const inventory = [...this.pluginRegistry.inventory(), ...(this.managedPlugins?.inventory() ?? [])];
+    const source = this.pluginRegistryConfigured ? 'host-registry' : this.managedPlugins ? 'managed-modules' : 'unconfigured';
     if (action === 'inspect' && parts.length === 1) {
       const plugin = inventory.find(entry => entry.name === parts[0]);
       if (!plugin) return { ok: false, error: 'Plugin is not registered; use /plugins to inspect current registrations' };
@@ -5063,18 +5107,18 @@ export class DaemonServer {
         `Source: ${plugin.source.kind === 'module' ? plugin.source.path : 'registered by embedding host'}`,
         plugin.description,
         ...(['tools', 'hooks', 'channels', 'providers', 'dependencies'] as const).map(key => `${key}: ${plugin[key].join(', ') || 'none'}`),
-        'Execution readiness has not been checked. Registered capabilities may require additional host wiring.',
+        'enabled' in plugin ? `State: ${plugin.enabled ? 'enabled for subsequent turns' : 'disabled'}. Native tools use the plugin_ prefix.` : 'Execution readiness has not been checked. Registered capabilities may require additional host wiring.',
       ].join('\n'));
-      return { ok: true, source, plugin: { ...plugin }, execution_readiness: 'not_checked' };
+      return { ok: true, source, plugin: { ...plugin }, execution_readiness: 'enabled' in plugin ? plugin.enabled ? 'registered' : 'disabled' : 'not_checked' };
     }
-    if (action !== 'list' || parts.length) return { ok: false, error: 'Usage: /plugins [list|inspect <name>]' };
-    const plugins = this.pluginRegistry.pluginNames.sort();
+    if (action !== 'list' || parts.length) return { ok: false, error: 'Usage: /plugins [list|inspect <name>|install <local-module.ts>|enable <name>|disable <name>]'  };
+    const plugins = inventory.map(entry => entry.name).sort();
     const slashCommands = this.slashPluginRegistry.list();
     const lines = ["Native plugins:"];
-    if (!this.pluginRegistryConfigured) lines.push('No native plugin registry supplied by this host. Plugin loading and management are not configured.');
+    if (!this.pluginRegistryConfigured && !this.managedPlugins) lines.push('No native plugin registry supplied by this host. Plugin loading and management are not configured.');
     lines.push(
       ...(plugins.length
-        ? plugins.map((name) => `  \`${name}\``)
+        ? inventory.map((entry) => `  \`${entry.name}\`${"enabled" in entry ? entry.enabled ? " · enabled" : " · disabled" : ""}`)
         : ["  (no plugins loaded)"]),
     );
     if (slashCommands.length) {
@@ -5118,7 +5162,31 @@ export class DaemonServer {
     args = "",
   ): Promise<JsonRpcPayload> {
     await this.refreshSkills(session);
-    const [action = 'list', ...parts] = args.trim().split(/\s+/).filter(Boolean);
+    let parsed: string[];
+    try { parsed = machineArguments(args); } catch { return { ok: false, error: 'Unclosed quote in extension command' }; }
+    const [action = 'list', ...parts] = parsed;
+    if (action === "search" || action === "browse") {
+      const query = parts.join(" ");
+      const catalog = await new SkillsHub({ skillsDirectory: this.skillDirectory }).search(query, 50);
+      const combined = new Map(catalog.map(result => [result.name, { ...result, description: '' }]));
+      for (const skill of this.skillRegistry.search(query)) {
+        combined.set(skill.metadata.name, { name: skill.metadata.name, identifier: skill.sourcePath, source: 'discovered', description: skill.metadata.description });
+      }
+      const results = [...combined.values()].sort((a, b) => a.name.localeCompare(b.name)).slice(0, 50);
+      const output = ["Project, local and bundled skills:", ...results.map(result => result.name + ' · ' + result.source + (result.description ? '\n  ' + result.description : '')), ...(results.length ? [] : ['No matching skills.']), "Install a local skill directory: /skills install <path>"].join("\n");
+      this.emitSlash(connection, output);
+      return { ok: true, results: results.map(result => ({ ...result })) };
+    }
+    if (action === "install") {
+      if (!parts.length) return { ok: false, error: "Usage: /skills install <local-directory-or-SKILL.md>" };
+      try {
+        const path = await installLocalSkill(resolve(session?.cwd ?? process.cwd(), parts.join(" ")), this.skillDirectory, this.skillRegistry.all().map(skill => skill.metadata.name));
+        await this.refreshSkills(session);
+        this.runtime.reload({});
+        this.emitSlash(connection, "Installed skill and assets at " + path + ". Activate with /skill <name>.");
+        return { ok: true, path };
+      } catch (error) { return { ok: false, error: errorMessage(error) }; }
+    }
     if (action === 'trust' && parts.length === 1) {
       const candidates = new SkillRegistry();
       const roots = this.skillDirectories ?? defaultSkillDiscoveryRoots({ cwd: session?.cwd ?? process.cwd(), userSkillsDirectory: this.skillDirectory });
@@ -5165,7 +5233,7 @@ export class DaemonServer {
         execution_readiness: 'not_checked', instructions, truncated,
       } };
     }
-    if (action !== 'list' || parts.length) return { ok: false, error: 'Usage: /skills [list|inspect <name>|diagnostics|trust <name>]' };
+    if (action !== 'list' || parts.length) return { ok: false, error: 'Usage: /skills [list|search <query>|install <path>|inspect <name>|diagnostics|trust <name>]'  };
     const skills = this.skillRegistry
       .all()
       .filter((skill) => skillMatchesPlatform(skill));
@@ -5803,14 +5871,6 @@ export class DaemonServer {
       agents_directory: workspace.agentsDir,
       loaded_files: workspace.loadedFiles,
     };
-  }
-
-  private showMachinePicker(
-    connection: DaemonTransportConnection,
-  ): JsonRpcPayload {
-    // The TUI opens the picker overlay; the daemon just acknowledges.
-    this.emitSlash(connection, "Opening machine picker…");
-    return { ok: true };
   }
 
   private async generateImage(

@@ -176,3 +176,13 @@ test('unrelated corruption does not poison a healthy hot-path lookup', () => {
     rmSync(temporary.directory, { recursive: true, force: true })
   }
 })
+
+test('uncapped goals continue past two million tokens while explicit caps still reject', () => {
+  const ledger = new GoalTokenLedger(':memory:')
+  try {
+    ledger.initialize('session', 'goal')
+    ledger.admit('session', 'goal', 'owner')({ inputTokens: 2090726, outputTokens: 0 })
+    expect(() => ledger.admit('session', 'goal', 'owner', 2000000)).toThrow('exhausted')
+    expect(() => ledger.admit('session', 'goal', 'owner')({ inputTokens: 1, outputTokens: 1 })).not.toThrow()
+  } finally { ledger.close() }
+})

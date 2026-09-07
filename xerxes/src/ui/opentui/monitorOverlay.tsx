@@ -15,9 +15,10 @@ import { Box, Text } from './primitives.js'
 
 export function MonitorOverlay({ t }: { t: Theme }) {
   const gateway = useOptionalGateway()
-  const size = overlayPanelSize(useTerminalDimensions(), { maxWidth: 180, minWidth: 32 })
+  const terminal = useTerminalDimensions()
   const [editing, setEditing] = useState<MonitorView | null>(null)
   const [creating, setCreating] = useState(false)
+  const size = overlayPanelSize(terminal, { maxWidth: creating ? 120 : 180, minWidth: 32, ...(creating ? { desiredHeight: 32 } : {}) })
   const [rows, setRows] = useState<MonitorView[]>([])
   const [selected, setSelected] = useState('')
   const [detail, setDetail] = useState<MonitorView | null>(null)

@@ -23,7 +23,7 @@ it('previews timing without saving and ignores obsolete responses', async () => 
     await act(async () => resolveOld({ ok: true, next_run_at: '2099-01-01T09:00:00.000Z' }))
     await screen.flush()
     expect(screen.captureCharFrame()).not.toContain('2099-01-01')
-    expect(screen.captureCharFrame()).toContain('Paused: enable to run.')
+    expect(screen.captureCharFrame()).toContain('Paused · enable when ready')
     expect(rpc.mock.calls.every(call => call[0] === 'schedule.preview')).toBe(true)
   } finally { act(() => screen.renderer.destroy()) }
 })
@@ -32,7 +32,7 @@ it('shows the next eligible UTC instant before saving', async () => {
   const rpc = vi.fn(async () => ({ ok: true, next_run_at: '2099-01-01T09:00:00.000Z' }))
   const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><ScheduleForm t={DARK_THEME} onClose={() => {}} onSaved={() => {}} /></GatewayProvider>, { width: 110, height: 35 })
   try {
-    await vi.waitFor(async () => { await screen.flush(); expect(screen.captureCharFrame()).toContain('Next eligible run (UTC): 2099-01-01T09:00:00.000Z') })
+    await vi.waitFor(async () => { await screen.flush(); expect(screen.captureCharFrame()).toContain('2099-01-01T09:00:00.000Z') })
   } finally { act(() => screen.renderer.destroy()) }
 })
 it.each([[150, 40], [40, 18]])('creates a paused schedule at %ix%i', async (width, height) => {

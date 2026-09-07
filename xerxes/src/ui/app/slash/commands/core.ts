@@ -1,5 +1,6 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
+import { connectRemoteMachine, parseRemoteMachine } from '../../../lib/machineHandoff.js'
 import { NO_CONFIRM_DESTRUCTIVE } from '../../../config/env.js'
 import { dailyFortune, randomFortune } from '../../../content/fortunes.js'
 import { HOTKEYS } from '../../../content/hotkeys.js'
@@ -24,6 +25,7 @@ import type { StatusBarMode } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
 import { patchUiState } from '../../uiStore.js'
 import type { SlashCommand, SlashRunCtx } from '../types.js'
+import { runNativeSlash } from '../nativeSlash.js'
 
 /**
  * Persist a display preference and surface daemon failures as a transcript
@@ -156,6 +158,12 @@ function formatCommandsPage(sections: PanelSection[]): string {
 }
 
 export const coreCommands: SlashCommand[] = [
+  {
+    name: 'features',
+    group: 'info',
+    help: 'explore capabilities, entry points and current limitations',
+    run: (_arg, ctx) => runNativeSlash(ctx, 'features', 'Explore Xerxes')
+  },
   {
     help: 'list commands + hotkeys',
     name: 'help',
@@ -294,7 +302,7 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    help: 'set or view a goal and its milestone; --duration 30m or --tokens 100000 sets limits',
+    help: 'set or view a goal; unlimited removes limits; --duration 30m or --tokens 100000 sets limits',
     name: 'goal',
     group: 'activity',
     // Rendering happens daemon-side so the terminal, the bridge and every
@@ -314,19 +322,35 @@ export const coreCommands: SlashCommand[] = [
         )
         .catch(ctx.guardedErr)
     },
-    usage: '/goal [<objective>|clear|edit <objective>|pause|resume|milestone [<text>|clear]|--duration <Ns|Nm|Nh>|--tokens <count>]'
+    usage: '/goal [<objective>|clear|edit <objective>|pause|resume|unlimited|milestone [<text>|clear]|--duration <Ns|Nm|Nh>|--tokens <count>]'
   },
 
   {
-    help: 'select a remote machine to work on',
+    help: 'open remote workspaces over SSH; add or remove saved machines',
     name: 'machine',
-    run: (_arg, ctx) => {
-      // The TUI opens the picker overlay; the daemon just acknowledges.
-      ctx.gateway.rpc('slash', { command: '/machine' }).catch(ctx.guardedErr)
-      // Open the picker locally — the daemon's response is a no-op.
-      patchOverlayState({ machinePicker: true })
+    group: 'tools',
+    run: async (arg, ctx) => {
+      if (!arg.trim()) { patchOverlayState({ machinePicker: true }); return }
+      if (/^connect\s/.test(arg.trim())) {
+        try {
+          const result = await ctx.gateway.rpc('slash.exec', { command: 'machine ' + arg.trim() })
+          if (ctx.stale()) return
+          if (!result?.ok) throw new Error(String(result?.error ?? 'Could not resolve machine'))
+          await connectRemoteMachine(parseRemoteMachine(result.machine))
+          ctx.transcript.sys('Remote session closed. Back in your local workspace.')
+        } catch (error) { ctx.guardedErr(error) }
+        return
+      }
+      runNativeSlash(ctx, 'machine ' + arg.trim(), 'Remote workspaces')
     },
-    usage: '/machine'
+    usage: '/machine [add <name> <ssh-target> <absolute-path>|remove <name>|connect <name>|list]'
+  },
+  {
+    help: 'create and edit project specialist definitions',
+    name: 'custom-agents',
+    group: 'config',
+    run: () => { patchOverlayState({ customAgentEditor: true }) },
+    usage: '/custom-agents'
   },
 
   {
@@ -536,6 +560,7 @@ export const coreCommands: SlashCommand[] = [
     aliases: ['shells'],
     help: 'open the terminal viewer (F8)',
     name: 'terminals',
+    group: 'activity',
     run: (arg, ctx) => {
       if (arg) {
         return ctx.transcript.sys('usage: /terminals')

@@ -1327,3 +1327,30 @@ The daemon's explicit monitor HTTP host receives signed UTF-8 deliveries as
 documented in the configuration guide. Delivery data is untrusted evidence, not
 new authorization. Shutdown interrupts the watch and closes its subscription;
 restart requires a new watch and does not claim recovery of missed deliveries.
+
+### Project specialist editing and machine handoff
+
+Additive v35 RPCs under `agentPreset.*` use the selected session's project:
+
+- `agentPreset.projectList {}` → `{ok, agents:[{id,description,error?}]}`.
+- `agentPreset.projectRead {id}` → `{ok,id,content,revision}`.
+- `agentPreset.projectWrite {id?,content,revision}` → `{ok,id,content,revision}`.
+  New definitions use `revision:null` and may derive the id from YAML `name`.
+  Existing definitions require the read revision. Validation/conflict errors
+  return `ok:false`; the client preserves its draft. Successful saves refresh
+  runtime definitions.
+
+`slash.exec` with `command:"machine list"` returns `{ok,machines,output}`.
+Each machine is `{alias,target,workspacePath}`. `machine add <name> <ssh-target>
+<absolute-path>` and `machine remove <name>` mutate the user registry;
+`machine connect <name>` resolves a saved machine and returns `{ok,machine}`.
+Arguments may be single- or double-quoted. Resolution does not prove connectivity
+or change daemon session ownership. The terminal client suspends its renderer
+and launches interactive SSH for the returned target, then restores the local
+UI when SSH exits. Errors return `{ok:false,error}`.
+
+`slash.exec` also exposes local extension management: `skills search <query>`,
+`skills browse`, `skills install <directory-or-SKILL.md>`, `plugins install
+<module.ts>`, and `plugins enable|disable <name-or-path>`. Host availability,
+validation and import errors are returned explicitly. Plugin management is an
+injected daemon host capability; the production CLI supplies it.
