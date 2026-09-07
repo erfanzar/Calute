@@ -143,6 +143,14 @@ test('SkillTool searches beyond the prompt index, bounds listings, and preserves
   expect(activated).toContain('Apply it now.')
 })
 
+test('SkillTool preserves the registry shell-preprocessing trust decision', async () => {
+  const skills = new SkillRegistry()
+  skills.register({ ...parseSkillMarkdown('---\nname: project-workflow\n---\nReview !`echo fixture`.', '/virtual/SKILL.md'), allowCommandExecution: false })
+  const registry = new ToolRegistry()
+  registerClaudeSkillTool(registry, skills)
+  await expect(registry.execute(toolCall('SkillTool', { skill_name: 'project-workflow' }), { metadata: {} })).rejects.toThrow('/skills trust')
+})
+
 test('Claude agent tools map task lifecycle, outputs, and mailbox events to SpawnedAgentManager', async () => {
   const manager = new SpawnedAgentManager({
     idFactory: () => 'generated-agent',
@@ -278,14 +286,16 @@ test('Claude agent message drains are filtered and cursor-isolated by session ow
   expect(await tools.execute('CheckAgentMessages', {}, sessionB)).toMatchObject({ events: [] })
 })
 
-test('agent creation schemas require concise titles for single and batch delegation', async () => {
+test('agent creation schemas accept description for single delegation and require titles for batches', async () => {
   const byName = new Map(CLAUDE_AGENT_TOOL_DEFINITIONS.map(tool => [tool.function.name, tool]))
   const required = (name: string) => byName.get(name)?.function.parameters.required as string[] | undefined
   const properties = byName.get('AgentTool')?.function.parameters.properties as Record<string, Record<string, unknown>>
   const spawnProperties = byName.get('SpawnAgents')?.function.parameters.properties as Record<string, Record<string, unknown>>
   const awaitProperties = byName.get('AwaitAgents')?.function.parameters.properties as Record<string, Record<string, unknown>>
 
-  expect(required('AgentTool')).toContain('title')
+  expect(required('AgentTool')).toEqual(['prompt'])
+  expect(properties.description?.type).toBe('string')
+  expect(properties.resume?.type).toBe('string')
   expect(required('TaskCreateTool')).toContain('title')
   expect(properties.title?.maxLength).toBe(48)
   expect(spawnProperties.agents?.type).toBe('array')
@@ -303,8 +313,9 @@ test('agent creation schemas require concise titles for single and batch delegat
   registerClaudeAgentTools(registry, {
     manager,
   })
-  await expect(registry.execute(toolCall('AgentTool', { prompt: 'missing title' }), { metadata: {} }))
-    .rejects.toThrow('title')
+  const described = JSON.parse(await registry.execute(toolCall('AgentTool', { prompt: 'review', description: 'Review code' }), { metadata: {} }))
+  expect(described.title).toBe('Review code')
+  manager.close(described.id)
   await expect(registry.execute(toolCall('SpawnAgents', {
     agents: [{ prompt: 'missing batch title' }],
   }), { metadata: {} })).rejects.toThrow('title')
@@ -317,7 +328,7 @@ test('agent creation schemas require concise titles for single and batch delegat
     wait: false,
   }), { metadata: {} })) as Record<string, unknown>
   expect(accepted).toMatchObject({ accepted_count: 9, omitted_count: 1, shown_count: 8 })
-  expect(manager.listHandles()).toHaveLength(9)
+  expect(manager.listHandles().filter(handle => !handle.closed)).toHaveLength(9)
 
   const oversized = Array.from({ length: 33 }, (_, index) => ({
     prompt: `oversized task ${index}`,
@@ -327,7 +338,7 @@ test('agent creation schemas require concise titles for single and batch delegat
     agents: oversized,
     wait: false,
   }), { metadata: {} })).rejects.toThrow('at most 32')
-  expect(manager.listHandles()).toHaveLength(9)
+  expect(manager.listHandles().filter(handle => !handle.closed)).toHaveLength(9)
 })
 
 test('SpawnAgents runs registrations through a bounded concurrency pool while preserving batch order', async () => {

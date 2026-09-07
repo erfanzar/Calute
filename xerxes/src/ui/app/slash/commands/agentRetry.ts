@@ -20,6 +20,7 @@ export const agentRetryCommands: SlashCommand[] = [
   {
     help: 'open the agents dashboard · retry a failed agent in place',
     name: 'agents',
+    group: 'activity',
     run: (arg, ctx) => {
       const parts = arg.trim().split(/\s+/).filter(Boolean)
       const sub = parts[0]?.toLowerCase() ?? ''

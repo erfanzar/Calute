@@ -16,15 +16,16 @@ import {
 
 test('bridge command registry preserves canonical metadata, aliases, categories, and registry order', () => {
   expect(CATEGORIES).toContain('session')
-  expect(resolveCommand('/loop list')).toMatchObject({ name: 'loop', category: 'tools', argsHint: 'list|pause|resume|cancel|run <id>' })
-  expect(COMMAND_REGISTRY).toHaveLength(78)
+  expect(resolveCommand('/loop list')).toMatchObject({ name: 'loop', category: 'activity', argsHint: '[list|pause|resume|cancel|run <id>]' })
+  expect(listCommands('activity').map(command => command.name).sort()).toEqual(['agents', 'goal', 'loop', 'monitors', 'runs', 'schedules'])
+  expect(COMMAND_REGISTRY).toHaveLength(81)
   expect(resolveCommand('/mcp status')).toMatchObject({ name: 'mcp', category: 'tools' })
   expect(resolveCommand('/compress now')).toMatchObject({ name: 'compact', aliases: ['compress'] })
   expect(resolveCommand('/thinking high')).toMatchObject({ name: 'reasoning', argsHint: '[level]' })
   expect(resolveCommand('/q')).toMatchObject({ name: 'exit' })
   expect(resolveCommand('/help@XerxesBot')).toMatchObject({ name: 'help' })
   expect(resolveCommand('unknown')).toBeUndefined()
-  expect(resolveCommand('/goal ship the release')).toMatchObject({ name: 'goal', category: 'session' })
+  expect(resolveCommand('/goal ship the release')).toMatchObject({ name: 'goal', category: 'activity' })
   expect(listCommands('snapshots').map(commandDefinition => commandDefinition.name)).toEqual([
     'rollback',
     'snapshot',

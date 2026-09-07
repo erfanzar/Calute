@@ -91,6 +91,20 @@ function makeContext(request: ReturnType<typeof vi.fn>, catalog: null | SlashCat
 }
 
 describe('createSlashHandler', () => {
+  it('routes repository setup and existing workflow trust through the daemon without erasing history', async () => {
+    patchUiState({ sid: 's1' })
+    const request = vi.fn(async () => ({ ok: true, queued: true }))
+    const { context, send } = makeContext(request)
+    createSlashHandler(context)('/init focus on kernel tests')
+    await flush()
+    expect(request).toHaveBeenCalledWith('slash.exec', { command: 'init focus on kernel tests', session_id: 's1' })
+    createSlashHandler(context)('/skills trust repo-test')
+    await flush()
+    expect(request).toHaveBeenCalledWith('slash.exec', { command: 'skills trust repo-test', session_id: 's1' })
+    expect(send).toEqual([])
+    expect(context.session.resetVisibleHistory).not.toHaveBeenCalled()
+    expect(context.transcript.setHistoryItems).not.toHaveBeenCalled()
+  })
   it('routes milestone commands without replacing history or sending a model message', async () => {
     patchUiState({ sid: 's1' })
     const request = vi.fn(async () => ({ ok: true, text: 'Current milestone: Verify recovery' }))

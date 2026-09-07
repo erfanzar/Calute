@@ -2,8 +2,8 @@
 // Licensed under the Apache License, Version 2.0.
 
 import { existsSync, readdirSync, realpathSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { xerxesHome } from "../daemon/paths.js";
@@ -28,6 +28,8 @@ export interface SkillMetadata {
 }
 
 export interface Skill {
+  /** False for automatically loaded project instructions without explicit hash trust. */
+  readonly allowCommandExecution?: boolean;
   readonly instructions: string;
   readonly metadata: SkillMetadata;
   /** Set when frontmatter declared no `name:` and the containing directory name was used instead. */
@@ -61,6 +63,10 @@ export interface SkillDiscoveryNote {
 /** A discovery root plus whether its contents arrived with the working directory. */
 export interface SkillDiscoveryRoot {
   readonly path: string;
+  /** Load instructions without hash trust; shell preprocessing still requires trust. */
+  readonly autoLoadInstructions?: boolean;
+  /** Flat Markdown command files share skill validation, trust and activation. */
+  readonly format?: 'commands';
   /** Roots a cloned repository can populate; their skills go through {@link WorkspaceSkillTrust}. */
   readonly workspace?: boolean;
 }
@@ -77,6 +83,8 @@ export interface WorkspaceSkillCandidate {
 /** Host decision about admitting a workspace-sourced skill into the registry. */
 export interface WorkspaceSkillTrust {
   isTrusted(candidate: WorkspaceSkillCandidate): boolean | Promise<boolean>;
+  /** Refresh a stable trust snapshot once per discovery pass. */
+  refresh?(): void | Promise<void>;
 }
 
 export interface SkillRegistryOptions {
@@ -516,13 +524,14 @@ async function discoverInto(
   roots: readonly SkillDiscoveryRootInput[],
   workspaceTrust: WorkspaceSkillTrust | undefined,
 ): Promise<DiscoveryOutcome> {
+  await workspaceTrust?.refresh?.();
   const discovered: string[] = [];
   const notes: SkillDiscoveryNote[] = [];
   let totalBytes = 0;
   let budgetExhausted = false;
   for (const root of roots) {
-    const { path: directory, workspace = false } = normalizeDiscoveryRoot(root);
-    for await (const skillPath of skillFiles(directory)) {
+    const { path: directory, workspace = false, format, autoLoadInstructions = false } = normalizeDiscoveryRoot(root);
+    for await (const skillPath of skillFiles(directory, 0, format === 'commands')) {
       if (totalBytes >= MAX_SKILL_DISCOVERY_TOTAL_BYTES) {
         // A hostile tree of large files must not exhaust memory through unbounded discovery reads.
         budgetExhausted = true;
@@ -563,6 +572,9 @@ async function discoverInto(
         }
         totalBytes += metadata.size;
         skill = parseSkillMarkdown(await readFile(skillPath, "utf8"), skillPath);
+        if (format === 'commands' && skill.nameFromDirectory) {
+          skill = { ...skill, nameFromDirectory: false, metadata: { ...skill.metadata, name: basename(skillPath, '.md') } };
+        }
       } catch (error) {
         // A corrupt third-party skill is isolated; remaining skills stay discoverable.
         notes.push({ kind: "parse-error", path: skillPath, detail: errorDetail(error) });
@@ -587,9 +599,9 @@ async function discoverInto(
         });
         continue;
       }
-      if (workspace && workspaceTrust !== undefined) {
-        const trusted = await workspaceTrust.isTrusted({ name, root: directory, skillPath });
-        if (!trusted) {
+      if (workspace && (workspaceTrust !== undefined || autoLoadInstructions)) {
+        const trusted = await workspaceTrust?.isTrusted({ name, root: directory, skillPath }) ?? false;
+        if (!trusted && !autoLoadInstructions) {
           notes.push({
             kind: "untrusted-workspace",
             path: skillPath,
@@ -598,6 +610,7 @@ async function discoverInto(
           });
           continue;
         }
+        skill = { ...skill, allowCommandExecution: trusted };
       }
       const shadowing = skills.get(name);
       if (shadowing !== undefined) {
@@ -639,7 +652,7 @@ export function defaultSkillDiscoveryDirectories(
 /**
  * The same roots as {@link defaultSkillDiscoveryDirectories}, tagged with their provenance.
  *
- * The two working-directory roots are whatever the checked-out repository happens to contain, so
+ * Working-directory roots are whatever the checked-out repository happens to contain, so
  * a host that supplies a {@link WorkspaceSkillTrust} needs them distinguishable from the user's
  * own and the bundled roots.
  */
@@ -650,6 +663,8 @@ export function defaultSkillDiscoveryRoots(
   const roots: readonly SkillDiscoveryRoot[] = [
     { path: join(cwd, ".agents", "skills"), workspace: true },
     { path: join(cwd, "skills"), workspace: true },
+    { path: join(cwd, ".xerxes", "skills"), workspace: true, autoLoadInstructions: true },
+    { path: join(cwd, ".xerxes", "commands"), workspace: true, autoLoadInstructions: true, format: 'commands' },
     { path: options.userSkillsDirectory ?? join(xerxesHome(), "skills") },
     { path: join(xerxesHome(), "agents", "skills") },
     { path: BUNDLED_SKILLS_DIRECTORY },
@@ -673,13 +688,13 @@ export function trustedHashWorkspaceSkills(paths: SkillGuardPaths = {}): Workspa
   // Read the database once per predicate: a rewrite mid-pass must not change verdicts halfway through.
   let database: Promise<Record<string, string>> | undefined;
   return {
+    refresh() { database = loadTrustedHashes(paths); },
     async isTrusted(candidate: WorkspaceSkillCandidate): Promise<boolean> {
       database ??= loadTrustedHashes(paths);
-      const expected = (await database)[candidate.skillPath];
-      if (expected === undefined) {
-        return false;
-      }
       try {
+        const hashes = await database;
+        const expected = hashes[candidate.skillPath] ?? hashes[await realpath(candidate.skillPath)];
+        if (expected === undefined) return false;
         return (await hashSkillFile(candidate.skillPath)) === expected;
       } catch {
         // An unhashable file cannot be proven trusted; withhold it rather than assume the best.
@@ -741,7 +756,7 @@ export function skillMatchesPlatform(
   );
 }
 
-async function* skillFiles(directory: string, depth = 0): AsyncGenerator<string> {
+async function* skillFiles(directory: string, depth = 0, commands = false): AsyncGenerator<string> {
   if (depth > MAX_SKILL_DISCOVERY_DEPTH) return;
   try {
     const entries = await readdir(directory, {
@@ -752,8 +767,8 @@ async function* skillFiles(directory: string, depth = 0): AsyncGenerator<string>
       const path = join(directory, entry.name);
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) {
-        yield* skillFiles(path, depth + 1);
-      } else if (entry.isFile() && entry.name === "SKILL.md") {
+        if (!commands) yield* skillFiles(path, depth + 1);
+      } else if (entry.isFile() && (commands ? entry.name.endsWith('.md') && entry.name !== 'README.md' : entry.name === "SKILL.md")) {
         yield path;
       }
     }

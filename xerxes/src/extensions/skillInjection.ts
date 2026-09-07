@@ -12,9 +12,9 @@
  * - `` !`command` `` — execute the command in the project shell and splice
  *   its stdout into the instructions before the model sees them.
  *
- * Trust model: expansion runs only on skills that survived registry
- * admission (bundled, user-installed, or hash-trusted workspace skills —
- * untrusted workspace skills never reach the registry), and the expanded
+ * Trust model: project instructions may load automatically, but shell
+ * preprocessing requires explicit hash trust. Callers forward the registry's
+ * allowCommandExecution decision. The expanded
  * text still passes through the prompt-injection scan in
  * skillPromptSection, so command output is neutralized like any other
  * untrusted content.
@@ -26,6 +26,7 @@ const INJECTION_TIMEOUT_MS = 10_000
 const INJECTION_OUTPUT_CAP = 4 * 1024
 
 export interface SkillExpansionOptions {
+  readonly allowCommandExecution?: boolean
   /** Raw argument string from the invocation (`/skill name arg1 arg2`). */
   readonly args?: string
   /** Working directory for `` !`cmd` `` execution. */
@@ -40,8 +41,12 @@ export async function expandSkillInstructions(
   options: SkillExpansionOptions,
 ): Promise<string> {
   let expanded = substituteArguments(instructions, options.args)
+  INJECTION_PATTERN.lastIndex = 0
   if (!INJECTION_PATTERN.test(expanded)) return expanded
   INJECTION_PATTERN.lastIndex = 0
+  if (options.allowCommandExecution === false) {
+    throw new Error('This project workflow uses shell preprocessing. Review it and run /skills trust <name> to enable command expansion.')
+  }
 
   const run = options.run ?? defaultSkillCommandExecutor(options.cwd)
   const replacements: { readonly replacement: string; readonly span: string }[] = []

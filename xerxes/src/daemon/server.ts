@@ -97,9 +97,12 @@ import {
   defaultSkillDiscoveryRoots,
   skillActivationPrompt,
   skillMatchesPlatform,
+  parseSkillMarkdown,
+  skillInstructionsAreSafe,
   SkillRegistry,
   trustedHashWorkspaceSkills,
 } from "../extensions/skills.js";
+import { recordTrustedSkillContent } from "../extensions/skillsGuard.js";
 import { expandSkillInstructions } from "../extensions/skillInjection.js";
 import { skillSuggestionValues } from "../extensions/skillSuggestions.js";
 import {
@@ -407,6 +410,7 @@ const HANDLED_CANONICAL_COMMANDS: ReadonlySet<string> = new Set([
   "fast",
   "feedback",
   "history",
+  "goal",
   "help",
   "image",
   "init",
@@ -1063,12 +1067,12 @@ export class DaemonServer {
     this.pluginRegistry = options.pluginRegistry ?? new PluginRegistry();
     this.pluginRegistryConfigured = options.pluginRegistry !== undefined;
     this.skillDirectory = resolve(
-      options.skillDirectory ?? join(homedir(), ".xerxes", "skills"),
+      options.skillDirectory ?? join(xerxesHome(), "skills"),
     );
     this.skillDirectories = options.skillDirectories;
     this.skillRegistry =
       options.skillRegistry ??
-      new SkillRegistry({ workspaceTrust: trustedHashWorkspaceSkills() });
+      new SkillRegistry({ workspaceTrust: trustedHashWorkspaceSkills({ skillsDirectory: this.skillDirectory }) });
     this.slashPluginRegistry =
       options.slashPluginRegistry ?? getDefaultSlashPluginRegistry();
     this.snapshotManagerFactory =
@@ -2971,7 +2975,7 @@ export class DaemonServer {
     const skillsAction = /^\/skills\s+(\S*)$/.exec(text);
     if (skillsAction) {
       const prefix = (skillsAction[1] ?? '').toLowerCase();
-      return { ok: true, kind: 'slash', completions: ['list', 'inspect', 'diagnostics']
+      return { ok: true, kind: 'slash', completions: ['list', 'inspect', 'diagnostics', 'trust']
         .filter(action => action.startsWith(prefix))
         .map(action => ({ value: `/skills ${action} `, label: action, meta: 'Local skill discovery' })) };
     }
@@ -4339,6 +4343,11 @@ export class DaemonServer {
         return this.showMemory(connection, session);
       case "personality":
         return this.showPersonality(connection, session);
+      case "goal": {
+        const result = await this.dispatch(connection, { jsonrpc: "2.0", id: 0, method: "session.goal", params: { input: args } });
+        if (typeof result.text === "string") this.emitSlash(connection, result.text);
+        return result;
+      }
       case "context": {
         if (!session) return { ok: false, error: "No active session" };
         const inspected = inspectSessionContext(session);
@@ -5110,6 +5119,20 @@ export class DaemonServer {
   ): Promise<JsonRpcPayload> {
     await this.refreshSkills(session);
     const [action = 'list', ...parts] = args.trim().split(/\s+/).filter(Boolean);
+    if (action === 'trust' && parts.length === 1) {
+      const candidates = new SkillRegistry();
+      const roots = this.skillDirectories ?? defaultSkillDiscoveryRoots({ cwd: session?.cwd ?? process.cwd(), userSkillsDirectory: this.skillDirectory });
+      await candidates.refresh(...roots);
+      const skill = candidates.get(parts[0]!);
+      if (!skill) return { ok: false, error: 'Skill or command not found, or its instructions failed validation' };
+      const content = await readFile(skill.sourcePath, 'utf8');
+      if (!skillInstructionsAreSafe(parseSkillMarkdown(content, skill.sourcePath))) return { ok: false, error: 'Instructions failed the security scan; file was not trusted' };
+      await recordTrustedSkillContent(skill.sourcePath, content, { skillsDirectory: this.skillDirectory });
+      await this.refreshSkills(session);
+      this.runtime.reload({});
+      this.emitSlash(connection, `Trusted the current contents of ${skill.sourcePath}. Invoke /${skill.metadata.name}; edits require trusting the new contents again.`);
+      return { ok: true, name: skill.metadata.name, path: skill.sourcePath };
+    }
     if (action === 'diagnostics' && !parts.length) {
       const notes = this.skillRegistry.discoveryNotes;
       const diagnostics = notes.slice(0, 200).map(note => ({ ...note, detail: note.detail.slice(0, 1000) }));
@@ -5142,7 +5165,7 @@ export class DaemonServer {
         execution_readiness: 'not_checked', instructions, truncated,
       } };
     }
-    if (action !== 'list' || parts.length) return { ok: false, error: 'Usage: /skills [list|inspect <name>|diagnostics]' };
+    if (action !== 'list' || parts.length) return { ok: false, error: 'Usage: /skills [list|inspect <name>|diagnostics|trust <name>]' };
     const skills = this.skillRegistry
       .all()
       .filter((skill) => skillMatchesPlatform(skill));
@@ -5211,6 +5234,7 @@ export class DaemonServer {
     // injections before the activation prompt is built. Expansion output is
     // untrusted — the scan in skillPromptSection still applies.
     const expandedInstructions = await expandSkillInstructions(skill.instructions, {
+      allowCommandExecution: skill.allowCommandExecution !== false,
       ...(argumentsText ? { args: argumentsText } : {}),
       cwd: openedSession.cwd,
     });
@@ -5719,10 +5743,11 @@ export class DaemonServer {
       .then(async () => {
         const active = this.runtime.sessionStatus(key);
         await this.refreshSkills(active);
+        this.runtime.reload({});
         const workspace = await loadProjectAgentWorkspace(projectDirectory);
         this.emitSlash(
           connection,
-          `Project initialization turn finished. Loaded ${workspace.loadedFiles.length} project workspace file(s) and ${this.skillRegistry.all().length} native skill(s).`,
+          `Project initialization turn finished. Refreshed agent definitions and loaded ${workspace.loadedFiles.length} project workspace file(s) and ${this.skillRegistry.all().length} skills/commands. Use /skills to inspect them and /skills diagnostics for rejected files.`,
         );
       })
       .catch((error) =>
@@ -6633,14 +6658,14 @@ export class DaemonServer {
     connection: DaemonTransportConnection,
     session: DaemonSession | undefined,
   ): Promise<JsonRpcPayload> {
-    this.runtime.reload({});
     const active =
       session ?? this.runtime.sessionStatus(connection.activeSessionKey);
+    await this.refreshSkills(active);
+    this.runtime.reload({});
     if (active) {
       this.emitInitDone(connection, active);
       this.emitStatus(connection, active);
     }
-    await this.refreshSkills(active);
     this.emitSlash(
       connection,
       `Reloaded native runtime configuration and ${this.skillRegistry.all().length} discovered skill(s).`,
@@ -10459,8 +10484,13 @@ function projectInitializationPrompt(
     `Project root: \`${projectDirectory}\`.`,
     ...(request ? ["", `Additional request: ${request}`] : []),
     "",
-    "Inspect the repository before changing files. Produce project-specific agent context in `XERXES.md` and `.agents/` only when the current runtime exposes the needed file and sub-agent tools.",
-    "Capture real build/test commands, architecture, conventions, and risks. Do not invent a generic template when tooling is unavailable; report the blocker instead.",
+    "Inspect package manifests, source directories, CI workflows, existing docs, XERXES.md, AGENTS.md and existing .xerxes/.agents setup before changing files. Ground every choice in this repository; do not create a generic roster of unrelated experts.",
+    "Write or carefully update XERXES.md with real build/test commands, architecture, conventions and useful operating notes. Preserve accurate content and user instructions.",
+    "Use create_project_setup to create a small useful set of missing specialists, skills and slash commands. Do not write their files with generic file tools: create_project_setup validates formats, preserves existing files and records trust for newly authored workflows. If that tool is unavailable, report the blocker rather than claiming setup is done.",
+    "Agents go in .xerxes/agents/<name>.md. Give each a concrete when-to-use description and repo-specific instructions. Select only tools it needs, using registered tool names; omitted tools default to read-only file exploration. Do not pin provider/model names: inherit the user's model selection or configured intelligence tier.",
+    "Skills go in .xerxes/skills/<name>/SKILL.md and contain reusable domain workflows with relevant paths and verification steps. Commands go in .xerxes/commands/<name>.md and describe user-invoked workflows, such as repo-test or repo-review, using $ARGUMENTS for optional user input. Avoid reserved command names and duplicate skill/command names.",
+    "Do not overwrite existing specialists, skills or commands. Reuse what fits and add only missing capabilities. Do not create scheduled jobs, start agents or execute generated command instructions as part of setup.",
+    "Finish with the actual created/skipped paths and examples of invoking the new commands and specialists. Explain any missing capabilities or errors. The daemon refreshes discovery after this turn; do not claim a live provider test unless one was actually run.",
   ].join("\n");
 }
 

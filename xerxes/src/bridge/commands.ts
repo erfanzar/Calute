@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 export const CATEGORIES = [
+  'activity',
   'session',
   'config',
   'tools',
@@ -59,7 +60,7 @@ export const COMMAND_REGISTRY: readonly CommandDefinition[] = Object.freeze([
   command('retry-connection', 'Retry the last failed provider connection', 'session'),
   command('undo', 'Undo the last turn', 'session'),
   command('title', 'Generate or set the session title', 'session', { argsHint: '[title]' }),
-  command('goal', 'Set or view the goal for a long-running task', 'session', {
+  command('goal', 'Set or view the goal for a long-running task', 'activity', {
     argsHint: '[<objective>|clear|edit <objective>|pause|resume|milestone [<text>|clear]]',
   }),
   command('branch', 'Fork this session through a completed retained turn or its current end', 'session', { argsHint: '[--through-turn N] [label]' }),
@@ -107,23 +108,26 @@ export const COMMAND_REGISTRY: readonly CommandDefinition[] = Object.freeze([
   command('lsp', 'Inspect language-server health or release a workspace host', 'tools', { argsHint: '[status|release <name>]' }),
   command('tools', 'Inspect registered tools and session exposure', 'tools'),
   command('toolsets', 'List configured toolsets', 'tools'),
-  command('skills', 'List discovered skills, inspect instructions, or show discovery diagnostics', 'skills', { argsHint: '[list|inspect <name>|diagnostics]' }),
+  command('skills', 'List, inspect or trust skills and project commands', 'skills', { argsHint: '[list|inspect <name>|diagnostics|trust <name>]' }),
   command('skill', 'Invoke a skill by name', 'skills', { argsHint: '<name>' }),
   command('skill-create', 'Scaffold a new skill directory', 'skills', { argsHint: '<name>' }),
-  command('loop', 'Manage bounded follow-ups for this conversation', 'tools', { argsHint: 'list|pause|resume|cancel|run <id>' }),
+  command('loop', 'Manage bounded follow-ups for this conversation', 'activity', { argsHint: '[list|pause|resume|cancel|run <id>]' }),
+  command('runs', 'Inspect run history and unread results', 'activity', { argsHint: '[list|unread|inspect <id>|ack <id> <revision>]' }),
+  command('monitors', 'Create and inspect terminal, file, WebSocket and webhook watches', 'activity', { argsHint: '[list|stop <id>]' }),
+  command('schedules', 'Create and manage workspace schedules', 'activity', { argsHint: '[list|add|pause|resume|run|remove|legacy|migrate]' }),
   command('cron', 'Manage scheduled tasks', 'tools', { argsHint: 'list|add|remove|run' }),
-  command('reload', 'Reload skills + tools', 'tools'),
+  command('reload', 'Rediscover agents, skills, commands and tools', 'tools'),
   command('reload-mcp', 'Reload MCP servers', 'tools'),
   command('browser', 'Manage browser sessions', 'tools'),
   command('plugins', 'List registered plugins or inspect sources and capabilities', 'tools', { argsHint: '[list|inspect <name>]' }),
-  command('init', 'Analyze the repo and write/update XERXES.md', 'tools'),
+  command('init', 'Inspect the repo and create instructions, specialists, skills and commands', 'tools', { argsHint: '[focus or additional instructions]' }),
   command('channels', 'List/enable/disable channel gateways', 'tools', { argsHint: '[list|enable <name>|disable <name>]' }),
   command('providers', 'Manage provider profiles', 'config', { argsHint: '[list|use <name>|add …|remove <name>]' }),
   command('worktree', 'Create a git worktree for this session', 'tools', { argsHint: 'create [name]' }),
   command('creator-trace', 'Show the declarative-forge trace for this session', 'tools'),
   command('workspace', 'Inspect or initialize project .agents workspace', 'tools', { argsHint: '[status|init]' }),
   command('soul', 'Show or edit SOUL.md', 'tools'),
-  command('agents', 'List or select sub-agents', 'tools'),
+  command('agents', 'List or select sub-agents', 'activity'),
   command('machine', 'Select a remote machine to work on', 'tools'),
 
   command('help', 'Show help', 'info', { aliases: ['?'] }),

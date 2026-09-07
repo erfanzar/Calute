@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 import { describe, expect, it } from 'vitest'
 
-import { mergeCompletionItems, slashCompletionsFromCatalog } from '../hooks/useCompletion.js'
+import { mergeCompletionItems, slashCompletionsFromCatalog, tuiSlashCompletions } from '../hooks/useCompletion.js'
 import { rankCompletionItems } from '../lib/completion.js'
 import type { SlashCatalog } from '../types.js'
 
@@ -37,6 +37,20 @@ const catalog: SlashCatalog = {
 const ranked = (input: string) => rankCompletionItems(slashCompletionsFromCatalog(input, catalog), input.slice(1))
 
 describe('slash catalog completions', () => {
+  it.each([null, catalog])('keeps activity panels in the first menu page with a missing or older catalog', oldCatalog => {
+    const rows = rankCompletionItems(tuiSlashCompletions('/', oldCatalog), '')
+    expect(rows.slice(0, 6).map(row => row.display)).toEqual(['agents', 'goal', 'loop', 'monitors', 'runs', 'schedules'])
+  })
+
+  it.each(['agents', 'goal', 'loop', 'monitors', 'runs', 'schedules'])('finds the local %s command by prefix without daemon discovery', name => {
+    const input = '/' + name.slice(0, 3)
+    expect(tuiSlashCompletions(input, null)).toContainEqual(expect.objectContaining({ text: '/' + name }))
+  })
+
+  it('keeps one entry per panel when the daemon advertises it too', () => {
+    const rows = tuiSlashCompletions('/', { ...catalog, pairs: [...catalog.pairs, ['/runs', 'Run history']] })
+    expect(rows.filter(row => row.display === 'runs')).toHaveLength(1)
+  })
   it('tags each completion with the category that owns it', () => {
     const byName = new Map(slashCompletionsFromCatalog('/', catalog).map(item => [item.display, item.group]))
 

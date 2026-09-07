@@ -296,6 +296,7 @@ export const coreCommands: SlashCommand[] = [
   {
     help: 'set or view a goal and its milestone; --duration 30m or --tokens 100000 sets limits',
     name: 'goal',
+    group: 'activity',
     // Rendering happens daemon-side so the terminal, the bridge and every
     // channel describe one goal with one vocabulary. This end only carries the
     // words.

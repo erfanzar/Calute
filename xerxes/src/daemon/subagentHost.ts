@@ -4,7 +4,7 @@
 import { recordCompaction } from '../context/compactionHistory.js'
 import { isAbsolute, resolve } from 'node:path'
 import { parseWorktreeRef, parseWorktreeSource } from '../agents/worktreeOptions.js'
-import type { AgentDefinition } from '../agents/definitions.js'
+import { subagentCatalogForAgent, type AgentDefinition } from '../agents/definitions.js'
 import {
   SUBAGENT_BLOCKED_TOOLS,
   SubAgentManager,
@@ -27,7 +27,8 @@ import type {
   SpawnedAgentSnapshot,
   SpawnedAgentStatus,
 } from '../operators/subagents.js'
-import { bootstrap } from '../runtime/bootstrap.js'
+import { bootstrap, bootstrapSubagentsForAgent } from '../runtime/bootstrap.js'
+import { skillPromptSection, type SkillRegistry } from '../extensions/skills.js'
 import type { RunHistory } from '../runtime/runHistory.js'
 import { runWithActiveSession } from '../runtime/sessionContext.js'
 import { looksLikeSessionId, type DaemonTranscriptStore } from '../session/daemonTranscript.js'
@@ -93,6 +94,7 @@ export interface NativeSubagentHostOptions {
   readonly eventBus: DaemonSubagentEventBus
   /** Bounded supplemental bootstrap context, such as the discovered skill catalog. */
   readonly extraContext?: string
+  readonly skillRegistry?: SkillRegistry
   readonly validateProviderSelection?: (profile: string, model: string, effort?: string, signal?: AbortSignal) => Promise<void>
   readonly validateInheritedSelection?: (model: string, effort?: string, signal?: AbortSignal) => Promise<void>
   readonly resolveProviderProfile?: (profile: string, model: string, expectedRoute?: string) => Pick<NativeSubagentHostOptions, 'llm' | 'contextLimit' | 'maxTokens' | 'maxOutputTokens' | 'temperature' | 'topK' | 'topP'>
@@ -102,6 +104,7 @@ export interface NativeSubagentHostOptions {
   /** Per-child model fallback used when maxTokens is not configured. */
   readonly maxOutputTokens?: (model: string) => number | undefined
   readonly model: string
+  readonly reasoningEffort?: string
   readonly permissionMode: PermissionMode
   readonly temperature?: number
   readonly toolExecutor: ToolExecutor
@@ -336,6 +339,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
   private cwd: string
   private definitions: ReadonlyMap<string, AgentDefinition>
   private fallbackModel: string
+  private fallbackEffort: string | undefined
   private fallbackPermissionMode: PermissionMode
   private generation: number
   private readonly handles = new Map<string, HandleMetadata>()
@@ -361,6 +365,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     this.cwd = options.cwd
     this.definitions = options.agentDefinitions
     this.fallbackModel = options.model
+    this.fallbackEffort = options.reasoningEffort
     this.fallbackPermissionMode = options.permissionMode
     this.generation = generation
     this.transcripts = options.transcriptStore
@@ -377,6 +382,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     this.cwd = options.cwd
     this.definitions = options.agentDefinitions
     this.fallbackModel = options.model
+    this.fallbackEffort = options.reasoningEffort
     this.fallbackPermissionMode = options.permissionMode
     this.generation = generation
     this.transcripts = options.transcriptStore
@@ -422,7 +428,9 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
       || stringConfig(definition.model)
       || stringConfig(options.parentModel)
       || this.fallbackModel
-    const requestedPermissionMode = permissionModeConfig(options.permissionMode, this.fallbackPermissionMode)
+    const inheritedMode = permissionModeConfig(options.permissionMode, this.fallbackPermissionMode)
+    const fileMode = agentPermissionMode(definition, inheritedMode)
+    const requestedPermissionMode = delegatedPermissionExceeds(fileMode, inheritedMode) ? inheritedMode : fileMode
     const permissionMode = delegatedPermissionExceeds(requestedPermissionMode, this.fallbackPermissionMode)
       ? this.fallbackPermissionMode
       : requestedPermissionMode
@@ -436,7 +444,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
       ...(options.worktreeSource === undefined ? {} : { worktreeSource: options.worktreeSource }),
       input: prompt,
       ...(options.agent?.providerProfile ? { providerProfile: options.agent.providerProfile } : {}),
-      ...(options.agent?.reasoningEffort ? { reasoningEffort: options.agent.reasoningEffort } : {}),
+      ...((options.agent?.reasoningEffort ?? definition.effort ?? this.fallbackEffort) ? { reasoningEffort: (options.agent?.reasoningEffort ?? definition.effort ?? this.fallbackEffort)! } : {}),
       model,
       workspace,
       ...(providerRoute === undefined ? {} : { providerRoute }),
@@ -504,10 +512,13 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
         : { _toolsAllowed: [...definition.allowedTools] }),
       ...(definition.excludeTools.length ? { _toolsExcluded: [...definition.excludeTools] } : {}),
       ...(definition.tools.length ? { _toolsWhitelist: [...definition.tools] } : {}),
+      ...(definition.promptMode ? { _agentPromptMode: definition.promptMode } : {}),
+      ...(definition.skills?.length ? { _agentSkills: [...definition.skills] } : {}),
+      ...(definition.maxTurns === undefined ? {} : { _agentMaxTurns: definition.maxTurns }),
     }
     const toolsets = subagentTools(this.availableTools, config).map(tool => tool.function.name)
     const isolation = resolved.isolation ?? definition.isolation
-    const rules = [...nativeRuleLabels(permissionMode, isolation), ...(worktreeRef ? ['worktree-ref:' + worktreeRef] : []), ...(worktreeSource ? ['worktree-source:' + worktreeSource] : [])]
+    const rules = [...nativeRuleLabels(permissionMode, isolation), ...(definition.background ? ['background'] : []), ...(worktreeRef ? ['worktree-ref:' + worktreeRef] : []), ...(worktreeSource ? ['worktree-source:' + worktreeSource] : [])]
     const parentKey = resolved.parentAgentId ?? resolved.creatorAgentId
     const childDepth = parentKey === undefined ? undefined : this.parentRunningChildDepth(parentKey)
     // An identity-preserving respawn must register its persisted history
@@ -762,7 +773,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     if (!creatorDefinition) {
       throw new ValidationError('creator_agent_id', 'is not a registered agent profile', creator)
     }
-    const catalog = creatorDefinition.subagents ?? {}
+    const catalog = subagentCatalogForAgent(this.definitions, creator)
     const catalogName = Object.hasOwn(catalog, requestedType)
       ? requestedType
       : canonicalProfileAlias(requestedType)
@@ -1267,8 +1278,15 @@ async function runNativeSubagent(
 
   try {
     try {
+      const preloadedSkills = stringList(request.config._agentSkills).map(name => {
+        const skill = options.skillRegistry?.get(name)
+        if (!skill) throw new ValidationError('skills', `preloaded skill '${name}' is unavailable; inspect /skills diagnostics`, name)
+        return skillPromptSection(skill)
+      })
       const boot = await bootstrap({
+        ...(request.config._agentPromptMode === 'replace' ? { baseSystemPrompt: request.systemPrompt } : {}),
         cwd,
+        subagents: bootstrapSubagentsForAgent(options.agentDefinitions, request.task.agentDefName),
         ...(options.extraContext ? { extraContext: options.extraContext } : {}),
         model,
         tools,
@@ -1277,12 +1295,13 @@ async function runNativeSubagent(
       const events = runTurn({
         agentId: request.task.agentDefName || request.task.id,
         ...(maxTokens === undefined ? {} : { maxTokens }),
+        ...(typeof request.config._agentMaxTurns === 'number' ? { maxModelTurns: request.config._agentMaxTurns } : {}),
         model,
         ...(stringConfig(request.config.reasoningEffort) ? { thinking: { effort: stringConfig(request.config.reasoningEffort) } } : {}),
         permissionMode,
         sessionId: conversation.historySessionId,
         state,
-        systemPrompt: [boot.systemPrompt, request.systemPrompt].filter(Boolean).join('\n\n'),
+        systemPrompt: [boot.systemPrompt, ...(request.config._agentPromptMode === 'replace' ? [] : [request.systemPrompt]), ...preloadedSkills].filter(Boolean).join('\n\n'),
         ...(options.temperature === undefined ? {} : { temperature: options.temperature }),
         ...(options.topK === undefined ? {} : { topK: options.topK }),
         tools,
@@ -1318,7 +1337,9 @@ async function runNativeSubagent(
             event.reason && event.reason !== 'completed' && event.reason !== 'objective_verified'
           )) {
             terminalFailure = new Error(
-              event.reason === 'context_overflow'
+              event.reason === 'tool_budget_exhausted' && typeof request.config._agentMaxTurns === 'number'
+                ? `Subagent reached maxTurns=${request.config._agentMaxTurns}. Output is partial; resume this agent to continue.`
+                : event.reason === 'context_overflow'
                 ? 'Subagent provider context window was exhausted'
                 : event.reason === 'provider_failed'
                   ? 'Subagent provider request failed'
@@ -1590,7 +1611,7 @@ function subagentTools(
     const name = definition.function.name
     if (SUBAGENT_BLOCKED_TOOLS.has(name) || excluded.has(name)) return false
     if (whitelist.length && !whitelist.includes(name)) return false
-    return !allowed.length || allowed.includes(name)
+    return !Array.isArray(config._toolsAllowed) || allowed.includes(name)
   })
 }
 
@@ -1759,6 +1780,16 @@ function permissionModeConfig(value: unknown, fallback: PermissionMode): Permiss
   return value === 'accept-all' || value === 'auto' || value === 'manual' || value === 'plan' ? value : fallback
 }
 
+function agentPermissionMode(definition: AgentDefinition, inherited: PermissionMode): PermissionMode {
+  switch (definition.permissionMode) {
+    case 'acceptEdits': case 'auto': return 'auto'
+    case 'dontAsk': case 'manual': return 'manual'
+    case 'plan': return 'plan'
+    case 'bypassPermissions': return 'accept-all'
+    default: return inherited
+  }
+}
+
 function permissionModeFromRules(rules: readonly string[]): PermissionMode {
   const configured = rules.find(rule => rule.startsWith('permission:'))?.slice('permission:'.length)
   return permissionModeConfig(configured, 'manual')
@@ -1772,6 +1803,12 @@ function agentDefinitionsFingerprint(definitions: ReadonlyMap<string, AgentDefin
       name: definition.name,
       description: definition.description,
       systemPrompt: definition.systemPrompt,
+      promptMode: definition.promptMode,
+      skills: definition.skills,
+      maxTurns: definition.maxTurns,
+      effort: definition.effort,
+      background: definition.background,
+      permissionMode: definition.permissionMode,
       model: definition.model,
       source: definition.source,
       tools: definition.tools,

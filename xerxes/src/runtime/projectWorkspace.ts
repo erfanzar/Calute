@@ -29,18 +29,14 @@ export const PROJECT_AGENT_CONTEXT_FILES = [
 ] as const
 
 /**
- * Every Markdown file under `.agents/` is injected; these subtrees stay out.
- *
- * The `skills` subtree is deliberately excluded from bootstrap injection:
- * skill bodies are reference material that is only relevant when a task
- * actually needs them, and injecting every SKILL.md eagerly would dwarf the
- * useful operating context and blow the aggregate byte ceiling. Instead the
- * skill registry indexes `.agents/skills/` separately and the model pulls a
- * skill body on demand through SkillTool. Only the top-level `skills`
- * directory is excluded (matched at depth 0); a nested directory named
- * `skills` elsewhere in the tree is ordinary documentation and is injected.
+ * Project notes load eagerly. Workflow and specialist subtrees stay on demand
+ * through their registries so their bodies do not consume the prompt budget.
+ * Exclusions apply only at depth zero; nested runbook folders remain notes.
  */
-const SKILLS_DIRECTORY = 'skills'
+const CONTEXT_ROOTS = [
+  { name: '.agents', excluded: ['skills'], priority: PROJECT_AGENT_CONTEXT_FILES },
+  { name: '.xerxes', excluded: ['agents', 'skills', 'commands'], priority: ['AGENTS.md', 'README.md', 'repo-map.yaml', 'repo-map.yml', 'ops/OPS.md', 'projects/README.md'] },
+] as const
 /**
  * Hard cap on discovered Markdown files. Bounds bootstrap latency and prompt
  * size even if a project accumulates (or an attacker plants) a large tree;
@@ -61,7 +57,7 @@ export interface ProjectAgentWorkspaceContextOptions {
   readonly root: string
 }
 
-/** Rendered, prompt-safe project-local `.agents` operating context. */
+/** Rendered, prompt-safe project-local `.agents` and `.xerxes` operating context. */
 export class ProjectAgentWorkspaceContext {
   readonly agentsDir: string
   readonly loadedFiles: readonly string[]
@@ -97,12 +93,13 @@ export function projectAgentSkillsDir(projectRoot: string): string {
  *
  * Ordering is deterministic: the PROJECT_AGENT_CONTEXT_FILES priority files
  * come first in their declaration order, followed by every other Markdown
- * file discovered under `.agents/` sorted lexically by path. This keeps the
+ * file discovered under each context root sorted lexically by path. Legacy
+ * `.agents` context precedes `.xerxes` context. This keeps the
  * rendered prompt stable across runs and platforms, which matters for prompt
  * caching and for reproducible agent behavior.
  *
  * Each candidate file is defended independently before it enters the prompt:
- * its real path must stay contained inside the project-owned `.agents`
+ * its real path must stay contained inside its project-owned context
  * directory (a symlinked runbook must not inject arbitrary host content),
  * and its body passes the prompt-injection scanner, which neutralizes
  * hostile spans in place so the rest of the file remains available.
@@ -119,33 +116,33 @@ export async function loadProjectAgentWorkspace(
   const lexicalRoot = normalizeProjectRoot(projectRoot)
   const root = await canonicalDirectoryOrLexical(lexicalRoot)
   const agentsDir = join(root, PROJECT_AGENTS_DIR)
-  const canonicalAgentsDir = await containedDirectory(root, agentsDir)
-  if (canonicalAgentsDir === undefined) {
-    return new ProjectAgentWorkspaceContext({ root, agentsDir, prompt: '', loadedFiles: [] })
-  }
-
   const parts = [
     '# Project Agent Workspace',
-    `Directory: ${agentsDir}`,
+    `Project: ${root}`,
     '',
-    'This is project-owned agent operating context. Every Markdown file under `.agents/` is included below.',
-    'Repository-local skills under `.agents/skills/` are discovered separately and load on demand.',
+    'This is project-owned operating context from `.agents/` and `.xerxes/`.',
+    'Skills, commands, and specialist definitions are discovered separately and load on demand.',
     'Files clipped with a truncation note can be read directly with normal file tools.',
   ]
   const loadedFiles: string[] = []
 
-  for (const candidate of await orderedContextFiles(canonicalAgentsDir)) {
-    const relativePath = relative(canonicalAgentsDir, candidate).split(sep).join('/')
-    const content = await loadContextFile(root, canonicalAgentsDir, candidate, maximum)
-    if (content === undefined) continue
-    if (!content.trim()) continue
-    // Inject the scanner-neutralized body rather than dropping the whole
-    // file: hostile spans are replaced with inert [BLOCKED: ...] markers, so
-    // the remaining safe content stays available and the scan stays
-    // observable in the prompt itself.
-    const scanned = scanContextContent(content, `Project agent workspace: ${candidate}`)
-    loadedFiles.push(candidate)
-    parts.push('', `## .agents/${relativePath}`, scanned.trim())
+  for (const contextRoot of CONTEXT_ROOTS) {
+    const directory = await containedDirectory(root, join(root, contextRoot.name))
+    if (directory === undefined) continue
+    for (const candidate of await orderedContextFiles(directory, contextRoot.priority, contextRoot.excluded)) {
+      if (loadedFiles.length >= MAX_DISCOVERED_CONTEXT_FILES) break
+      const relativePath = relative(directory, candidate).split(sep).join('/')
+      const content = await loadContextFile(root, directory, candidate, maximum)
+      if (content === undefined) continue
+      if (!content.trim()) continue
+      // Inject the scanner-neutralized body rather than dropping the whole
+      // file: hostile spans are replaced with inert [BLOCKED: ...] markers, so
+      // the remaining safe content stays available and the scan stays
+      // observable in the prompt itself.
+      const scanned = scanContextContent(content, `Project agent workspace: ${candidate}`)
+      loadedFiles.push(candidate)
+      parts.push('', `## ${contextRoot.name}/${relativePath}`, scanned.trim())
+    }
   }
 
   return new ProjectAgentWorkspaceContext({
@@ -176,14 +173,14 @@ async function canonicalDirectoryOrLexical(path: string): Promise<string> {
  * honored when the files appear. Discovery results are filtered against the
  * resolved priority paths so a priority file is never injected twice.
  */
-async function orderedContextFiles(canonicalAgentsDir: string): Promise<string[]> {
+async function orderedContextFiles(canonicalAgentsDir: string, priorityFiles: readonly string[], excluded: readonly string[]): Promise<string[]> {
   // Priority candidates are anchored at the canonical directory so a
   // symlinked `.agents` root keeps its front-of-prompt position instead of
   // failing lexical containment against itself. Sorting uses code-unit
   // order, which is stable across host locales (localeCompare is not).
-  const priority = PROJECT_AGENT_CONTEXT_FILES.map(path => join(canonicalAgentsDir, ...path.split('/')))
+  const priority = priorityFiles.map(path => join(canonicalAgentsDir, ...path.split('/')))
   const priorityPaths = new Set(priority.map(path => resolve(path)))
-  const discovered = await discoverMarkdownFiles(canonicalAgentsDir)
+  const discovered = await discoverMarkdownFiles(canonicalAgentsDir, excluded)
   const rest = discovered
     .filter(path => !priorityPaths.has(resolve(path)))
     .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
@@ -207,7 +204,7 @@ async function orderedContextFiles(canonicalAgentsDir: string): Promise<string[]
  * symlink that escapes `.agents` or the project root is dropped at load time
  * even if it were somehow discovered.
  */
-async function discoverMarkdownFiles(agentsDir: string): Promise<string[]> {
+async function discoverMarkdownFiles(agentsDir: string, excluded: readonly string[]): Promise<string[]> {
   const discovered: string[] = []
 
   async function walk(directory: string, depth: number): Promise<void> {
@@ -222,7 +219,7 @@ async function discoverMarkdownFiles(agentsDir: string): Promise<string[]> {
       if (discovered.length >= MAX_DISCOVERED_CONTEXT_FILES) return
       const candidate = join(directory, entry.name)
       if (entry.isDirectory()) {
-        if (entry.name === SKILLS_DIRECTORY && depth === 0) continue
+        if (excluded.includes(entry.name) && depth === 0) continue
         if (entry.name.startsWith('.') || entry.name === 'node_modules') continue
         await walk(candidate, depth + 1)
         continue

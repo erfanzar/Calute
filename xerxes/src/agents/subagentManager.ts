@@ -39,7 +39,6 @@ export const SUBAGENT_BLOCKED_TOOLS = Object.freeze(new Set([
   'TaskOutputTool',
   'TaskStopTool',
   'TaskUpdateTool',
-  'SkillTool',
 ]))
 
 const READ_FILE_TOOLS = new Set(['ReadFile', 'read_file', 'analyze_code_structure'])
@@ -1221,7 +1220,9 @@ export class SubAgentManager {
       } else {
         task.status = 'failed'
         task.error = errorMessage(error)
-        task.result = `Error: ${task.error}`
+        const partialOutput = error !== null && typeof error === 'object' && 'partialOutput' in error && typeof error.partialOutput === 'string'
+          ? error.partialOutput.trim() : ''
+        task.result = partialOutput ? `${partialOutput}\n\n[Partial result: ${task.error}]` : `Error: ${task.error}`
         this.postEvent(task, 'error', { error: task.error })
       }
       throw error
@@ -1287,7 +1288,9 @@ export class SubAgentManager {
   }
 
   private synchronize(task: SubAgentTask, snapshot: SpawnedAgentSnapshot): void {
-    if (snapshot.lastOutput !== undefined) task.result = snapshot.lastOutput
+    // On a failed follow-up the handle may still carry the previous turn's
+    // successful output. Keep the current attempt's error/partial result.
+    if (snapshot.lastOutput !== undefined && snapshot.status !== 'error') task.result = snapshot.lastOutput
     if (snapshot.error !== undefined && snapshot.error !== 'cancelled') task.error = snapshot.error
     task.inboxSize = snapshot.queueSize
     task.lastActivityAt = this.now().valueOf()
@@ -1736,7 +1739,7 @@ function effectiveConfig(
 ): Readonly<Record<string, unknown>> {
   const effective: Record<string, unknown> = { ...config }
   if (definition === undefined) return Object.freeze(effective)
-  if (definition.model) effective.model = definition.model
+  if (definition.model && !effective.model) effective.model = definition.model
   const allowed = intersectToolLists(stringList(config._toolsAllowed), definition.allowedTools)
   if (allowed !== undefined) effective._toolsAllowed = allowed
   const whitelist = intersectToolLists(
@@ -1756,7 +1759,7 @@ function effectiveConfig(
  */
 function intersectToolLists(caller: readonly string[], definition: readonly string[] | null): string[] | undefined {
   if (definition === null) return caller.length ? [...caller] : undefined
-  if (!caller.length) return [...definition]
+  if (!caller.length) return definition.length ? [...definition] : ['\0']
   const intersection = caller.filter(name => definition.includes(name))
   return intersection.length ? intersection : ['\0']
 }

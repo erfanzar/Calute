@@ -227,6 +227,8 @@ export interface TurnRequest {
    */
   readonly maxConsecutiveDenials?: number
   readonly maxToolTurns?: number
+  /** Hard cap on model rounds, including continuations after truncated output. */
+  readonly maxModelTurns?: number
   readonly maxTokens?: number
   readonly model: string
   /** Optional maximum retries for objective-mode text-only stopping attempts. */
@@ -358,6 +360,10 @@ export async function* runTurn(
   const state = request.state
   const permissionMode = request.permissionMode ?? DEFAULT_PERMISSION_MODE
   const maxToolTurns = request.maxToolTurns ?? DEFAULT_MAX_TOOL_TURNS
+  const maxModelTurns = request.maxModelTurns ?? Number.POSITIVE_INFINITY
+  if (maxModelTurns !== Number.POSITIVE_INFINITY && (!Number.isInteger(maxModelTurns) || maxModelTurns < 1)) {
+    throw new TypeError('maxModelTurns must be a positive integer or Infinity')
+  }
   if (maxToolTurns !== Number.POSITIVE_INFINITY && (!Number.isInteger(maxToolTurns) || maxToolTurns < 1)) {
     throw new TypeError('maxToolTurns must be a positive integer or Infinity')
   }
@@ -459,7 +465,7 @@ export async function* runTurn(
   let outputLimitEscalations = 0
   let outputTokenOverride: number | undefined
   try {
-    for (let toolTurn = 0; !signal?.aborted && toolTurn < turnLimit; toolTurn += 1) {
+    for (let toolTurn = 0; !signal?.aborted && toolTurn < turnLimit && toolTurn < maxModelTurns; toolTurn += 1) {
       appendAgentEventMessage(state, dependencies.drainAgentEvents?.())
       for (const steer of dependencies.drainSteer?.() ?? []) {
         const content = steer.trim()
@@ -783,6 +789,7 @@ export async function* runTurn(
       // would leave the persisted tool_use blocks without the tool_result
       // blocks Anthropic requires them to be paired with.
       if (finishReason === 'length' && providerToolCalls.length === 0) {
+        if (toolTurn + 1 >= maxModelTurns) break
         if (outputLimitEscalations >= MAX_OUTPUT_LIMIT_ESCALATIONS) {
           yield {
             type: 'text',

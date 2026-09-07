@@ -1,7 +1,7 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
-import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -48,6 +48,42 @@ test('returns an empty context when the project has no .agents workspace', async
     expect(context.agentsDir).toBe(join(await realpath(root), '.agents'))
     expect(context.loadedFiles).toEqual([])
     expect(context.prompt).toBe('')
+  })
+})
+
+test('loads existing .xerxes notes and repo map, keeping specialist and workflow bodies on demand', async () => {
+  await inTemporaryDirectory(async root => {
+    const files = {
+      'README.md': 'Project setup overview.',
+      'repo-map.yaml': 'entrypoint: src/main.ts',
+      'ops/OPS.md': 'Run the local build.',
+      'projects/current.md': 'The active milestone.',
+      'agents/specialist.md': 'SPECIALIST BODY',
+      'skills/audit/SKILL.md': 'SKILL BODY',
+      'commands/review.md': 'COMMAND BODY',
+      'private.json': '{"private":"not context"}',
+    }
+    const setup = join(root, '.xerxes')
+    for (const [path, content] of Object.entries(files)) {
+      const absolute = join(setup, path)
+      await mkdir(absolute.slice(0, absolute.lastIndexOf('/')), { recursive: true })
+      await writeFile(absolute, content)
+    }
+    await writeFile(join(root, 'outside.md'), 'ESCAPED BODY')
+    await symlink(join(root, 'outside.md'), join(setup, 'AGENTS.md'))
+    const context = await loadProjectAgentWorkspace(root)
+    expect(context.loadedFiles).toHaveLength(4)
+    expect(context.prompt).toContain('## .xerxes/README.md')
+    expect(context.prompt).toContain('entrypoint: src/main.ts')
+    expect(context.prompt).toContain('The active milestone.')
+    for (const body of ['SPECIALIST BODY', 'SKILL BODY', 'COMMAND BODY', 'ESCAPED BODY', 'not context']) expect(context.prompt).not.toContain(body)
+    for (const [path, content] of Object.entries(files)) expect(await readFile(join(setup, path), 'utf8')).toBe(content)
+    await writeFile(join(setup, 'README.md'), 'Updated setup overview.')
+    await mkdir(join(root, '.agents'))
+    await writeFile(join(root, '.agents/AGENTS.md'), 'Legacy project rules.')
+    const refreshed = await loadProjectAgentWorkspace(root)
+    expect(refreshed.prompt).toContain('Updated setup overview.')
+    expect(refreshed.prompt).toContain('Legacy project rules.')
   })
 })
 

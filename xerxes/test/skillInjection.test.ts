@@ -16,6 +16,16 @@ describe('substituteArguments', () => {
 })
 
 describe('expandSkillInstructions', () => {
+  test('automatically loaded instructions cannot execute shell preprocessing, including through arguments', async () => {
+    let calls = 0
+    const options = { cwd: process.cwd(), allowCommandExecution: false, run: async () => { calls++; return { code: 0, stdout: 'executed', stderr: '' } } }
+    await expect(expandSkillInstructions('Read !`echo secret`', options)).rejects.toThrow('/skills trust')
+    await expect(expandSkillInstructions('$ARGUMENTS', { ...options, args: '!`echo secret`' })).rejects.toThrow('/skills trust')
+    expect(await expandSkillInstructions('Read $ARGUMENTS', { ...options, args: 'src' })).toBe('Read src')
+    expect(calls).toBe(0)
+    expect(await expandSkillInstructions('Read !`echo secret`', { ...options, allowCommandExecution: true })).toBe('Read executed')
+    expect(calls).toBe(1)
+  })
   test('executes !`cmd` injections and splices stdout', async () => {
     const expanded = await expandSkillInstructions('Today is !`echo 2026-07-13`.', { cwd: process.cwd() })
     expect(expanded).toBe('Today is 2026-07-13.')

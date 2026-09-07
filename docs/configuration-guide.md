@@ -1632,3 +1632,112 @@ bodies and oversized requests are rejected. Keep the default loopback bind or
 explicitly configure a TLS reverse proxy for a remote sender; Xerxes does not
 create a public tunnel. Native GitHub/Stripe/etc. signature formats are not
 accepted by this generic protocol—use a sender that implements the contract.
+
+### Finding activity panels in the TUI
+
+Type `/` to open the command menu. Its first **Activity** group contains
+`/agents`, `/goal`, `/loop`, `/monitors`, `/runs`, and `/schedules`. Type a prefix
+such as `/mon` or `/sched` to filter the list. Tab fills the highlighted command;
+Enter executes a complete command. `/help` and `/commands` also list these entries.
+The TUI keeps its activity navigation locally, so an older or temporarily
+unavailable daemon catalog cannot hide those panels. Their data still requires
+an available daemon with the corresponding RPC support. Restart the TUI after a
+rebuild to load the updated menu.
+
+### Generate and use project specialists, skills and commands
+
+Run `/init` in Code mode to have the current model inspect the repository and
+create a relevant project setup. You can add a focus, such as `/init focus on
+kernel correctness and benchmarking`. This submits a normal model turn: it uses
+your selected provider and the current tool permissions. The TUI and daemon use
+the same initialization flow.
+
+The model updates `XERXES.md` with verified repository guidance and uses
+`create_project_setup` to add missing definitions:
+
+| Location | Purpose | Use |
+| --- | --- | --- |
+| `.xerxes/agents/<name>.md` | Specialist instructions and tool selection | The built-in Code and Objective agents select specialists by their descriptions; you can also ask for one by name. |
+| `.xerxes/skills/<name>/SKILL.md` | Reusable domain workflows | Listed by `/skills`; loaded through SkillTool or invoked as `/<name>`. |
+| `.xerxes/commands/<name>.md` | User-invoked prompt workflows | Type `/<name> arguments`; `$ARGUMENTS` expands to the supplied arguments. |
+
+Setup preserves existing agent, skill and command files. It validates the whole
+input batch before writing, refuses unknown tool names and reserved names, and
+creates files exclusively. Omitted agent tools default to ReadFile, ListDir,
+GlobTool and GrepTool. Generated agents inherit the runtime model unless an
+explicit model or configured intelligence tier is chosen when spawning them.
+Setup does not start specialists, schedule jobs, or run the generated workflows.
+After the setup turn, the daemon refreshes discovery automatically. Inspect the
+model's created/skipped report and `/skills diagnostics` for rejected files;
+finishing a turn is not a guarantee that every requested artifact was created.
+
+Launching Xerxes in a project automatically loads its existing `.xerxes` setup.
+Startup does not generate, patch, or rewrite setup files. README and other Markdown
+notes under `.xerxes`, including `ops/` and `projects/`, plus `repo-map.yaml` or
+`repo-map.yml`, become bounded project context. Agent, skill, and command bodies
+load on demand rather than filling the main prompt. Legacy `.agents` context
+continues to load as well.
+
+After editing definitions in a running session, `/reload` refreshes discovery. Project agents override
+user agents of the same name; user agents override shipped definitions. The
+built-in Code/Objective child catalog includes discovered user/project agents,
+including overrides of shipped specialists such as `reviewer`. A Markdown agent
+used as the main agent can also discover the catalog whenever its tools allow
+delegation. Native YAML compositions keep their explicit child allowlists and
+pinned definitions. Delegated workers cannot spawn additional workers.
+Discovery scans agent subfolders recursively and walks from the current directory
+to the repository root; the nearest project definition wins. Markdown documents
+without frontmatter are ignored. No `.claude` directories are read.
+
+The model sees agent names and descriptions in its delegation tool and prompt.
+It chooses a type by description, or follows the exact type requested by the
+user. A delegated Markdown agent receives its own system prompt plus environment
+and project context, in a separate conversation. Its full instructions are not
+injected into the parent's context.
+
+Markdown frontmatter supports these settings:
+
+| Field | Behavior |
+| --- | --- |
+| `name`, `description` | Identity and when to delegate. Description is required for discovery. Legacy Xerxes files without `name` use their filename. |
+| `tools` | YAML list or comma-separated names. Omitted means inherit available child tools; `[]` grants no tools. Native names and Claude's `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`, and `Skill` names resolve to native tools. |
+| `disallowedTools` | Removes tools from the inherited or explicit set. |
+| `model` | A configured model ID, or `inherit`. An explicit spawn model wins over the file; otherwise the file wins over the parent model. |
+| `effort` | `low`, `medium`, `high`, `xhigh`, or `max`, subject to provider support. Inherits session effort when omitted. |
+| `maxTurns` | Positive cap on model rounds, including output-length continuations. A stopped agent retains partial output and can be resumed. |
+| `skills` | Skill names whose full instructions are preloaded. Missing skills fail before a provider call. Other skills remain available through SkillTool if permitted. |
+| `background` | `true` keeps the agent in the background even if a single-agent call or swarm requested a foreground wait. |
+| `permissionMode` | `default` inherits; `plan` restricts to planning; `acceptEdits`/`auto` use Xerxes auto permissions; `manual`/`dontAsk` deny anything requiring a child approval prompt; `bypassPermissions` requests accept-all. All remain bounded by parent permissions. |
+| `isolation`, `max_depth` | Native worktree isolation and depth controls. |
+
+AgentTool accepts `description` as an alternative to `title`, and `resume` with
+an existing agent ID to continue its conversation. Resuming cannot change model,
+provider, or isolation. Ownership checks prevent accessing another chat's agents.
+
+These are the supported native behaviors, not blanket compatibility with every
+Claude Code extension. Per-agent `hooks`, `memory`, `mcpServers`, `color`,
+`initialPrompt`, and Claude model aliases are not implemented here. Unsupported
+frontmatter fields fail visibly instead of silently losing their behavior.
+
+```markdown
+---
+name: kernel-expert
+description: Review this repository's kernel layouts and numerical correctness.
+tools: [ReadFile, ListDir, GlobTool, GrepTool]
+model: inherit
+---
+Inspect the kernel implementation and its tests. Report correctness issues
+with concrete file references and verification steps.
+```
+
+Existing `.xerxes` skills and commands appear automatically in `/skills` and slash
+completion, including after local edits. Ordinary prompt workflows need no trust
+step. Shell preprocessing using `` !`command` `` requires explicit content-hash
+trust: inspect the workflow and run `/skills trust <name>` to enable it. New
+workflows authored through `create_project_setup` already receive that trust;
+editing them removes shell-preprocessing permission until trusted again.
+Startup never records trust or executes workflow commands. Size limits and
+injection checks still apply; `/skills diagnostics` shows rejected files.
+Other workspace skill roots retain their existing trust requirements.
+Skill names and command names share a namespace; existing discovery roots keep
+their precedence. Project commands cannot replace built-in slash commands.

@@ -11,6 +11,79 @@ import { COMPACTION_REFERENCE_PREFIX } from '../src/context/compressor.js'
 import { DaemonInteractionBoard } from '../src/daemon/interactions.js'
 import { InMemoryDaemonRuntime, type DaemonEvent, type DaemonSession, type TurnRunControls, type TurnRunner } from '../src/daemon/runtime.js'
 import { DaemonServer } from '../src/daemon/server.js'
+import { ToolRegistry } from '../src/executors/toolRegistry.js'
+import { registerFileTools } from '../src/tools/fileTools.js'
+import { registerProjectSetupTool } from '../src/tools/projectSetup.js'
+import { WorkspacePathResolver } from '../src/tools/pathSafety.js'
+
+test('startup loads existing commands, init adds workflows, and shell preprocessing requires explicit trust', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'xerxes-init-workflows-'))
+  const skillDirectory = join(root, 'skill-home')
+  const tools = new ToolRegistry()
+  const paths = new WorkspacePathResolver(root)
+  registerFileTools(tools, paths)
+  registerProjectSetupTool(tools, paths, { skillsDirectory: skillDirectory })
+  const requests: string[] = []
+  const runner: TurnRunner = {
+    async *run(_session, text) {
+      requests.push(text)
+      if (text.startsWith('Initialize this repository')) {
+        const result = await tools.execute({ id: 'create', type: 'function', function: {
+          name: 'create_project_setup', arguments: { artifacts: [
+            { kind: 'command', name: 'repo-test', description: 'Run repo tests', instructions: 'Inspect tests for $ARGUMENTS.' },
+          ] },
+        } }, { metadata: {} })
+        yield { type: 'text_part', payload: { text: result } }
+      } else yield { type: 'text_part', payload: { text: 'Workflow invoked' } }
+    },
+  }
+  const runtime = new InMemoryDaemonRuntime(runner, { currentProjectDirectory: root, sessionDirectory: join(root, 'sessions') })
+  const socketPath = join(root, 'daemon.sock')
+  await mkdir(join(root, '.xerxes/commands'), { recursive: true })
+  const existing = '---\ndescription: Existing workflow\n---\nReview $ARGUMENTS.'
+  await writeFile(join(root, '.xerxes/commands/existing.md'), existing)
+  const server = new DaemonServer({ socketPath, runtime, skillDirectory })
+  await server.start()
+  const client = await DaemonParityClient.connect(socketPath)
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { session_key: 'setup', project_dir: root } })
+    await client.next(frame => frame.id === 1)
+    client.send({ jsonrpc: '2.0', id: 101, method: 'complete', params: { text: '/existing' } })
+    expect((await client.next(frame => frame.id === 101)).result?.completions).toContainEqual(expect.objectContaining({ value: '/existing ' }))
+    expect(await readFile(join(root, '.xerxes/commands/existing.md'), 'utf8')).toBe(existing)
+    expect(await Bun.file(join(skillDirectory, '.hub/trusted_hashes.json')).exists()).toBe(false)
+    client.send({ jsonrpc: '2.0', id: 102, method: 'slash', params: { command: '/existing src' } })
+    expect((await client.next(frame => frame.id === 102)).result).toMatchObject({ ok: true, queued: true })
+    await client.next(frame => frame.method === 'event' && frame.params?.type === 'turn_end')
+    expect(requests.pop()).toContain('Review src.')
+    client.send({ jsonrpc: '2.0', id: 2, method: 'slash', params: { command: '/init focus on tests' } })
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: true, queued: true })
+    await client.next(frame => frame.method === 'event' && frame.params?.type === 'notification' && String(frame.params.payload?.body).includes('Project initialization turn finished'))
+    expect(requests[0]).toContain('create_project_setup')
+    expect(requests[0]).toContain('focus on tests')
+    expect(requests[0]).toContain('Do not overwrite existing')
+    client.send({ jsonrpc: '2.0', id: 3, method: 'complete', params: { text: '/repo-test' } })
+    expect((await client.next(frame => frame.id === 3)).result?.completions).toContainEqual(expect.objectContaining({ value: '/repo-test ' }))
+    client.send({ jsonrpc: '2.0', id: 4, method: 'slash', params: { command: '/repo-test kernels' } })
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ ok: true, queued: true })
+    await client.next(frame => frame.method === 'event' && frame.params?.type === 'text_part' && frame.params.payload?.text === 'Workflow invoked')
+    expect(requests.at(-1)).toContain('Inspect tests for kernels.')
+    await client.next(frame => frame.method === 'event' && frame.params?.type === 'turn_end')
+    await writeFile(join(root, '.xerxes/commands/existing.md'), '---\ndescription: Existing workflow\n---\nReview !`echo shell-expanded`.')
+    client.send({ jsonrpc: '2.0', id: 5, method: 'slash', params: { command: '/existing' } })
+    expect(JSON.stringify(await client.next(frame => frame.id === 5))).toContain('/skills trust')
+    client.send({ jsonrpc: '2.0', id: 6, method: 'slash', params: { command: '/skills trust existing' } })
+    expect((await client.next(frame => frame.id === 6)).result).toMatchObject({ ok: true, name: 'existing' })
+    client.send({ jsonrpc: '2.0', id: 103, method: 'slash', params: { command: '/existing' } })
+    expect((await client.next(frame => frame.id === 103)).result).toMatchObject({ ok: true, queued: true })
+    await client.next(frame => frame.method === 'event' && frame.params?.type === 'turn_end')
+    expect(requests.at(-1)).toContain('Review shell-expanded.')
+    client.send({ jsonrpc: '2.0', id: 7, method: 'complete', params: { text: '/existing' } })
+    expect((await client.next(frame => frame.id === 7)).result?.completions).toContainEqual(expect.objectContaining({ value: '/existing ' }))
+    client.send({ jsonrpc: '2.0', id: 8, method: 'slash', params: { command: '/skills trust missing' } })
+    expect((await client.next(frame => frame.id === 8)).result).toMatchObject({ ok: false })
+  } finally { client.close(); await server.stop(); await rm(root, { recursive: true, force: true }) }
+})
 
 test('daemon completion preserves command and path semantics while native skills remain invocable by slash', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'xerxes-daemon-completion-parity-'))

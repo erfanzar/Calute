@@ -15,6 +15,8 @@ export interface SlashRunCtx extends SlashHandlerContext {
 }
 
 export interface SlashCommand {
+  /** Local panel commands remain discoverable without a daemon catalog. */
+  group?: string
   aliases?: string[]
   help?: string
   name: string

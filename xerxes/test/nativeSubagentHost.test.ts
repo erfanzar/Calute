@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { BUILTIN_AGENTS, type AgentDefinition } from '../src/agents/definitions.js'
+import { BUILTIN_AGENTS, loadAgentDefinitions, type AgentDefinition } from '../src/agents/definitions.js'
 import {
   persistedSubagentDeliveryValues,
   persistedSubagentSnapshotValues,
@@ -683,6 +683,26 @@ class ToolCapturingParentClient implements LlmClient {
     yield { content: 'ready' }
   }
 }
+
+test.each(['kernel-expert', 'reviewer'])('a discovered project Markdown specialist %s runs with its project instructions', async profile => {
+  const root = await mkdtemp(join(tmpdir(), 'xerxes-auto-specialist-'))
+  await mkdir(join(root, '.xerxes/agents'), { recursive: true })
+  await writeFile(join(root, `.xerxes/agents/${profile}.md`), `---\nname: ${profile}\ndescription: Kernel correctness review\nmodel: inherit\ntools: [ReadFile]\n---\nReview our tiled kernel implementation carefully.`)
+  const client = new ToolCapturingParentClient()
+  const tools = new ToolRegistry()
+  const host = createNativeSubagentHost({
+    agentDefinitions: loadAgentDefinitions({ cwd: root, userDirectory: join(root, 'empty') }),
+    cwd: root, eventBus: new DaemonSubagentEventBus(), llm: client, model: 'test-model',
+    permissionMode: 'accept-all', tools: tools.definitions(), toolExecutor: tools,
+  })
+  try {
+    const child = await host.managerPort.spawn({ creatorAgentId: 'default', promptProfile: profile, message: 'Review the kernel', title: 'Kernel audit' })
+    const result = await host.managerPort.wait([child.id], 1_000)
+    expect(result.completed[0]?.status).toBe('completed')
+    expect(client.requests[0]?.model).toBe('test-model')
+    expect(JSON.stringify(client.requests[0])).toContain('Review our tiled kernel implementation carefully.')
+  } finally { await host.manager.shutdown(); await rm(root, { recursive: true, force: true }) }
+})
 
 test('native subagent turns inherit configured sampling controls', async () => {
   const client = new ToolCapturingParentClient()

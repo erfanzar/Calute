@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { CompletionItem } from '../app/interfaces.js'
+import { SLASH_COMMANDS } from '../app/slash/registry.js'
 import { looksLikeSlashCommand } from '../domain/slash.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type { CompletionResponse } from '../gatewayTypes.js'
@@ -85,6 +86,21 @@ export function mergeCompletionItems(primary: CompletionItem[], secondary: Compl
   }
 
   return merged
+}
+
+const panelCommands = SLASH_COMMANDS.filter(command => command.group)
+const panelCatalog: SlashCatalog = {
+  canon: Object.fromEntries(panelCommands.map(command => [`/${command.name}`, `/${command.name}`])),
+  pairs: panelCommands.map(command => [`/${command.name}`, command.help ?? '']),
+  categories: [...new Set(panelCommands.map(command => command.group!))].map(name => ({
+    name, pairs: panelCommands.filter(command => command.group === name).map(command => [`/${command.name}`, command.help ?? '']),
+  })),
+  skillCount: 0, sub: {},
+}
+
+/** Panel navigation belongs to the client, even with an older or unavailable daemon catalog. */
+export function tuiSlashCompletions(input: string, catalog: null | SlashCatalog): CompletionItem[] {
+  return mergeCompletionItems(slashCompletionsFromCatalog(input, panelCatalog), slashCompletionsFromCatalog(input, catalog))
 }
 
 export function completionRequestForInput(
@@ -193,7 +209,7 @@ export function useCompletion(input: string, blocked: boolean, gw: GatewayClient
       return
     }
 
-    const initialLocal = request.method === 'complete.slash' ? slashCompletionsFromCatalog(input, catalog) : []
+    const initialLocal = request.method === 'complete.slash' ? tuiSlashCompletions(input, catalog) : []
     const isSkillSuggest = request.method === 'skill_suggestions'
 
     if (initialLocal.length) {
@@ -244,7 +260,7 @@ export function useCompletion(input: string, blocked: boolean, gw: GatewayClient
           const r = asRpcResult<CompletionResponse>(raw)
 
           const remote = r?.items ?? []
-          const local = request.method === 'complete.slash' ? slashCompletionsFromCatalog(input, catalog) : []
+          const local = request.method === 'complete.slash' ? tuiSlashCompletions(input, catalog) : []
 
           setCompletions(
             request.method === 'complete.slash'
@@ -264,7 +280,7 @@ export function useCompletion(input: string, blocked: boolean, gw: GatewayClient
             return
           }
 
-          const local = request.method === 'complete.slash' ? slashCompletionsFromCatalog(input, catalog) : []
+          const local = request.method === 'complete.slash' ? tuiSlashCompletions(input, catalog) : []
 
           if (local.length) {
             setCompletions(rankCompletionItems(local, commandToken(input)))

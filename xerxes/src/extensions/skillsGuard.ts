@@ -117,6 +117,19 @@ export async function saveTrustedHashes(
   await writeDirectFile(hub, 'trusted_hashes.json', JSON.stringify(normalized, null, 2), 'trusted hash database')
 }
 
+let trustedContentWrites: Promise<void> = Promise.resolve()
+
+/** Trust exactly the validated bytes supplied by an authoring or operator action. */
+export function recordTrustedSkillContent(path: string, content: string, paths: SkillGuardPaths = {}): Promise<void> {
+  const hash = createHash('sha256').update(content).digest('hex')
+  const save = trustedContentWrites.then(async () => {
+    await saveTrustedHashes({ ...await loadTrustedHashes(paths), [path]: hash }, paths)
+  })
+  // Keep later operations available after a failure; the caller still receives that failure.
+  trustedContentWrites = save.catch(() => {})
+  return save
+}
+
 /** Run prompt-injection, trusted-hash, and source-repository checks for one skill. */
 export async function scanSkill(skillPath: string, options: ScanSkillOptions = {}): Promise<ScanResult> {
   let skill: SkillMarkdown | undefined

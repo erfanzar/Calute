@@ -46,6 +46,7 @@ agent:
     - SkillTool
     - TodoWriteTool
     - ToolSearchTool
+    - create_project_setup
   subagents:
     coder:
       path: ./coder.yaml

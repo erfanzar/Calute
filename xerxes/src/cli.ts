@@ -1894,6 +1894,8 @@ function daemonRuntime(
       || (typeof fallbackSetting === "string" ? fallbackSetting.trim() : "")
       || undefined;
     const subagentOptions = {
+      ...(connection.reasoningEffort ? { reasoningEffort: connection.reasoningEffort } : {}),
+      ...(host.skillRegistry ? { skillRegistry: host.skillRegistry } : {}),
       resolveSourceWorkspace: (sourceId: string): string => {
         const session = runtime?.listSessions().find(candidate => candidate.id === sourceId);
         if (!session) throw new Error('Subagent source session is unavailable; reopen the parent chat');
@@ -1946,6 +1948,7 @@ function daemonRuntime(
       subagentHost = createNativeSubagentHost(subagentOptions);
     }
     registerClaudeAgentTools(tools, {
+      availableAgents: bootstrapSubagentsForAgent(agentDefinitions),
       intelligence: new AgentSettingsStore(join(xerxesHome(), "daemon", "agent-settings.sqlite")).read().settings ?? parseAgentIntelligenceConfig(config.runtime.agent_intelligence),
       backgroundAgents: subagentHost.turnCoordinator,
       manager: subagentHost.managerPort,
@@ -2294,6 +2297,8 @@ async function acpServer(
     ...(connection.responsesApi ? { responses_api: true } : {}),
   });
   const subagentHost = createNativeSubagentHost({
+    ...(connection.reasoningEffort ? { reasoningEffort: connection.reasoningEffort } : {}),
+    skillRegistry,
     worktreeForWorkspace: nativeSubagentWorktrees,
     resolveProviderProfile: agentProviderResolver(profileStore),
     resolveProviderRoute: agentProviderRouteResolver(profileStore),
@@ -2319,6 +2324,7 @@ async function acpServer(
     ...(connection.topP === undefined ? {} : { topP: connection.topP }),
   });
   registerClaudeAgentTools(tools, {
+    availableAgents: bootstrapSubagentsForAgent(definitions, agentId),
     intelligence: new AgentSettingsStore(join(xerxesHome(), "daemon", "agent-settings.sqlite")).read().settings ?? parseAgentIntelligenceConfig(config.runtime.agent_intelligence),
     backgroundAgents: subagentHost.turnCoordinator,
     manager: subagentHost.managerPort,
@@ -2487,6 +2493,8 @@ async function runOneShot(
     ...(connection.responsesApi ? { responses_api: true } : {}),
   });
   const subagentHost = createNativeSubagentHost({
+    ...(connection.reasoningEffort ? { reasoningEffort: connection.reasoningEffort } : {}),
+    skillRegistry,
     worktreeForWorkspace: nativeSubagentWorktrees,
     resolveProviderProfile: agentProviderResolver(profileStore),
     resolveProviderRoute: agentProviderRouteResolver(profileStore),
@@ -2512,6 +2520,7 @@ async function runOneShot(
     ...(connection.topP === undefined ? {} : { topP: connection.topP }),
   });
   registerClaudeAgentTools(tools, {
+    availableAgents: bootstrapSubagentsForAgent(definitions, agent?.name ?? 'default'),
     intelligence: new AgentSettingsStore(join(xerxesHome(), "daemon", "agent-settings.sqlite")).read().settings ?? parseAgentIntelligenceConfig(config.runtime.agent_intelligence),
     backgroundAgents: subagentHost.turnCoordinator,
     manager: subagentHost.managerPort,

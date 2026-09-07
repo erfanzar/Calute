@@ -3330,3 +3330,24 @@ tests passing. The rebuilt `dist/cli.js` accepted an isolated socket connection
 and exited cleanly on SIGTERM; an overlong socket path retained its original
 bind error without `ERR_SERVER_NOT_RUNNING`. Logs are under
 `/tmp/xerxes-startup-{check,test,build}.log`.
+
+### TUI activity command discovery repair
+
+The user reported that the new panels could not be found. Runs, monitors and
+schedules had TUI handlers and native dispatch paths but were absent from the
+shared command registry, while goals were filtered out of the daemon catalog.
+Added the missing metadata and native goal slash routing, grouped the six
+activity commands at the top of completion, and derived local panel completion
+from the TUI handlers so older/missing daemon catalogs cannot hide them. Tests
+cover catalog/prefix discovery, local fallback/deduplication, and opening the
+four activity inspectors through registered commands in the full 220x65 layout,
+including Escape restoring the draft. Native iTerm/Terminal inspection was
+rejected by computer-use access policy; renderer checks are not native visual
+acceptance.
+
+Validation: root check/test/build passed after updating the registry metadata
+expectations: 3,660 runtime tests passed (3 skipped), and 1,257 UI tests passed.
+An isolated launch of rebuilt `dist/cli.js` also verified all six catalog entries,
+their prefix completions, monitor/run/schedule list RPCs, and native `/goal`.
+Build: `ba90a75b1b0196f7`. Logs: `/tmp/xerxes-discovery-final-check.log`,
+`/tmp/xerxes-discovery-verified-test.log`, and `/tmp/xerxes-discovery-final-build.log`.

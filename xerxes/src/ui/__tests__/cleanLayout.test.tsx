@@ -6,6 +6,8 @@ import { act } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { AppLayoutProps } from '../app/interfaces.js'
+import { GatewayProvider } from '../app/gatewayContext.js'
+import { findSlashCommand } from '../app/slash/registry.js'
 import { patchOverlayState, resetOverlayState, getOverlayState, resetFlowOverlays } from '../app/overlayStore.js'
 import { $agentRailVisible, resetPanelWidth } from '../app/panelSizeStore.js'
 import { resetToolRunVisibility } from '../app/toolRunStore.js'
@@ -67,6 +69,28 @@ const reset = () => {
 beforeEach(() => {
   reset()
   patchUiState({ info: { cwd: '/repo', model: 'sonnet-4.6', mode: 'code', permission_mode: 'default' } as never })
+})
+
+it.each([
+  ['runs', 'Runs · Workspace', 'run.list'],
+  ['monitors', 'Monitors · 0 watching', 'monitor.list'],
+  ['schedules', 'Schedules · current workspace', 'schedule.list'],
+  ['loop', 'Follow-ups · this conversation', 'schedule.list'],
+])('opens /%s through its registered handler in the full layout and returns to the draft', async (command, title, method) => {
+  patchUiState({ sid: 'discovery-session' })
+  const rpc = vi.fn(async () => ({ ok: true, runs: [], monitors: [], jobs: [] }))
+  const screen = await testRender(<GatewayProvider value={{ rpc } as never}><AppLayout {...props(220)} /></GatewayProvider>, { width: 220, height: 65, kittyKeyboard: true })
+  try {
+    await screen.flush()
+    act(() => findSlashCommand(command)!.run('', {} as never, '/' + command))
+    await screen.flush()
+    await vi.waitFor(() => expect(rpc).toHaveBeenCalledWith(method, expect.any(Object)))
+    expect(screen.captureCharFrame()).toContain(title)
+    act(() => screen.mockInput.pressKey('ESCAPE'))
+    await screen.flush()
+    expect(screen.captureCharFrame()).toContain('Keep cancellation behavior unchanged.')
+    expect(screen.captureCharFrame()).not.toContain(title)
+  } finally { act(() => screen.renderer.destroy()) }
 })
 afterEach(reset)
 

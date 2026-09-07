@@ -11,7 +11,7 @@ const nativeUnavailable = (ctx: SlashRunCtx, detail: string) =>
   ctx.transcript.sys(`unavailable in the native Bun daemon: ${detail}`)
 
 export const opsCommands: SlashCommand[] = [
-  { name: 'loop', help: 'manage bounded follow-ups for this conversation', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ loops: true, schedules: false }); else return runNativeSlash(ctx, `loop ${arg.trim()}`, 'Follow-ups') } },
+  { name: 'loop', group: 'activity', help: 'manage bounded follow-ups for this conversation', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ loops: true, schedules: false }); else return runNativeSlash(ctx, `loop ${arg.trim()}`, 'Follow-ups') } },
   { name: 'context', help: 'inspect context, pin memory and exclude stale recall', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ contextInspector: true }); else ctx.transcript.sys('usage: /context') } },
   { name: 'mcp', help: 'inspect MCP health [status|reconnect <name>]', run: (arg, ctx) => runNativeSlash(ctx, `mcp ${arg.trim()}`, 'MCP connections') },
   { name: 'snapshots', help: 'browse snapshot timeline [list]', run: (arg, ctx) => { if (!arg.trim()) patchOverlayState({ snapshots: true }); else if (arg.trim() === 'list') runNativeSlash(ctx, 'snapshots', 'Snapshots'); else ctx.transcript.sys('usage: /snapshots [list]') } },
@@ -34,6 +34,7 @@ export const opsCommands: SlashCommand[] = [
   },
   {
     name: 'schedules',
+    group: 'activity',
     help: 'manage workspace schedules [list|add|pause|resume|run|remove|legacy|migrate]',
     run: (arg, ctx) => {
       if (!arg.trim()) { patchOverlayState({ schedules: true, loops: false }); return }
@@ -42,7 +43,8 @@ export const opsCommands: SlashCommand[] = [
   },
   {
     name: 'monitors',
-    help: 'list or stop session watches [list|stop <id>]',
+    group: 'activity',
+    help: 'create and inspect terminal, file, WebSocket and webhook watches',
     run: (arg, ctx) => {
       if (!arg.trim()) { patchOverlayState({ monitors: true }); return }
       return runNativeSlash(ctx, `monitors ${arg.trim()}`, 'Monitors')
@@ -51,6 +53,7 @@ export const opsCommands: SlashCommand[] = [
   {
     help: 'inspect durable runs and unread results [list|unread|inspect|ack]',
     name: 'runs',
+    group: 'activity',
     run: (arg, ctx) => {
       if (!arg.trim()) { patchOverlayState({ runs: true }); return }
       runNativeSlash(ctx, `runs ${arg.trim()}`, 'Runs')
@@ -256,7 +259,7 @@ export const opsCommands: SlashCommand[] = [
   },
 
   {
-    help: 'list native skills, inspect <name>, or show discovery diagnostics',
+    help: 'list, inspect or trust skills and project commands; show discovery diagnostics',
     name: 'skills',
     run: (arg, ctx) => {
       const [sub = '', ...rest] = arg.trim().split(/\s+/).filter(Boolean)
@@ -268,6 +271,9 @@ export const opsCommands: SlashCommand[] = [
 
       if (lower === 'inspect') {
         return runNativeSlash(ctx, `skills inspect ${rest.join(' ')}`, 'Skill inspection')
+      }
+      if (lower === 'trust') {
+        return runNativeSlash(ctx, `skills trust ${rest.join(' ')}`, 'Trust skill')
       }
       if (lower === 'diagnostics') {
         return runNativeSlash(ctx, `skills diagnostics ${rest.join(' ')}`.trim(), 'Skill diagnostics')
@@ -281,10 +287,10 @@ export const opsCommands: SlashCommand[] = [
       }
 
       if (rest.length) {
-        return ctx.transcript.sys('usage: /skills [list|inspect <name>|diagnostics]  (activate with /skill <name>)')
+        return ctx.transcript.sys('usage: /skills [list|inspect <name>|diagnostics|trust <name>]  (activate with /skill <name>)')
       }
 
-      ctx.transcript.sys('usage: /skills [list|inspect <name>|diagnostics]  (activate with /skill <name>)')
+      ctx.transcript.sys('usage: /skills [list|inspect <name>|diagnostics|trust <name>]  (activate with /skill <name>)')
     }
   },
 

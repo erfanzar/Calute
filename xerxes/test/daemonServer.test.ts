@@ -1261,6 +1261,12 @@ test("daemon derives slash discovery from implemented canonical commands and rej
       params: {},
     });
     const catalog = await client.next((frame) => frame.id === 2);
+    for (const [index, name] of ['runs', 'monitors', 'schedules', 'goal', 'loop'].entries()) {
+      client.send({ jsonrpc: '2.0', id: 100 + index, method: 'complete', params: { text: '/' + name.slice(0, 3) } });
+      expect((await client.next(frame => frame.id === 100 + index)).result?.completions).toEqual(
+        expect.arrayContaining([expect.objectContaining({ value: '/' + name, category: 'activity' })]),
+      );
+    }
     expect(catalog.result).toMatchObject({
       ok: true,
       canon: {
@@ -1274,6 +1280,10 @@ test("daemon derives slash discovery from implemented canonical commands and rej
         ["/help", "Show help"],
         ["/compact", "Compress the conversation"],
         ["/cron", "Manage scheduled tasks"],
+        ["/runs", "Inspect run history and unread results"],
+        ["/monitors", "Create and inspect terminal, file, WebSocket and webhook watches"],
+        ["/schedules", "Create and manage workspace schedules"],
+        ["/goal", "Set or view the goal for a long-running task"],
         ["/history", "Show or search conversation history"],
         ["/remove-memory", "Wipe ALL Xerxes agent memory (global)"],
         ["/remove-history", "Wipe ALL saved chat history and snapshots (global)"],

@@ -167,6 +167,8 @@ interface SpawnedAgentHandle {
 
 /** Structural manager surface consumed by agent-facing compatibility tools. */
 export interface SpawnedAgentManagerPort {
+  /** Native hosts can continue a terminal agent under its original identity/history. */
+  retry?(handleId: string, options: { readonly message?: string; readonly sourceAgentId?: string }): Promise<SpawnedAgentSnapshot>
   close(handleId: string): SpawnedAgentSnapshot & { readonly previousStatus: SpawnedAgentStatus }
   listHandles(): SpawnedAgentSnapshot[]
   resume(handleId: string): SpawnedAgentSnapshot

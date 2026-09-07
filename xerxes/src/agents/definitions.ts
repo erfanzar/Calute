@@ -19,6 +19,13 @@ import {
 import { parseYaml, yamlMap, type YamlMap, type YamlValue } from './yaml.js'
 
 export interface AgentDefinition {
+  /** Markdown specialists replace the general coding persona when delegated. */
+  readonly promptMode?: 'replace'
+  readonly skills?: readonly string[]
+  readonly maxTurns?: number
+  readonly effort?: string
+  readonly background?: boolean
+  readonly permissionMode?: 'default' | 'manual' | 'acceptEdits' | 'auto' | 'dontAsk' | 'bypassPermissions' | 'plan'
   readonly allowedTools: readonly string[] | null
   readonly description: string
   readonly excludeTools: readonly string[]
@@ -37,6 +44,26 @@ export interface AgentDefinition {
 export interface AgentSubagentSpec extends SubagentSpec {
   /** Internal definition-map key used when an alias would collide globally. */
   readonly resolvedProfile?: string
+}
+
+/** The same effective child catalog drives prompt discovery and spawn admission. */
+export function subagentCatalogForAgent(
+  definitions: ReadonlyMap<string, AgentDefinition>,
+  agentName: string,
+): Readonly<Record<string, Pick<AgentSubagentSpec, 'description' | 'resolvedProfile'>>> {
+  const agent = definitions.get(agentName)
+  const catalog: Record<string, Pick<AgentSubagentSpec, 'description' | 'resolvedProfile'>> = Object.assign(Object.create(null), agent?.subagents)
+  // Native YAML compositions keep explicit child lists. Markdown main agents
+  // use the discovered catalog; their tool policy still decides whether they
+  // can delegate at all. Delegated workers cannot call agent-spawning tools.
+  const markdownMain = agent?.promptMode === 'replace'
+  if (!markdownMain && (agent?.source !== 'built-in' || !['default', 'objective'].includes(agentName))) return catalog
+  for (const [key, definition] of definitions) {
+    if (key !== definition.name || key === agentName) continue
+    if (!markdownMain && definition.source !== 'user' && definition.source !== 'project') continue
+    catalog[key] = { description: definition.description, resolvedProfile: key }
+  }
+  return catalog
 }
 
 export interface AgentDefinitionLoadOptions extends AgentSpecLoadOptions {
@@ -78,10 +105,9 @@ export function loadAgentDefinitions(options: AgentDefinitionLoadOptions = {}): 
   const definitions = new Map(options.builtinDefinitions ?? BUILTIN_AGENTS)
   const cwd = resolve(options.cwd ?? process.cwd())
   const userDirectory = resolve(options.userDirectory ?? join(xerxesHome(), 'agents'))
-  const projectDirectory = resolve(options.projectDirectory ?? join(cwd, '.xerxes', 'agents'))
-
   loadDefinitionDirectory(definitions, userDirectory, 'user', options)
-  loadDefinitionDirectory(definitions, projectDirectory, 'project', options)
+  const projectDirectories = options.projectDirectory ? [resolve(options.projectDirectory)] : projectAgentDirectories(cwd)
+  for (const directory of projectDirectories) loadDefinitionDirectory(definitions, directory, 'project', options)
   for (const candidate of projectAgentCandidates(cwd)) {
     try {
       for (const definition of parseProjectAgentFile(candidate, 'project', options)) {
@@ -201,25 +227,42 @@ export function resolveAgentDefinition(
 
 /** Recognized fields in a Markdown definition's YAML frontmatter. */
 const RECOGNIZED_MARKDOWN_FRONTMATTER_FIELDS: ReadonlySet<string> = new Set([
+  'name',
   'description',
   'isolation',
   'max_depth',
   'model',
   'tools',
+  'disallowedTools',
+  'skills',
+  'maxTurns',
+  'effort',
+  'background',
+  'permissionMode',
 ])
 
 /** Parse a Markdown definition with optional YAML frontmatter. */
 export function parseAgentMarkdown(path: string, source = 'user'): AgentDefinition {
   const content = readFileSync(path, 'utf8')
-  const name = basenameWithoutExtension(path)
   const frontmatter = markdownFrontmatter(content)
   const fields = frontmatter ? yamlMap(parseYaml(frontmatter.fields, path), `${path} frontmatter`) : {}
+  if (fields.name !== undefined && (typeof fields.name !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(fields.name))) {
+    throw new AgentSpecError(`${path} frontmatter.name must be a lowercase slug`)
+  }
+  const name = typeof fields.name === 'string' ? fields.name : basenameWithoutExtension(path)
   // Markdown definitions previously bypassed spec validation entirely, so an
   // `isolation: worktrees` typo silently downgraded children to shared-FS
   // writes and a `depth_limit: 9` typo kept the default depth. Apply the same
   // strictness as the YAML loader: unknown keys and invalid modes fail the file.
   rejectUnknownFrontmatterFields(fields, path)
-  const tools = stringList(fields.tools, `${path} frontmatter.tools`)
+  const tools = markdownTools(fields.tools, `${path} frontmatter.tools`)
+  const excludeTools = markdownTools(fields.disallowedTools, `${path} frontmatter.disallowedTools`)
+  const skills = markdownList(fields.skills, `${path} frontmatter.skills`)
+  const maxTurns = fields.maxTurns === undefined ? undefined : integer(fields.maxTurns, `${path} frontmatter.maxTurns`)
+  if (maxTurns === 0) throw new AgentSpecError(`${path} frontmatter.maxTurns must be positive`)
+  const effort = optionalChoice(fields.effort, ['low', 'medium', 'high', 'xhigh', 'max'], `${path} frontmatter.effort`)
+  const permissionMode = optionalChoice(fields.permissionMode, ['default', 'manual', 'acceptEdits', 'auto', 'dontAsk', 'bypassPermissions', 'plan'] as const, `${path} frontmatter.permissionMode`)
+  if (fields.background !== undefined && typeof fields.background !== 'boolean') throw new AgentSpecError(`${path} frontmatter.background must be a boolean`)
   const maxDepth = fields.max_depth === undefined ? 5 : integer(fields.max_depth, `${path} frontmatter.max_depth`)
   const declaredIsolation = fields.isolation === undefined || fields.isolation === null
     ? ''
@@ -232,14 +275,49 @@ export function parseAgentMarkdown(path: string, source = 'user'): AgentDefiniti
     name,
     description: stringValue(fields.description),
     systemPrompt: (frontmatter?.body ?? content).trim(),
-    model: stringValue(fields.model),
+    model: fields.model === 'inherit' ? '' : stringValue(fields.model),
     tools,
-    allowedTools: null,
-    excludeTools: [],
+    allowedTools: fields.tools !== undefined && fields.tools !== null && tools.length === 0 ? [] : null,
+    excludeTools,
+    promptMode: 'replace',
+    skills,
+    ...(maxTurns === undefined ? {} : { maxTurns }),
+    ...(effort === undefined ? {} : { effort }),
+    ...(permissionMode === undefined ? {} : { permissionMode }),
+    ...(fields.background === undefined ? {} : { background: fields.background as boolean }),
     source,
     maxDepth,
     isolation: declaredIsolation,
   })
+}
+
+function optionalChoice<T extends string>(value: YamlValue | undefined, choices: readonly T[], source: string): T | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || !choices.includes(value as T)) throw new AgentSpecError(`${source} must be one of: ${choices.join(', ')}`)
+  return value as T
+}
+
+function markdownList(value: YamlValue | undefined, source: string): string[] {
+  if (value === undefined || value === null) return []
+  const values = typeof value === 'string' ? value.split(',') : value
+  if (!Array.isArray(values) || values.some(item => typeof item !== 'string' || !item.trim())) throw new AgentSpecError(`${source} must be a list of non-empty strings or a comma-separated string`)
+  return [...new Set((values as string[]).map(item => item.trim()))]
+}
+
+/** Claude's short tool names resolve to the native execution tools, not inert labels. */
+function markdownTools(value: YamlValue | undefined, source: string): string[] {
+  const aliases: Readonly<Record<string, readonly string[]>> = {
+    Read: ['ReadFile'], Write: ['WriteFile'], Edit: ['FileEditTool'],
+    Glob: ['GlobTool'], Grep: ['GrepTool'],
+    Bash: ['exec_command', 'write_stdin', 'list_terminal_sessions', 'close_terminal_session'],
+    Agent: ['AgentTool', 'SpawnAgents', 'TaskCreateTool'], Task: ['AgentTool', 'SpawnAgents', 'TaskCreateTool'],
+    Skill: ['SkillTool'], WebSearch: ['DuckDuckGoSearch'], WebFetch: ['URLAnalyzer'],
+    TodoWrite: ['TodoWriteTool'], NotebookEdit: ['NotebookEditTool'],
+  }
+  return [...new Set(markdownList(value, source).flatMap(name => {
+    if (/[()]/.test(name)) throw new AgentSpecError(`${source}: scoped tool pattern '${name}' is not supported; use tool names`)
+    return aliases[name] ?? [name]
+  }))]
 }
 
 /** Reject unrecognized frontmatter keys so misspelled settings cannot be ignored. */
@@ -272,7 +350,10 @@ function loadDefinitionDirectory(
   }
   for (const path of agentFiles(directory, '.md')) {
     try {
+      // Readme files and prompt assets beside definitions are not agents.
+      if (!markdownFrontmatter(readFileSync(path, 'utf8'))) continue
       const definition = parseAgentMarkdown(path, source)
+      if (!definition.description.trim()) throw new AgentSpecError(`${path} frontmatter.description is required for agent discovery`)
       definitions.set(definition.name, definition)
       recordSpecDiagnostics()
     } catch (error) {
@@ -333,6 +414,12 @@ function sameDefinition(left: AgentDefinition, right: AgentDefinition): boolean 
     && left.model === right.model
     && left.isolation === right.isolation
     && left.maxDepth === right.maxDepth
+    && left.promptMode === right.promptMode
+    && left.maxTurns === right.maxTurns
+    && left.effort === right.effort
+    && left.background === right.background
+    && left.permissionMode === right.permissionMode
+    && JSON.stringify(left.skills ?? []) === JSON.stringify(right.skills ?? [])
     && JSON.stringify(left.tools) === JSON.stringify(right.tools)
     && JSON.stringify(left.allowedTools) === JSON.stringify(right.allowedTools)
     && JSON.stringify(left.excludeTools) === JSON.stringify(right.excludeTools)
@@ -385,6 +472,7 @@ function definitionFromSpec(spec: ResolvedAgentSpec, source: string): AgentDefin
 function freezeDefinition(definition: AgentDefinition): AgentDefinition {
   return Object.freeze({
     ...definition,
+    ...(definition.skills ? { skills: Object.freeze([...definition.skills]) } : {}),
     tools: Object.freeze([...definition.tools]),
     allowedTools: definition.allowedTools === null ? null : Object.freeze([...definition.allowedTools]),
     excludeTools: Object.freeze([...definition.excludeTools]),
@@ -424,7 +512,8 @@ function projectAgentCandidates(cwd: string): string[] {
   ].filter(path => existsSync(path))
 }
 
-function agentFiles(directory: string, extension: '.md' | '.yaml'): string[] {
+function agentFiles(directory: string, extension: '.md' | '.yaml', depth = 0): string[] {
+  if (depth > 16) return []
   if (!existsSync(directory)) {
     return []
   }
@@ -439,8 +528,22 @@ function agentFiles(directory: string, extension: '.md' | '.yaml'): string[] {
     ? entries
       .filter(entry => entry.isDirectory() && existsSync(join(directory, entry.name, 'agent.yaml')))
       .map(entry => join(directory, entry.name, 'agent.yaml'))
-    : []
+    : entries.filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
+      .flatMap(entry => agentFiles(join(directory, entry.name), extension, depth + 1))
   return [...direct, ...nested].sort()
+}
+
+/** Walk within the repository; nearer project definitions override outer ones. */
+function projectAgentDirectories(cwd: string): string[] {
+  const ancestors: string[] = []
+  let directory = cwd
+  while (true) {
+    ancestors.push(directory)
+    if (existsSync(join(directory, '.git'))) return ancestors.reverse().map(root => join(root, '.xerxes', 'agents'))
+    const parent = dirname(directory)
+    if (parent === directory) return [join(cwd, '.xerxes', 'agents')]
+    directory = parent
+  }
 }
 
 function recordLoadError(path: string, error: unknown): void {
@@ -493,7 +596,7 @@ function hardcodedBuiltinDefinitions(): ReadonlyMap<string, AgentDefinition> {
     'TaskCreateTool', 'TaskGetTool', 'TaskListTool', 'TaskOutputTool', 'TaskStopTool',
     'TaskUpdateTool', 'AwaitAgents', 'CheckAgentMessages', 'PeekAgent', 'ResetAgent',
     'HandoffTool', 'AskUserQuestionTool', 'SetInteractionModeTool', 'get_goal',
-    'create_goal', 'update_goal', 'SkillTool', 'TodoWriteTool', 'ToolSearchTool',
+    'create_goal', 'update_goal', 'SkillTool', 'TodoWriteTool', 'ToolSearchTool', 'create_project_setup',
   ]
   const definitions: AgentDefinition[] = [
     {

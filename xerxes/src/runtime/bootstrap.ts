@@ -4,7 +4,7 @@
 import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 
-import { BUILTIN_AGENTS, type AgentDefinition } from '../agents/definitions.js'
+import { BUILTIN_AGENTS, subagentCatalogForAgent, type AgentDefinition } from '../agents/definitions.js'
 import { xerxesSubdirFor } from '../core/paths.js'
 import { scanContextContent } from '../security/promptScanner.js'
 import { ExecutionRegistry, type EntryHandler } from './executionRegistry.js'
@@ -92,6 +92,8 @@ export interface BootstrapHost {
 }
 
 export interface BootstrapOptions {
+  /** Replace the general persona while retaining environment and project context. */
+  readonly baseSystemPrompt?: string
   readonly commands?: Readonly<Record<string, EntryHandler | undefined>>
   readonly cwd?: string
   readonly extraContext?: string
@@ -234,6 +236,7 @@ export async function bootstrap(options: BootstrapOptions = {}): Promise<Bootstr
     options.extraContext ?? '',
     options.tools ?? [],
     options.subagents,
+    options.baseSystemPrompt,
   )
   stages.push(stageFromElapsed(host, 'system_prompt', 'ok', systemPrompt.length + ' chars', promptStarted))
 
@@ -246,6 +249,7 @@ export function buildBootstrapSystemPrompt(
   extraContext = '',
   toolDefinitions: readonly unknown[] = [],
   subagentDefinitions?: readonly BootstrapPromptSubagent[],
+  baseSystemPrompt?: string,
 ): string {
   const tools = bootstrapPromptTools(toolDefinitions)
   const toolNames = new Set(tools.map(tool => tool.name))
@@ -331,6 +335,7 @@ export function buildBootstrapSystemPrompt(
       '# Multi-Agent Orchestration',
       '- Use available agent tools for genuinely independent work and keep task boundaries clear.',
       '- Prefer separate research, implementation, and review paths when parallelism helps.',
+      '- Choose a specialist from the available subagent types by its description when its expertise fits the task. Pass its exact name as subagent_type; the user does not need to name it first.',
       '- Track spawned work without waiting for a user reminder. Do not final-answer while required agents are queued or running; await all required results, then verify and synthesize them in the current turn.',
     )
     if (toolNames.has('SpawnAgents')) {
@@ -353,6 +358,10 @@ export function buildBootstrapSystemPrompt(
     '# Critical',
     '- Be concise and direct.',
     '- Respect every tool schema and its workspace/path constraints.',
+    '',
+  )
+  if (baseSystemPrompt !== undefined) sections.splice(0, sections.length, baseSystemPrompt)
+  sections.push(
     '',
     '# Environment',
     '- Date: ' + (context.date ?? ''),
@@ -407,12 +416,12 @@ export interface BootstrapPromptSubagent {
   readonly name: string
 }
 
-/** Resolve the exact child names/descriptions declared by one active agent. */
+/** Resolve the exact child names/descriptions available to one active agent. */
 export function bootstrapSubagentsForAgent(
   definitions: ReadonlyMap<string, AgentDefinition>,
   agentName = 'default',
 ): BootstrapPromptSubagent[] {
-  const declared = definitions.get(agentName)?.subagents ?? {}
+  const declared = subagentCatalogForAgent(definitions, agentName)
   return Object.entries(declared).map(([name, spec]) => ({
     name,
     description: spec.description

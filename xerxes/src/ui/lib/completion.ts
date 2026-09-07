@@ -109,6 +109,7 @@ export function completionMeta(meta: string | undefined, max: number): string {
  * skills hub; they just no longer own the default view.
  */
 const GROUP_ORDER = [
+  'activity',
   'session',
   'config',
   // `info` sits above `skills` deliberately: /help and /status are among the

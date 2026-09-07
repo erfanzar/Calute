@@ -202,6 +202,7 @@ export class AgentEventMailbox {
 }
 
 export interface ClaudeAgentToolsOptions {
+  readonly availableAgents?: readonly { readonly name: string; readonly description: string }[]
   readonly intelligence?: AgentIntelligenceConfig
   /** Resolves an agent type to the runtime descriptor consumed by the manager. */
   readonly agentResolver?: (subagentType: string, model?: string) => SpawnedAgentDescriptor | undefined
@@ -229,6 +230,8 @@ export const CLAUDE_AGENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   definition('AgentTool', 'Spawn one focused subagent, optionally waiting for its final result.', {
     prompt: stringSchema('The delegated task.'),
     title: titleSchema('Short human-readable title describing this delegated task.'),
+    description: titleSchema('Short task description; accepted as an alternative to title.'),
+    resume: stringSchema('Resume an existing subagent by its returned id, retaining its conversation.'),
     subagent_type: stringSchema('Agent definition to run.'),
     worktree_source: { type: 'string', enum: ['working-tree'], description: 'Copy current tracked and untracked non-ignored files into the isolated checkout. Requires isolation=worktree; mutually exclusive with worktree_ref.' },
     worktree_ref: stringSchema('Optional Git revision for worktree isolation. Defaults to HEAD. Resolved at each allocation; use a commit ID for a fixed baseline.'),
@@ -241,7 +244,7 @@ export const CLAUDE_AGENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     run_in_background: booleanSchema('Return immediately while the subagent keeps working.', false),
     wait: booleanSchema('Wait for the subagent to finish.', true),
     timeout: numberSchema('Maximum seconds to wait.'),
-  }, ['prompt', 'title']),
+  }, ['prompt']),
   definition('SendMessageTool', 'Queue a follow-up message for a managed subagent.', {
     target: stringSchema('Subagent id or stable name.'),
     message: stringSchema('Message for the subagent.'),
@@ -339,8 +342,11 @@ export function registerClaudeAgentTools(
   const adapter = new ClaudeAgentTools(options)
   const config = parseAgentIntelligenceConfig(options.intelligence)
   const tiers = AGENT_INTELLIGENCE_LEVELS.filter(level => config[level]).map(level => `${level}=${typeof config[level] === 'string' ? config[level] : JSON.stringify(config[level])}`).join(', ')
+  const catalog = options.availableAgents?.length
+    ? '\nAvailable subagent types (choose by description, or use the exact type requested by the user):\n' + options.availableAgents.map(agent => `- ${agent.name}: ${agent.description}`).join('\n')
+    : ''
   const definitions = CLAUDE_AGENT_TOOL_DEFINITIONS.map(tool => ['AgentTool', 'TaskCreateTool', 'SpawnAgents'].includes(tool.function.name)
-    ? { ...tool, function: { ...tool.function, parameters: configuredIntelligenceSchema(tool.function.parameters, config), description: `${tool.function.description} Intelligence default: ${config.default ?? 'inherit'}. Configured tiers: ${tiers || 'none; omit intelligence and inherit, or specify model'}.` } }
+    ? { ...tool, function: { ...tool.function, parameters: configuredIntelligenceSchema(tool.function.parameters, config), description: `${tool.function.description} Intelligence default: ${config.default ?? 'inherit'}. Configured tiers: ${tiers || 'none; omit intelligence and inherit, or specify model'}.${catalog}` } }
     : tool)
   for (const tool of definitions) {
     registry.replace(tool, (inputs, context, signal) => adapter.execute(tool.function.name, inputs, context, signal), agentId)
@@ -431,6 +437,33 @@ export class ClaudeAgentTools {
     context: ToolExecutionContext,
     signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
+    const prompt = requiredString(inputs, 'prompt')
+    const resume = optionalString(inputs, 'resume')?.trim()
+    if (resume) {
+      for (const field of ['model', 'intelligence', 'provider_profile', 'reasoning_effort', 'isolation', 'worktree_ref', 'worktree_source']) {
+        if (inputs[field] !== undefined) throw new ValidationError(field, 'cannot reconfigure an existing agent while resuming; spawn a new agent for different settings', inputs[field])
+      }
+      const previous = this.requireSnapshot(resume, context, 'resume')
+      const requestedType = optionalString(inputs, 'subagent_type')?.trim()
+      if (requestedType && requestedType !== previous.promptProfile) throw new ValidationError('subagent_type', 'cannot change the profile of a resumed agent', requestedType)
+      const snapshot = isTerminal(previous) && this.options.manager.retry
+        ? await this.options.manager.retry(previous.id, { message: prompt, ...(context.sessionId ? { sourceAgentId: context.sessionId } : {}) })
+        : await this.options.manager.sendInput(previous.id, { message: prompt })
+      this.capture()
+      if (snapshot.rules?.includes('background') || optionalBoolean(inputs, 'run_in_background', false) || !optionalBoolean(inputs, 'wait', true)) {
+        this.observeBackgroundState([snapshot])
+        return agentSnapshotWire(snapshot)
+      }
+      try {
+        const settled = await this.waitFor([snapshot.id], timeoutMilliseconds(inputs, 'timeout', DEFAULT_WAIT_SECONDS), signal, context)
+        const final = settled[0] ?? snapshot
+        this.observeBackgroundState([final])
+        return agentSnapshotWire(final)
+      } catch (error) {
+        if (signal?.aborted) this.closeAfterAbort([snapshot.id], error)
+        throw error
+      }
+    }
     const isolation = parseIsolation(inputs.isolation)
     const name = optionalString(inputs, 'name')?.trim()
     const subagentType = optionalString(inputs, 'subagent_type')?.trim()
@@ -442,14 +475,14 @@ export class ClaudeAgentTools {
       providerProfile: optionalString(inputs, 'provider_profile'),
       reasoningEffort: optionalString(inputs, 'reasoning_effort'),
       intelligence: parseAgentIntelligence(inputs.intelligence),
-      prompt: requiredString(inputs, 'prompt'),
-      title: normalizeAgentTitle(requiredString(inputs, 'title')),
+      prompt,
+      title: normalizeAgentTitle(optionalString(inputs, 'title')?.trim() || optionalString(inputs, 'description')?.trim() || prompt.slice(0, MAX_AGENT_TITLE_LENGTH)),
       ...(name ? { name } : {}),
       ...(subagentType ? { subagentType } : {}),
       ...(model ? { model } : {}),
     }
     const snapshot = await this.spawnSpec(spec, context, signal)
-    const background = optionalBoolean(inputs, 'run_in_background', false)
+    const background = snapshot.rules?.includes('background') || optionalBoolean(inputs, 'run_in_background', false)
     if (background || !optionalBoolean(inputs, 'wait', true)) {
       this.observeBackgroundState([snapshot])
       return agentSnapshotWire(snapshot)
@@ -552,13 +585,19 @@ export class ClaudeAgentTools {
       this.observeSpawnBatchState(snapshots)
       return spawnBatchWire(snapshots)
     }
-    const ids = snapshots.map(snapshot => snapshot.id)
+    const ids = snapshots.filter(snapshot => !snapshot.rules?.includes('background')).map(snapshot => snapshot.id)
+    if (!ids.length) {
+      this.observeSpawnBatchState(snapshots)
+      return spawnBatchWire(snapshots)
+    }
     try {
       const settled = await this.waitFor(ids, timeoutMilliseconds(inputs, 'timeout', DEFAULT_WAIT_SECONDS), signal, context)
-      this.observeSpawnBatchState(settled)
-      return spawnBatchWire(settled)
+      const byId = new Map(settled.map(snapshot => [snapshot.id, snapshot]))
+      const combined = snapshots.map(snapshot => byId.get(snapshot.id) ?? snapshot)
+      this.observeSpawnBatchState(combined)
+      return spawnBatchWire(combined)
     } catch (error) {
-      if (signal?.aborted) this.closeAfterAbort(ids, error)
+      if (signal?.aborted) this.closeAfterAbort(snapshots.map(snapshot => snapshot.id), error)
       throw error
     }
   }

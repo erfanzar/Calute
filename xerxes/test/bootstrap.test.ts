@@ -298,16 +298,14 @@ test('creator-local catalog descriptions follow the resolved profile when aliase
   ])
 })
 
-test('32 production core tools keep bootstrap prompt below its non-duplicated schema budget', () => {
+test('production core tools keep bootstrap prompt below its non-duplicated schema budget', () => {
   const registry = new ToolRegistry()
   registerCoreTools(registry, { workspaceRoot: '/workspace' })
   const tools = registry.definitions()
   const prompt = buildBootstrapSystemPrompt({ cwd: '/workspace' }, '', tools)
 
-  // 29 -> 32: check_command, kill_command and list_commands, which give a
-  // long-running command an identity the model can poll instead of leaving it to
-  // fire-and-forget it with `nohup` and guess at the outcome.
-  expect(tools).toHaveLength(32)
+  // Includes the validated repository setup authoring tool.
+  expect(tools).toHaveLength(33)
   // The ceiling guards against tool JSON Schemas leaking into the prompt, which
   // costs kilobytes per regression — not against doctrine or tool descriptions,
   // which are the prompt's actual job. Raise it deliberately when real content

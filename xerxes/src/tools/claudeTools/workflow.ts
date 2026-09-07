@@ -653,6 +653,7 @@ async function renderSkill(registry: SkillRegistry, inputs: JsonObject): Promise
   // $ARGUMENTS/$N and !`cmd` expansion (Claude Code custom-command parity);
   // the injection scan in skillPromptSection still runs on the result.
   const instructions = await expandSkillInstructions(skill.instructions, {
+    allowCommandExecution: skill.allowCommandExecution !== false,
     ...(args ? { args } : {}),
     cwd: process.cwd(),
   })

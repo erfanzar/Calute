@@ -14,6 +14,7 @@ import { registerComputerUseTool, type ComputerUseToolsOptions } from './compute
 import { registerCodingTools } from './codingTools.js'
 import { registerDataTools } from './dataTools.js'
 import { registerFileTools } from './fileTools.js'
+import { registerProjectSetupTool } from './projectSetup.js'
 import { registerHomeAssistantTools, type HomeAssistantToolsOptions } from './homeAssistantTools.js'
 import { registerGenerateImageTool, type GenerateImageToolOptions } from './imageGen.js'
 import { registerSearchHistoryTool, type SearchHistoryTool } from './history.js'
@@ -168,6 +169,7 @@ export function registerCoreTools(registry: ToolRegistry, options: CoreToolsOpti
   if (options.modelInventory) registerModelInventoryTool(registry, options.modelInventory)
   const paths = new WorkspacePathResolver(options.workspaceRoot ?? process.cwd(), options.activeWorkspaceRoot)
   registerFileTools(registry, paths)
+  registerProjectSetupTool(registry, paths)
   if (options.includeAiTools ?? true) {
     registerAiTools(registry, options.aiTools ?? {})
   }
