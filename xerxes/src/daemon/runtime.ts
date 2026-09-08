@@ -363,6 +363,7 @@ export interface DaemonRuntime {
   setSessionModel?(
     sessionKey: string,
     model: string,
+    providerProfile?: string,
   ): Promise<DaemonSession | undefined>;
   /** Pin one session to a reasoning effort without disturbing any other. */
   setSessionReasoning?(
@@ -971,6 +972,10 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
     // register a second live copy. Claim the resolved id synchronously first;
     // a concurrent opener of another key folds into a deterministic typed
     // error instead of racing.
+    if (!effectiveTranscript && this.runtimeSettings.provider_profile && session.model === this.model()) {
+      session.metadata.provider_profile = this.runtimeSettings.provider_profile;
+      session.modelPinned = true;
+    }
     const claimant = this.sessionIdClaims.get(session.id);
     if (claimant !== undefined && claimant !== key) {
       throw new ValidationError(
@@ -1144,6 +1149,7 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
   async setSessionModel(
     sessionKey: string,
     model: string,
+    providerProfile?: string,
   ): Promise<DaemonSession | undefined> {
     const session = this.sessions.get(sessionKey);
     if (!session) {
@@ -1156,10 +1162,12 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
     const modelDelta = contextDeltaFor(session.model, chosen, Date.now(), "model");
     if (modelDelta) appendContextDelta(session.metadata, modelDelta);
     session.model = chosen;
+    if (providerProfile !== undefined) session.metadata.provider_profile = providerProfile;
     // Pinned from here on, so a later global reload cannot silently move this
     // session onto another session's model.
     session.modelPinned = true;
     session.lastActive = Date.now();
+    await this.saveSession(session);
     return session;
   }
 

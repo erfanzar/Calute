@@ -1,48 +1,25 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 /** @jsxImportSource @opentui/react */
-import { useEffect, useState } from 'react'
-import { useOptionalGateway } from '../app/gatewayContext.js'
 import { patchOverlayState } from '../app/overlayStore.js'
 import type { Theme } from '../theme.js'
 import { Box, Text } from './primitives.js'
+import { recentOutcomes, useActivity } from './useActivity.js'
 
-export const BACKGROUND_STATUS_POLL_MS = 2000
-interface Counts { shells: number; watchers: number }
-export function parseBackgroundStatus(value: unknown): Counts {
-  if (!value || typeof value !== 'object') throw new Error('Invalid background status')
-  const row = value as Record<string, unknown>
-  if (row.ok !== true || !Number.isSafeInteger(row.shells) || Number(row.shells) < 0 || !Number.isSafeInteger(row.watchers) || Number(row.watchers) < 0) throw new Error('Background status unavailable')
-  return { shells: Number(row.shells), watchers: Number(row.watchers) }
-}
-
-/** Poll while idle too; never infer background work from model prose. */
 export function BackgroundStatus({ sessionId, t }: { sessionId: string | null; t: Theme }) {
-  const gateway = useOptionalGateway()
-  const [snapshot, setSnapshot] = useState<{ sessionId: string; counts: Counts | null } | null>(null)
-  useEffect(() => {
-    if (!gateway || !sessionId) return
-    let active = true
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const refresh = async () => {
-      try {
-        const counts = parseBackgroundStatus(await gateway.gw.request('background.status', { session_id: sessionId }))
-        if (active) setSnapshot({ sessionId, counts })
-      } catch {
-        // Do not leave a stale "running" badge after losing the daemon.
-        if (active) setSnapshot({ sessionId, counts: null })
-      } finally {
-        if (active) timer = setTimeout(() => { void refresh() }, BACKGROUND_STATUS_POLL_MS)
-      }
-    }
-    void refresh()
-    return () => { active = false; if (timer) clearTimeout(timer) }
-  }, [gateway, sessionId])
-  if (!gateway || !snapshot || snapshot.sessionId !== sessionId) return null
-  if (!snapshot.counts) return <Text color={t.color.muted}> · background status unavailable</Text>
-  const { shells, watchers } = snapshot.counts
+  const { rows, error, now } = useActivity(sessionId)
+  const shells = rows.filter(row => row.kind === 'shell' && row.state === 'running').length
+  const watchers = rows.filter(row => row.kind === 'watcher' && row.state === 'watching').length
+  const running = rows.filter(row => row.kind === 'schedule' && ['running','cancelling'].includes(row.state)).length
+  const scheduled = rows.filter(row => row.kind === 'schedule' && row.state === 'scheduled').length
+  const recent = recentOutcomes(rows, now)
+  const failed = recent.filter(row => ['failed','interrupted'].includes(row.kind === 'schedule' ? row.lastState ?? '' : row.state)).length
+  const finished = recent.length - failed
+  const labels = [shells ? `${shells} ${shells === 1 ? 'shell' : 'shells'} running` : '', watchers ? `${watchers} ${watchers === 1 ? 'watcher' : 'watchers'} active` : '', running ? `${running} scheduled ${running === 1 ? 'run' : 'runs'} active` : '', scheduled ? `${scheduled} scheduled` : ''].filter(Boolean)
   return <Box flexDirection="row" flexWrap="wrap" flexShrink={0}>
-    {shells > 0 ? <Box onClick={() => patchOverlayState({ terminals: true })}><Text color={t.color.brandGold}>{` · ${shells} ${shells === 1 ? 'shell' : 'shells'} running`}</Text></Box> : null}
-    {watchers > 0 ? <Box onClick={() => patchOverlayState({ monitors: true })}><Text color={t.color.brandGold}>{` · ${watchers} ${watchers === 1 ? 'watcher' : 'watchers'} active`}</Text></Box> : null}
+    {error ? <Box onClick={() => patchOverlayState({ activity: true })}><Text color={t.color.muted}> · background status unavailable</Text></Box> : null}
+    {labels.map(label => <Box key={label} onClick={() => patchOverlayState({ activity: true })}><Text color={t.color.brandGold}>{' · ' + label}</Text></Box>)}
+    {finished > 0 ? <Box onClick={() => patchOverlayState({ activity: true })}><Text color={t.color.ok}>{` · ✓ ${finished} finished`}</Text></Box> : null}
+    {failed > 0 ? <Box onClick={() => patchOverlayState({ activity: true })}><Text color={t.color.warn}>{` · ! ${failed} failed`}</Text></Box> : null}
   </Box>
 }

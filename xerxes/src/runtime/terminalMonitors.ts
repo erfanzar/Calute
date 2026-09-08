@@ -1,5 +1,6 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
+import { ActivityChanges } from './activityChanges.js'
 import type { ReactionMailbox, ReactionHealth, ReactionPolicyEdit } from './reactionMailbox.js'
 import type { RunHistory, MonitorConfiguration } from './runHistory.js'
 import type { FileMonitorSource } from './fileMonitorSource.js'
@@ -30,6 +31,7 @@ interface Watch {
 }
 /** Event-driven source watches. No model polling and no ownership of source processes. */
 export class TerminalMonitors {
+  readonly activityChanges = new ActivityChanges()
   private readonly watches = new Map<string, Watch>()
   private readonly opening = new Set<{ owner: string; controller: AbortController }>()
   constructor(private readonly terminals: TerminalRegistry, private readonly history: RunHistory,
@@ -87,6 +89,7 @@ export class TerminalMonitors {
       watch = { source, trigger: 'output', id: run.id, terminalId: '', owner, match, state: 'watching', events: [], expiresAt,
         ...(options.reaction ? { reaction: { ...options.reaction } } : {}), droppedEvents: 0, sequence: 0, partial: '', prefixOmitted: false, suffixOmitted: false, seen: new Set(), maxEvents, unsubscribe: subscription.close, sourceStatus: 'Watching webhook messages' }
       this.watches.set(watch.id, watch)
+    this.activityChanges.notify()
       if (options.reaction) this.reactionMailbox!.configure({ owner, runId: watch.id, expiresAt, ...options.reaction })
       const active = watch
       watch.timer = setTimeout(() => this.finish(active, 'expired'), duration)
@@ -145,6 +148,7 @@ export class TerminalMonitors {
       watch = { source, trigger: 'output', id: run.id, terminalId: '', owner, match, state: 'watching', events: [], expiresAt,
         ...(options.reaction ? { reaction: { ...options.reaction } } : {}), droppedEvents: 0, sequence: 0, partial: '', prefixOmitted: false, suffixOmitted: false, seen: new Set(), maxEvents, unsubscribe: subscription.close, sourceStatus: status }
       this.watches.set(watch.id, watch)
+    this.activityChanges.notify()
       if (options.reaction) this.reactionMailbox!.configure({ owner, runId: watch.id, expiresAt, ...options.reaction })
       const active = watch
       watch.timer = setTimeout(() => this.finish(active, 'expired'), duration)
@@ -196,6 +200,7 @@ export class TerminalMonitors {
         ...(options.reaction ? { reaction: { ...options.reaction } } : {}), droppedEvents: 0, sequence: 0, partial: '', prefixOmitted: false, suffixOmitted: false, seen: new Set(), maxEvents, unsubscribe: subscription.close,
         sourceStatus: 'Watching file metadata changes. Rapid changes may coalesce; file contents are not read.' }
       this.watches.set(watch.id, watch)
+    this.activityChanges.notify()
       if (options.reaction) this.reactionMailbox!.configure({ owner, runId: watch.id, expiresAt, ...options.reaction })
       const active = watch
       watch.timer = setTimeout(() => this.finish(active, 'expired'), duration)
@@ -234,6 +239,7 @@ export class TerminalMonitors {
     const watch: Watch = { trigger, id: run.id, terminalId: terminal.id, owner, match, state: 'watching', events: [], expiresAt,
       ...(options.reaction ? { reaction: { ...options.reaction } } : {}), droppedEvents: 0, sequence: 0, partial: '', prefixOmitted: false, suffixOmitted: false, seen: new Set(), maxEvents, unsubscribe: () => {} }
     this.watches.set(watch.id, watch)
+    this.activityChanges.notify()
     try {
       if (options.reaction) this.reactionMailbox!.configure({ owner, runId: watch.id, expiresAt: watch.expiresAt, ...options.reaction })
       if (trigger === 'completion' && !terminal.running) {
@@ -431,6 +437,7 @@ export class TerminalMonitors {
     watch.unsubscribe()
     if (watch.timer) clearTimeout(watch.timer)
     watch.state = state
+    this.activityChanges.notify()
     watch.partial = ''
     delete watch.matchedLine
     if (state === 'interrupted' && watch.source?.kind === 'file') watch.sourceStatus = 'File watch interrupted. Changes during downtime were not observed; create a new watch.'
@@ -452,6 +459,7 @@ export class TerminalMonitors {
     if (watch.timer) clearTimeout(watch.timer)
     this.reactionMailbox?.cancel(watch.owner, watch.id)
     watch.state = 'failed'
+    this.activityChanges.notify()
     watch.partial = ''
     delete watch.matchedLine
     watch.error = error instanceof Error ? error.message : String(error)

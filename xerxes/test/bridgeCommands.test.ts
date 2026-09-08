@@ -17,8 +17,8 @@ import {
 test('bridge command registry preserves canonical metadata, aliases, categories, and registry order', () => {
   expect(CATEGORIES).toContain('session')
   expect(resolveCommand('/loop list')).toMatchObject({ name: 'loop', category: 'activity', argsHint: '[list|pause|resume|cancel|run <id>]' })
-  expect(listCommands('activity').map(command => command.name).sort()).toEqual(['agents', 'goal', 'loop', 'monitors', 'runs', 'schedules'])
-  expect(COMMAND_REGISTRY).toHaveLength(83)
+  expect(listCommands('activity').map(command => command.name).sort()).toEqual(['activity', 'agents', 'goal', 'loop', 'monitors', 'runs', 'schedules'])
+  expect(COMMAND_REGISTRY).toHaveLength(84)
   expect(resolveCommand('/features')).toMatchObject({ name: 'features', category: 'info' })
   expect(resolveCommand('/mcp status')).toMatchObject({ name: 'mcp', category: 'tools' })
   expect(resolveCommand('/compress now')).toMatchObject({ name: 'compact', aliases: ['compress'] })

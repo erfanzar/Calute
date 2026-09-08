@@ -113,6 +113,7 @@ export const COMMAND_REGISTRY: readonly CommandDefinition[] = Object.freeze([
   command('skill-create', 'Scaffold a new skill directory', 'skills', { argsHint: '<name>' }),
   command('loop', 'Manage bounded follow-ups for this conversation', 'activity', { argsHint: '[list|pause|resume|cancel|run <id>]' }),
   command('runs', 'Inspect run history and unread results', 'activity', { argsHint: '[list|unread|inspect <id>|ack <id> <revision>]' }),
+  command('activity', 'Inspect background shells, watches and schedules', 'activity'),
   command('monitors', 'Create and inspect terminal, file, WebSocket and webhook watches', 'activity', { argsHint: '[list|stop <id>]' }),
   command('schedules', 'Create and manage workspace schedules', 'activity', { argsHint: '[list|add|pause|resume|run|remove|legacy|migrate]' }),
   command('cron', 'Manage scheduled tasks', 'tools', { argsHint: 'list|add|remove|run' }),

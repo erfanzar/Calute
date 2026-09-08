@@ -178,3 +178,22 @@ test('missing preloaded skills fail visibly before contacting the provider', asy
     } finally { await host.manager.shutdown() }
   })
 })
+
+test('inherited child uses its parent provider rather than the active host provider', async () => {
+  await fixture('---\nname: specialist\ndescription: Review code\nmodel: inherit\n---\nReview carefully.', async root => {
+    const calls: string[] = [];
+    const host = createNativeSubagentHost({
+      agentDefinitions: loadAgentDefinitions({ cwd:root, userDirectory:join(root,'empty') }),
+      cwd:root, eventBus:new DaemonSubagentEventBus(), model:'kimi-for-coding', permissionMode:'accept-all', tools:[], toolExecutor:new ToolRegistry(),
+      llm: { async *stream() { throw new Error('Wrong inherited Kimi transport'); yield {content:''}; } },
+      resolveSourceProvider: source => { expect(source).toBe('codex-parent'); return 'codex'; },
+      resolveProviderRoute: () => 'a'.repeat(64),
+      resolveProviderProfile: profile => ({llm:{async *stream(request){calls.push(profile + '/' + request.model);yield {content:'reviewed'};}}}),
+    });
+    try {
+      const child = await host.managerPort.spawn({ creatorAgentId:'default', promptProfile:'specialist', message:'Review this', sourceAgentId:'codex-parent', parentModel:'gpt-6-astra' });
+      expect((await host.managerPort.wait([child.id],2000)).completed[0]?.status).toBe('completed');
+      expect(calls).toEqual(['codex/gpt-6-astra']);
+    } finally { await host.manager.shutdown(); }
+  });
+});

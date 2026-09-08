@@ -902,6 +902,14 @@ export class GatewayClient extends EventEmitter {
 
       case 'tool.inventory':
       case 'background.status':
+      case 'background.activity':
+      case 'terminal.control':
+      case 'terminal.inspect':
+      case 'monitor.stop':
+      case 'monitor.inspect':
+      case 'schedule.inspect':
+      case 'schedule.pause':
+      case 'schedule.cancel':
       case 'snapshot.list':
       case 'snapshot.preview':
       case 'snapshot.restoreFile':
@@ -1168,21 +1176,11 @@ export class GatewayClient extends EventEmitter {
         throw new Error('model id is required')
       }
 
-      // The picker lists provider *profiles*, not just vendor labels. Select
-      // that profile first so its base URL and credential travel with the
-      // chosen model; treating `--provider` as part of the model id silently
-      // left the previous provider active.
-      if (providerProfile) {
-        await this.nativeSuccess('provider_select', { name: providerProfile })
-      }
-
-      // Pin the model on the session itself. A daemon-wide runtime.reload only
-      // changes the default for unpinned sessions; the picker then claimed the
-      // new model while the next status update (often triggered by /reasoning)
-      // restored the session's old model and sent it to the newly selected
-      // provider.
+      // Bind provider credentials and model in one session-scoped operation.
+      // Changing the global provider first could retarget other live chats.
       const raw = await this.nativeSuccess('set_model', {
         model,
+        ...(providerProfile ? { provider_profile: providerProfile } : {}),
         session_key: this.keyFor(params.session_id)
       })
       return { value: String(raw.model ?? model) }
@@ -1660,7 +1658,7 @@ export class GatewayClient extends EventEmitter {
       providers: profiles.map((profile: RpcObject) => {
         const profileName = String(profile.name ?? profile.provider ?? 'provider')
         return {
-          configured_model: String(profile.model ?? ''),
+          configured_model: (profile.provider === 'kimi-code' && !/^(kimi|k[0-9])(?:[-./]|$)/i.test(String(profile.model ?? ''))) ? '' : String(profile.model ?? ''),
           is_current: Boolean(currentName && profileName === currentName),
           name: profileName,
           provider_type: String(profile.provider ?? ''),

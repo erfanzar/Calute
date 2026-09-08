@@ -110,6 +110,7 @@ export interface OverlayState {
   contextInspector: boolean
   machinePicker: boolean
   customAgentEditor: boolean
+  activity: boolean
   monitors: boolean
   runs: boolean
   snapshots: boolean

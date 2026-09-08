@@ -5,6 +5,7 @@
 // scrollbox transcript (native sticky-scroll), a native <textarea>
 // composer, approval/confirm/clarify prompts, and compact application chrome.
 import { DialogHeader, DialogFooter } from './dialogChrome.js'
+import { ActivityOverlay } from './activityOverlay.js'
 import { BackgroundStatus } from './backgroundStatus.js'
 import type { KeyBinding, KeyEvent, ScrollBoxRenderable, TextareaRenderable, TextRenderable } from '@opentui/core'
 import { useBlur, useFocus, useKeyboard, usePaste, useTerminalDimensions } from '@opentui/react'
@@ -2075,6 +2076,7 @@ export function AppLayout({
       ) : null}
       {overlay.goal ? <GoalOverlay t={t} /> : null}
       {overlay.contextInspector ? <ContextOverlay t={t} /> : null}
+      {overlay.activity ? <ActivityOverlay key={ui.sid} sessionId={ui.sid} t={t} /> : null}
       {overlay.monitors ? <MonitorOverlay t={t} /> : null}
       {overlay.loops ? <ScheduleOverlay t={t} followupsOnly /> : null}
       {overlay.schedules ? <ScheduleOverlay t={t} /> : null}

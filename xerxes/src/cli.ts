@@ -39,8 +39,9 @@ import { loadSystemDaemonConfig, type DaemonConfig } from "./daemon/config.js";
 import type { DaemonInteractionBoard } from "./daemon/interactions.js";
 import { daemonPaths, xerxesHome } from "./daemon/paths.js";
 import { createProductionInteractionBoard } from "./daemon/productionInteractions.js";
+import { profileAcceptsModel, sessionProvider } from './daemon/sessionProvider.js';
 import { runtimeConnection } from "./daemon/runtimeConnection.js";
-import { InMemoryDaemonRuntime } from "./daemon/runtime.js";
+import { InMemoryDaemonRuntime, type DaemonSession } from "./daemon/runtime.js";
 import { daemonBuildIdForEntry } from "./daemon/sourceBuild.js";
 import { compactionCompletionPort } from "./daemon/server.js";
 import { DaemonSubagentEventBus } from "./daemon/subagentEvents.js";
@@ -1684,7 +1685,9 @@ function daemonRuntime(
     return memory;
   };
   const initialConnection = runtimeConnection(config, profileStore.active());
+  const initialProfile = profileStore.active();
   const initialSettings: Record<string, unknown> = {
+    provider_profile: initialProfile && initialConnection && profileAcceptsModel(initialProfile, initialConnection.model) && !(config.runtime.provider || config.runtime.base_url || config.runtime.api_key) ? initialProfile.name : undefined,
     ...config.runtime,
     ...(initialConnection
       ? {
@@ -1903,6 +1906,12 @@ function daemonRuntime(
     const subagentOptions = {
       ...(connection.reasoningEffort ? { reasoningEffort: connection.reasoningEffort } : {}),
       ...(host.skillRegistry ? { skillRegistry: host.skillRegistry } : {}),
+      resolveSourceProvider: (sourceId: string, model: string): string | undefined => {
+        const session = runtime?.listSessions().find(candidate => candidate.id === sourceId);
+        if (!session) throw new Error('Subagent source session is unavailable; reopen the parent chat');
+        if (!session.metadata.provider_profile && (config.runtime.provider || config.runtime.base_url || config.runtime.api_key)) return undefined;
+        return sessionProvider(profileStore, session, model)?.name;
+      },
       resolveSourceWorkspace: (sourceId: string): string => {
         const session = runtime?.listSessions().find(candidate => candidate.id === sourceId);
         if (!session) throw new Error('Subagent source session is unavailable; reopen the parent chat');
@@ -1966,7 +1975,15 @@ function daemonRuntime(
     registerClaudeWorkflowTools(tools, {
       ...(agentDefinitions.size ? { agentDefinitions: [...agentDefinitions.values()] } : {}),
       ...(host.skillRegistry ? { skillRegistry: host.skillRegistry } : {}),
-      planGenerator: createLlmPlanGenerator(llm, { model: connection.model }),
+      planGenerator: {
+        generate: (request, signal) => {
+          const active = getActiveSession<DaemonSession>();
+          const model = active?.model || connection.model;
+          const profile = active && (active.metadata.provider_profile || !(config.runtime.provider || config.runtime.base_url || config.runtime.api_key)) ? sessionProvider(profileStore, active, model) : undefined;
+          const planner = profile ? createLlmClient(model, { provider: profile.provider, api_key: profile.api_key, base_url: profile.base_url, ...(connection.responsesApi ? { responses_api: true } : {}) }) : llm;
+          return createLlmPlanGenerator(planner, { model }).generate(request, signal);
+        },
+      },
       subagentManager: subagentHost.managerPort,
     });
     // Report what a request actually carries, not what is registered. With
@@ -1975,6 +1992,18 @@ function daemonRuntime(
     activeToolCount = tools.definitionsForTranscript([]).length;
     const contextLimit = resolvedProfileContextLimit(profileStore.active(), connection.model);
     return new AgentTurnRunner({
+      resolveSessionProvider: (session, model) => {
+        if (!session.metadata.provider_profile && (config.runtime.provider || config.runtime.base_url || config.runtime.api_key)) return { llm };
+        const profile = sessionProvider(profileStore, session, model);
+        if (!profile) return { llm };
+        return {
+          llm: createLlmClient(model, { provider: profile.provider, api_key: profile.api_key, base_url: profile.base_url, ...(connection.responsesApi ? { responses_api: true } : {}) }),
+          createLlmForModel: candidate => createLlmClient(candidate, { provider: profile.provider, api_key: profile.api_key, base_url: profile.base_url, ...(connection.responsesApi ? { responses_api: true } : {}) }),
+          providerOverrides: { provider: profile.provider, base_url: profile.base_url },
+          contextLimit: resolvedProfileContextLimit(profile, model),
+          maxOutputTokens: candidate => resolvedProfileMaxOutputTokens(profile, candidate),
+        };
+      },
       ...(contextLimit === undefined ? {} : { contextLimit }),
       // The profile's provider, carried explicitly so nothing downstream has
       // to infer it from the model id. An OpenRouter id like
@@ -2052,20 +2081,24 @@ function daemonRuntime(
       // loop can retry an overflowed round once, but only if something is
       // willing to shrink the history for it.
       reduceContext: async (messages) => {
+        const active = getActiveSession<DaemonSession>();
+        const model = active?.model || connection.model;
+        const profile = active && (active.metadata.provider_profile || !(config.runtime.provider || config.runtime.base_url || config.runtime.api_key)) ? sessionProvider(profileStore, active, model) : undefined;
+        const compactionLlm = profile ? createLlmClient(model, { provider: profile.provider, api_key: profile.api_key, base_url: profile.base_url, ...(connection.responsesApi ? { responses_api: true } : {}) }) : llm;
         // PreCompact hook before any message is dropped (Claude Code parity).
         const hookRunner = hooksForWorkspace(getActiveSession<{ cwd: string }>()?.cwd ?? workspaceRoot);
         if (hookRunner.hasHooks("on_compact")) {
           await hookRunner.run("on_compact", {
             message_count: messages.length,
-            model: connection.model,
+            model,
             trigger: "context_overflow",
           });
         }
         const priced = messages as unknown as Readonly<Record<string, unknown>>[];
-        const before = estimateContextTokens(priced, { model: connection.model });
+        const before = estimateContextTokens(priced, { model });
         const agent = createCompactionAgent({
-          model: connection.model,
-          completion: compactionCompletionPort(llm, connection.model),
+          model,
+          completion: compactionCompletionPort(compactionLlm, model),
           summaryMaxTokens: OVERFLOW_SUMMARY_MAX_TOKENS,
         });
         // `ContextMessage` is deliberately `Record<string, unknown>` so
@@ -2079,7 +2112,7 @@ function daemonRuntime(
             0,
             before - estimateContextTokens(
               reduced as unknown as Readonly<Record<string, unknown>>[],
-              { model: connection.model },
+              { model },
             ),
           ),
         };

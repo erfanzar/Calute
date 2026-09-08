@@ -76,8 +76,7 @@ test('resuming history continues on the model that wrote it', async () => {
     // An empty transcript is never persisted, so the session needs history for
     // there to be anything to resume.
     opened.messages.push({ role: 'user', content: 'hello' }, { role: 'assistant', content: 'hi — the pinned reply' })
-    await runtime.setSessionModel('original', 'codex/gpt-5.5')
-    await runtime.flushSessions()
+    await runtime.setSessionModel('original', 'codex/gpt-5.5', 'codex')
 
     // A fresh daemon whose default is a different provider entirely.
     const restarted = new InMemoryDaemonRuntime(undefined, {
@@ -90,6 +89,7 @@ test('resuming history continues on the model that wrote it', async () => {
     // Resuming must not silently move a conversation onto another provider:
     // the transcript was produced by this model and continues on it.
     expect(resumed.model).toBe('codex/gpt-5.5')
+    expect(resumed.metadata.provider_profile).toBe('codex')
 
     // And it stays put when the daemon default moves again.
     restarted.reload({ model: 'claude-opus-4-6' })

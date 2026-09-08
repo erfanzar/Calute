@@ -107,6 +107,7 @@ export interface AgentTurnRunnerOptions {
   /** Optional tier receiving completed assistant turns for recall on later work. */
   readonly memory?: Memory
   readonly memoryMinChars?: number
+  readonly resolveSessionProvider?: (session: DaemonSession, model: string) => { llm: LlmClient; createLlmForModel?: (model: string) => LlmClient; providerOverrides?: ProviderOverrides; contextLimit?: number | undefined; maxOutputTokens?: (model: string) => number | undefined }
   readonly llm: LlmClient
   /** Provider-reported context capacity for this profile/model; absent means unknown. */
   readonly contextLimit?: number
@@ -246,6 +247,7 @@ export class AgentTurnRunner implements TurnRunner {
     signal: AbortSignal,
     controls: TurnRunControls = {},
   ): AsyncGenerator<DaemonEvent> {
+    const routedProvider = this.options.resolveSessionProvider?.(session, this.options.agentDefinitions?.get(session.agentId)?.model || session.model || this.options.model)
     const displayText = controls.displayText?.trim() || text
     // The session is the source of truth between turns: undo, retry, compact,
     // and idle steers mutate session.messages directly, so cached state must
@@ -477,12 +479,12 @@ export class AgentTurnRunner implements TurnRunner {
       // fallback model. Restarting after content would duplicate streamed
       // text, so the fallback is strictly pre-content and exactly once.
       const fallbackModel = this.options.fallbackModel
-      const fallbackFactory = this.options.createLlmForModel
+      const fallbackFactory = routedProvider?.providerOverrides ? routedProvider.createLlmForModel : this.options.createLlmForModel
       let attemptModel = model
-      let attemptLlm = this.options.llm
+      let attemptLlm = routedProvider?.llm ?? this.options.llm
       let fallbackAttempted = false
       for (;;) {
-        const maxTokens = this.options.maxTokens ?? this.options.maxOutputTokens?.(attemptModel)
+        const maxTokens = this.options.maxTokens ?? (routedProvider?.maxOutputTokens ?? this.options.maxOutputTokens)?.(attemptModel)
         const turnEvents = withActiveSession(session, runTurn({
         agentId: promptAgent?.name ?? session.agentId,
         interactionMode: session.interactionMode,
@@ -520,8 +522,8 @@ export class AgentTurnRunner implements TurnRunner {
         } : {}),
         ...(controls.drainSteer ? { drainSteer: controls.drainSteer } : {}),
         // Retry patience is owned by the routed provider, not a global default.
-        retryDelays: retryPolicyForModel(attemptModel, this.options.providerOverrides).delaysMs,
-        maxSuggestedRetryDelayMs: retryPolicyForModel(attemptModel, this.options.providerOverrides)
+        retryDelays: retryPolicyForModel(attemptModel, routedProvider?.providerOverrides ?? this.options.providerOverrides).delaysMs,
+        maxSuggestedRetryDelayMs: retryPolicyForModel(attemptModel, routedProvider?.providerOverrides ?? this.options.providerOverrides)
           .maxSuggestedDelayMs,
         llm: attemptLlm,
         ...((this.options.hookRunnerForSession || this.options.hookRunner) ? { hookRunner: this.options.hookRunnerForSession?.(session) ?? this.options.hookRunner } : {}),
@@ -567,7 +569,7 @@ export class AgentTurnRunner implements TurnRunner {
             event,
             state,
             session,
-            this.options.contextLimit,
+            routedProvider?.contextLimit ?? this.options.contextLimit,
           )
         }
         // Pre-content buffering: hold status/retry events until the attempt
@@ -1281,7 +1283,11 @@ function synchronizeSessionState(session: DaemonSession, state: AgentState): voi
     return { ...providerMessage, text: displayText }
   })
   const mergedDeltas = mergeContextDeltas(state.metadata, session.metadata)
+  // The picker can change the next turn's route while this turn is streaming.
+  // Its session binding must survive the finishing turn's metadata snapshot.
+  const providerProfile = session.metadata.provider_profile
   session.metadata = { ...state.metadata }
+  if (providerProfile !== undefined) session.metadata.provider_profile = providerProfile
   if (mergedDeltas.length) session.metadata.context_deltas = mergedDeltas
   session.thinkingContent = [...state.thinkingContent]
   session.toolExecutions = [...state.toolExecutions]

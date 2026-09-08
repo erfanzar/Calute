@@ -3592,7 +3592,7 @@ test("daemon implements native completion, slash, steering, mode, and provider c
     });
     expect(
       (await client.next((frame) => frame.id === 81)).result?.session,
-    ).toMatchObject({ profile_name: null });
+    ).toMatchObject({ profile_name: 'native' });
     runtime.reload({
       base_url: "https://provider.example/v1",
       provider: "openai",
@@ -9992,4 +9992,62 @@ test('background.status counts live session-owned shells and watchers while idle
     monitors.stop(owner, watch.id);
     expect(await status(3)).toEqual({ ok: true, shells: 0, watchers: 0 });
   } finally { client.close(); monitors.close(); await server.stop(); history.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('activity pushes lifecycle changes, lists schedules and scopes process controls', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xr-activity-events-'));
+  const history = new RunHistory(join(directory, 'runs.sqlite'));
+  const terminals = new TerminalRegistry({ runHistory: history });
+  const runtime = new InMemoryDaemonRuntime(undefined, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const monitors = new TerminalMonitors(terminals, history, () => {});
+  const store = new JobStore(join(directory, 'jobs.json'));
+  const server = new DaemonServer({ socketPath: join(directory, 'rpc.sock'), runtime, projectDirectory: directory, terminalRegistry: terminals, runHistory: history, monitors, cronStoreFactory: () => store });
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory, 'rpc.sock'));
+  let requestId = 0;
+  const request = async (method: string, params: Record<string, unknown> = {}) => { const id = ++requestId; client.send({ jsonrpc:'2.0', id, method, params }); return (await client.next(frame => frame.id === id)).result; };
+  try {
+    await request('session.open', { session_key:'activity-owner' });
+    const owner = runtime.sessionStatus('activity-owner')!.id;
+    const shell = terminals.open({id:'owned',ownerSessionId:owner,cwd:directory,command:'bun test',kind:'background',control:{kill: async () => { shell.close(0); }}});
+    await client.next(eventFrame('background_changed'));
+    const watch = monitors.start(owner, { terminalId:shell.id,match:'done' });
+    store.add(new CronJob({id:'queued',prompt:'Check the build',schedule:'0 9 * * *',projectRoot:directory,nextRunAt:'2099-01-01T09:00:00Z'}));
+    terminals.open({id:'other',ownerSessionId:'other-session',cwd:directory,command:'private command',kind:'background'});
+    const activity = await request('background.activity');
+    expect(activity).toMatchObject({ok:true,rows:expect.arrayContaining([
+      expect.objectContaining({id:'owned',kind:'shell',state:'running',action:'stop'}),
+      expect.objectContaining({id:watch.id,kind:'watcher',state:'watching'}),
+      expect.objectContaining({id:'queued',kind:'schedule',state:'scheduled',action:'pause'}),
+    ])});
+    expect(JSON.stringify(activity)).not.toContain('private command');
+    expect(await request('terminal.control',{terminal_id:'other',action:'kill'})).toMatchObject({ok:false});
+    expect(await request('terminal.control',{terminal_id:'owned',action:'kill'})).toMatchObject({ok:true});
+    expect(await request('background.activity')).toMatchObject({rows:expect.arrayContaining([expect.objectContaining({id:'owned',state:'completed',endedAt:expect.any(Number),action:null})])});
+    const schedule = { revision: Bun.hash(JSON.stringify(store.get('queued')!.toRecord())).toString(16) };
+    expect(await request('schedule.pause',{schedule_id:'queued',revision:schedule.revision})).toMatchObject({ok:true});
+    expect(await request('background.activity')).toMatchObject({rows:expect.arrayContaining([expect.objectContaining({id:'queued',state:'paused'})])});
+    expect(await request('slash',{command:'/activity'})).toMatchObject({ok:true,rows:expect.any(Array)});
+  } finally { client.close(); monitors.close(); await server.stop(); history.close(); await rm(directory,{recursive:true,force:true}); }
+});
+
+test('model selection binds profile atomically without poisoning another profile', async () => {
+  const directory = await mkdtemp(join(tmpdir(),'xr-atomic-model-'));
+  const profiles = new ProfileStore(join(directory,'profiles.json'));
+  profiles.save({name:'kimi',provider:'kimi-code',model:'kimi-for-coding',apiKey:'fixture',baseUrl:'https://example.invalid'});
+  const runtime = new InMemoryDaemonRuntime(undefined,{model:'kimi-for-coding',currentProjectDirectory:directory});
+  const server = new DaemonServer({socketPath:join(directory,'rpc.sock'),runtime,profileStore:profiles});
+  await server.start();
+  const client = await SocketTestClient.connect(join(directory,'rpc.sock'));
+  let next=0;
+  const call=async(method:string,params:Record<string,unknown>)=>{const id=++next;client.send({jsonrpc:'2.0',id,method,params});return (await client.next(frame=>frame.id===id)).result;};
+  try {
+    await call('session.open',{session_key:'picker'});
+    expect(await call('set_model',{model:'gpt-6-astra',provider_profile:'codex'})).toMatchObject({ok:true,model:'gpt-6-astra'});
+    expect(runtime.sessionStatus('picker')?.metadata.provider_profile).toBe('codex');
+    expect(profiles.get('kimi')?.model).toBe('kimi-for-coding');
+    expect(await call('set_model',{model:'gpt-6-astra',provider_profile:'kimi'})).toMatchObject({ok:false});
+    expect(runtime.sessionStatus('picker')?.metadata.provider_profile).toBe('codex');
+    expect(await call('session.status',{})).toMatchObject({session:{model:'gpt-6-astra',profile_name:'codex'}});
+  } finally {client.close();await server.stop();await rm(directory,{recursive:true,force:true});}
 });

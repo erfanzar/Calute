@@ -257,6 +257,7 @@ import {
 import { resolveProjectDirectory, xerxesHome } from "./paths.js";
 import { formatBytes, wipeHistoryStores, wipeMemoryStores } from "./wipe.js";
 import { searchProjectFileMentions } from "./projectFileMentions.js";
+import { profileAcceptsModel, sessionProvider } from './sessionProvider.js';
 import type { DaemonTransportConnection } from "./transport.js";
 import {
   DaemonWebSocketGateway,
@@ -968,6 +969,17 @@ export class DaemonServer {
   private readonly websocketOptions: DaemonWebSocketGatewayOptions | undefined;
   private websocketGateway: DaemonWebSocketGateway | undefined;
 
+  private readonly activityUnsubscribe: Array<() => void> = [];
+  private activityPending = false;
+  private notifyActivity(): void {
+    if (this.activityPending || this.stoppingGoalWakes) return;
+    this.activityPending = true;
+    queueMicrotask(() => {
+      this.activityPending = false;
+      if (!this.stoppingGoalWakes) this.broadcast('background_changed', {});
+    });
+  }
+
   constructor(options: DaemonServerOptions) {
     this.machineSettingsPath = options.machineSettingsPath ?? join(xerxesHome(), 'machines.json');
     this.codexModelCatalog = options.codexModelCatalog ?? (async (profile, signal) => {
@@ -1107,6 +1119,9 @@ export class DaemonServer {
     this.goalTokenLedger = options.goalTokenLedger;
     this.goalTokenOwner = options.goalTokenOwner ?? crypto.randomUUID();
     this.monitors = options.monitors;
+    for (const source of [this.terminalRegistry, this.monitors, this.cronStore, this.cronScheduler]) {
+      if (source) this.activityUnsubscribe.push(source.activityChanges.subscribe(() => this.notifyActivity()));
+    }
     this.reactionMailbox = options.reactionMailbox;
     this.reactionDispatcher = options.reactionMailbox && this.runHistory ? new ReactionDispatcher(options.reactionMailbox, {
       admit: async (owner, work) => {
@@ -1400,6 +1415,7 @@ export class DaemonServer {
 
   private async stopOnce(): Promise<void> {
     this.stoppingGoalWakes = true;
+    for (const unsubscribe of this.activityUnsubscribe.splice(0)) unsubscribe();
     const server = this.server;
     const gateway = this.websocketGateway;
     const channelWebhook = this.channelWebhookServer;
@@ -1905,7 +1921,7 @@ export class DaemonServer {
               // This is intentionally an identity only. The picker can use it
               // to select the exact stored profile without receiving the live
               // endpoint or credential that proved the match.
-              profile_name: this.activeRuntimeProfileName(),
+              profile_name: this.sessionProfileName(session),
             }
           : null,
       };
@@ -2370,6 +2386,7 @@ export class DaemonServer {
         return { ok: true, review: await workspaces.inspect(params.workspace_id) };
       } catch (error) { return { ok: false, error: errorMessage(error) }; }
     }
+    if (method === "background.activity") return this.backgroundActivity(connection, params);
     if (method === "background.status") {
       const owner = this.terminalOwnerSessionId(connection, params);
       return {
@@ -2748,7 +2765,7 @@ export class DaemonServer {
       if (!model) {
         return { ok: false, error: "model id is required" };
       }
-      return this.setModel(connection, model, sessionKey(connection, params));
+      return this.setModel(connection, model, sessionKey(connection, params), optionalString(params.provider_profile));
     }
     if (method === "set_reasoning") {
       const effort = optionalString(params.reasoning_effort)
@@ -2798,7 +2815,8 @@ export class DaemonServer {
       // Resolve the ladder against the requested session's model. The daemon
       // default can differ after another tab/provider changes configuration.
       const activeSession = this.runtime.sessionStatus(sessionKey(connection, params));
-      const set = await this.reasoningLevels(activeSession?.model);
+      const profileName = activeSession ? this.sessionProfileName(activeSession) : null;
+      const set = await this.reasoningLevels(activeSession?.model, profileName ? this.profileStore.get(profileName) : undefined);
       const selectable = selectableEfforts(set);
       // Session-first, like configureReasoning: /thinking pins the effort per
       // session, so reading only the daemon-wide value would report an effort
@@ -3394,6 +3412,12 @@ export class DaemonServer {
     return { ok: true };
   }
 
+  private sessionProfileName(session: DaemonSession): string | null {
+    if (!session.metadata.provider_profile && !this.activeRuntimeProfileName()) return null;
+    try { return sessionProvider(this.profileStore, session, session.model)?.name ?? this.activeRuntimeProfileName(); }
+    catch { return typeof session.metadata.provider_profile === 'string' ? session.metadata.provider_profile : null; }
+  }
+
   private async emitProviderInit(
     connection: DaemonTransportConnection,
   ): Promise<void> {
@@ -3923,8 +3947,8 @@ export class DaemonServer {
       };
     }
     const fallbackModels = [...new Set([
-      ...(profile.model.trim() ? [profile.model.trim()] : []),
-      ...Object.keys(profile.model_capabilities ?? {}),
+      ...(profile.model.trim() && profileAcceptsModel(profile, profile.model) ? [profile.model.trim()] : []),
+      ...Object.keys(profile.model_capabilities ?? {}).filter(model => profileAcceptsModel(profile, model)),
     ])];
     if (
       profile.provider === "claude-code" ||
@@ -4443,6 +4467,11 @@ export class DaemonServer {
       case "cron":
       case "schedules":
         return this.manageCronJobs(connection, args);
+      case "activity": {
+        const result = this.backgroundActivity(connection, {});
+        this.emitSlash(connection, JSON.stringify(result, null, 2));
+        return result;
+      }
       case "background":
         return this.showBackgroundTasks(connection);
       case "browser":
@@ -4538,28 +4567,9 @@ export class DaemonServer {
           );
           return { ok: true, model: current };
         }
-        // Scoped to this session so a second open session keeps its own model.
-        // Only when the host cannot do that does this fall back to the global
-        // reload, which moves every unpinned session at once.
-        const pinned = await this.runtime.setSessionModel?.(
-          connection.activeSessionKey,
-          args,
-        );
-        if (!pinned) {
-          this.runtime.reload({ model: args });
-        }
-        // Persist as the default for sessions opened later; it no longer
-        // retargets sessions that already picked for themselves.
-        try {
-          this.profileStore?.updateActiveModel(args);
-        } catch {
-          // Profile persistence is best-effort; the in-memory model applies regardless.
-        }
-        this.emitSlash(connection, `Model set to \`${args}\`.`);
-        await this.emitProviderInit(connection);
-        const session = this.runtime.sessionStatus(connection.activeSessionKey);
-        if (session) this.emitStatus(connection, session);
-        return { ok: true, model: args };
+        const result = await this.setModel(connection, args);
+        this.emitSlash(connection, result.ok ? 'Model set to ' + args + '.' : String(result.error), result.ok ? 'info' : 'warning');
+        return result;
       }
       case "provider":
         if (!args) {
@@ -5508,6 +5518,47 @@ export class DaemonServer {
     return { ok: true, sessions };
   }
 
+  private backgroundActivity(connection: DaemonTransportConnection, params: JsonRpcPayload): JsonRpcPayload {
+    const key = sessionKey(connection, params);
+    const session = this.runtime.sessionStatus(key);
+    const owner = session?.id ?? key;
+    const rows: JsonRpcPayload[] = [];
+    for (const shell of this.terminalRegistry?.list(owner) ?? []) {
+      // Successful synchronous calls belong in the transcript, not activity history.
+      if (!shell.running && shell.kind === 'foreground' && shell.exitCode === 0) continue;
+      rows.push({ id: shell.id, kind: 'shell', title: shell.command.slice(0, 2000), detail: shell.cwd,
+        state: shell.running ? 'running' : shell.exitCode === 0 ? 'completed' : shell.exitCode === null ? 'interrupted' : 'failed',
+        startedAt: shell.startedAt, endedAt: shell.endedAt ?? null, exitCode: shell.exitCode,
+        action: shell.canKill ? 'stop' : null, scope: 'session' });
+    }
+    for (const watch of this.monitors?.list(owner) ?? []) {
+      const run = this.runHistory?.inspect(owner, watch.id);
+      const source = watch.source;
+      rows.push({ id: watch.id, kind: 'watcher', title: source?.kind === 'file' ? source.path : source?.kind === 'websocket' ? source.url : source?.kind === 'webhook' ? source.name : watch.match,
+        detail: watch.error ?? watch.sourceStatus ?? (watch.trigger === 'completion' ? 'Waiting for command completion' : 'Matching: ' + watch.match),
+        state: watch.state, startedAt: run?.startedAt ?? null, endedAt: run?.endedAt ?? null,
+        action: watch.stopAction ? 'stop' : null, scope: 'session' });
+    }
+    const project = session?.cwd ?? this.projectDirectory;
+    for (const job of this.cronStore.listJobs()) {
+      if (!project || !job.projectRoot || resolveProjectDirectory(job.projectRoot) !== resolveProjectDirectory(project)) continue;
+      if (job.targetSessionId && job.targetSessionId !== owner) continue;
+      const execution = this.cronScheduler.state(job.id);
+      const runOwner = job.targetSessionId ?? this.runtime.sessionStatus('cron:' + job.id)?.id;
+      const outcome = runOwner ? this.runHistory?.latestOutcome(runOwner, job.id, 'schedule') : null;
+      rows.push({ id: job.id, kind: 'schedule', title: job.prompt.slice(0, 2000), detail: job.targetSessionId ? 'Follow-up in this chat' : 'Workspace schedule · independent chat',
+        state: execution !== 'idle' ? execution : job.paused ? 'paused' : 'scheduled',
+        startedAt: execution !== 'idle' ? outcome?.startedAt ?? null : null, endedAt: null,
+        lastState: outcome?.state ?? null, lastEndedAt: outcome?.endedAt ?? null,
+        nextRunAt: job.nextRunAt ?? null, revision: Bun.hash(JSON.stringify(job.toRecord())).toString(16),
+        action: execution === 'running' ? 'cancel' : execution === 'idle' && !job.paused ? 'pause' : null,
+        scope: job.targetSessionId ? 'session' : 'workspace' });
+    }
+    const live = new Set(['running', 'watching', 'cancelling', 'scheduled']);
+    rows.sort((a,b) => Number(live.has(String(b.state))) - Number(live.has(String(a.state))) || Number(b.endedAt ?? b.startedAt ?? 0) - Number(a.endedAt ?? a.startedAt ?? 0));
+    return { ok: true, session_id: owner, rows: rows.slice(0, 200), omitted: Math.max(0, rows.length - 200) };
+  }
+
   private terminalOwnerSessionId(
     connection: DaemonTransportConnection,
     params: JsonRpcPayload,
@@ -6203,7 +6254,10 @@ export class DaemonServer {
     // consulting a provider at all, and building the client eagerly made that
     // no-op require a constructible one. See lazyCompactionCompletionPort.
     const completion = lazyCompactionCompletionPort(
-      () => createCompactionClient(model, this.profileStore?.active(), this.runtime.status()),
+      () => {
+        const profileName = this.sessionProfileName(session);
+        return createCompactionClient(model, profileName ? this.profileStore.get(profileName) : undefined, this.runtime.status());
+      },
       model,
       undefined,
       signal,
@@ -8332,11 +8386,27 @@ export class DaemonServer {
     name: string,
   ): Promise<JsonRpcPayload> {
     this.cancelProviderFlow(connection);
-    if (!name || !this.profileStore.setActive(name)) {
+    const chosen = this.profileStore.get(name);
+    if (!name || !chosen) {
       return { ok: false, error: `No provider profile named ${name}` };
     }
+    if (chosen.provider !== 'claude-code' && !profileAcceptsModel(chosen, chosen.model)) {
+      return { ok: false, error: `Provider ${name} cannot serve its configured model ${chosen.model}. Use /model to choose a supported model.` };
+    }
+    // Preserve the routes of existing chats before changing the daemon default.
+    for (const session of this.runtime.listSessions()) {
+      if (!session.metadata.provider_profile) {
+        try { sessionProvider(this.profileStore, session, session.model); session.modelPinned = true; } catch { /* Legacy ambiguity is reported before the next request. */ }
+      }
+    }
+    this.profileStore.setActive(name);
     const active = this.profileStore.active();
     this.runtime.reload(profileOverrides(active));
+    const target = this.runtime.sessionStatus(connection.activeSessionKey);
+    if (target && active) {
+      await this.runtime.setSessionModel?.(connection.activeSessionKey, active.model, active.name);
+      target.metadata.provider_profile = active.name;
+    }
     await this.emitProviderInit(connection);
     this.emitSlash(connection, `Switched to provider profile \`${name}\`.`);
     return { ok: true };
@@ -8372,18 +8442,28 @@ export class DaemonServer {
     connection: DaemonTransportConnection,
     model: string,
     targetSessionKey = connection.activeSessionKey,
+    providerName?: string,
   ): Promise<JsonRpcPayload> {
     if (this.runtime.setSessionModel === undefined) {
       return { ok: false, error: "this runtime does not support session model selection" };
     }
-    const session = await this.runtime.setSessionModel(targetSessionKey, model);
+    const current = this.runtime.sessionStatus(targetSessionKey);
+    if (!current) return { ok: false, error: 'no active session' };
+    let profile: ProviderProfile | undefined;
+    try {
+      profile = providerName ? this.profileStore.get(providerName) : sessionProvider(this.profileStore, { metadata: {} }, model);
+      if (providerName && !profile) return { ok: false, error: 'Unknown provider profile: ' + providerName };
+      if (profile && !profileAcceptsModel(profile, model)) return { ok: false, error: 'Provider ' + profile.name + ' cannot serve ' + model };
+    } catch (error) { return { ok: false, error: errorMessage(error) }; }
+    const session = await this.runtime.setSessionModel(targetSessionKey, model, profile?.name);
     if (!session) {
       return { ok: false, error: "no active session" };
     }
+    if (profile) session.metadata.provider_profile = profile.name;
     // Keep the selected profile's default aligned for sessions opened later;
     // existing sessions retain their own pins.
     try {
-      this.profileStore?.updateActiveModel(session.model);
+      if (profile && this.profileStore.active()?.name === profile.name) this.profileStore.updateActiveModel(session.model);
     } catch {
       // Profile persistence is best-effort; the session pin already applies.
     }
@@ -8404,7 +8484,9 @@ export class DaemonServer {
     if (!active) {
       return { ok: false, error: "no active session" };
     }
-    const levels = await this.reasoningLevels(active.model);
+    const profileName = this.sessionProfileName(active);
+    const profile = profileName ? this.profileStore.get(profileName) : undefined;
+    const levels = await this.reasoningLevels(active.model, profile);
     const offered = selectableEfforts(levels);
     const resolved = resolveEffort(levels, requested)
       ?? clampEffort(levels, requested);
@@ -8425,7 +8507,6 @@ export class DaemonServer {
     if (!session) {
       return { ok: false, error: "no active session" };
     }
-    const profile = this.profileStore.active();
     if (profile) {
       this.profileStore.updateSampling(profile.name, {
         reasoning_effort: resolved,
@@ -10298,10 +10379,10 @@ function createCompactionClient(
     ...(profile?.api_key ? { api_key: profile.api_key } : {}),
     ...(profile?.base_url ? { base_url: profile.base_url } : {}),
     ...(profile?.provider ? { provider: profile.provider } : {}),
-    ...(typeof status.base_url === "string" && status.base_url
+    ...(!profile && typeof status.base_url === "string" && status.base_url
       ? { base_url: status.base_url }
       : {}),
-    ...(typeof status.provider === "string" && status.provider
+    ...(!profile && typeof status.provider === "string" && status.provider
       ? { provider: status.provider }
       : {}),
   });
@@ -10710,6 +10791,7 @@ function profileOverrides(
     temperature: DEFAULT_TEMPERATURE,
     top_k: DEFAULT_TOP_K,
     ...profile.sampling,
+    provider_profile: profile.name,
     model: profile.model,
     base_url: profile.base_url,
     api_key: profile.api_key,

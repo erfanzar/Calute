@@ -1,6 +1,7 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { ActivityChanges } from '../runtime/activityChanges.js'
 import { CronJob, JobStore, nextFireAt } from './jobs.js'
 import { DeliveryError } from './delivery.js'
 import { scheduleTokenState } from './tokenUsage.js'
@@ -38,6 +39,7 @@ const DEFAULT_ONESHOT_RETRY_BASE_MS = 60_000
 
 /** Polling Bun scheduler with deterministic `tick` support for tests and daemon control. */
 export class CronScheduler {
+  readonly activityChanges = new ActivityChanges()
   private readonly holdsLease: (() => boolean) | undefined
   private interval: ReturnType<typeof setInterval> | undefined
   private readonly jobTimeout: number
@@ -260,6 +262,8 @@ export class CronScheduler {
     } else if (job.maxRuns !== undefined || job.expiresAt !== undefined) throw new Error('Bounded schedules must be persisted before running')
     const controller = new AbortController()
     this.active.set(job.id, controller)
+    controller.signal.addEventListener('abort', () => this.activityChanges.notify(), { once: true })
+    this.activityChanges.notify()
     this.activeProjects.set(job.id, job.projectRoot ?? '')
     const result = Promise.resolve().then(() => {
       controller.signal.throwIfAborted()
@@ -267,6 +271,7 @@ export class CronScheduler {
     }).finally(() => {
       if (this.active.get(job.id) === controller) {
         this.active.delete(job.id)
+        this.activityChanges.notify()
         this.activeProjects.delete(job.id)
       }
       this.settling.delete(result)

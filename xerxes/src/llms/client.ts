@@ -1,6 +1,7 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { httpErrorBody } from './httpErrorBody.js'
 import { createHash } from 'node:crypto'
 import { chargeModelCall } from './callBudget.js'
 
@@ -364,7 +365,7 @@ export class OpenAiCompatibleClient implements LlmClient {
       const body = await response.text()
       throw openAiHttpError(
         this.providerName,
-        `completion request failed (${response.status}): ${body.slice(0, 4_096)}`,
+        `completion request failed (${response.status}): ${httpErrorBody(body)}`,
         response,
       )
     }
@@ -409,7 +410,7 @@ export class OpenAiCompatibleClient implements LlmClient {
       const body = await response.text()
       throw openAiHttpError(
         this.providerName,
-        `stream request failed (${response.status}): ${body.slice(0, 4_096)}`,
+        `stream request failed (${response.status}): ${httpErrorBody(body)}`,
         response,
       )
     }
@@ -538,7 +539,7 @@ export class ResponsesApiClient implements LlmClient {
       const body = await response.text()
       throw openAiHttpError(
         this.providerName,
-        'Responses API completion request failed (' + response.status + '): ' + body.slice(0, 4_096),
+        'Responses API completion request failed (' + response.status + '): ' + httpErrorBody(body),
         response,
       )
     }
@@ -561,7 +562,7 @@ export class ResponsesApiClient implements LlmClient {
       const body = await response.text()
       throw openAiHttpError(
         this.providerName,
-        'Responses API stream request failed (' + response.status + '): ' + body.slice(0, 4_096),
+        'Responses API stream request failed (' + response.status + '): ' + httpErrorBody(body),
         response,
       )
     }
@@ -706,7 +707,7 @@ export class ResponsesApiClient implements LlmClient {
       const body = await response.text()
       throw openAiHttpError(
         this.providerName,
-        'Responses API stream request failed (' + response.status + '): ' + body.slice(0, 4_096),
+        'Responses API stream request failed (' + response.status + '): ' + httpErrorBody(body),
         response,
       )
     }

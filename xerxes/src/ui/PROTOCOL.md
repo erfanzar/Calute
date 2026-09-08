@@ -1373,8 +1373,28 @@ Git output, duration and rendered rows are bounded; symlinks are not followed.
 `{ok:true,shells:number,watchers:number}`. It counts currently running terminal
 registry entries and monitors in the `watching` state, without reading output or
 consuming events. The gateway maps `session_id` to `session_key`. The composer
-refreshes every two seconds even while idle, discards late replies after a session
-switch, and opens terminals/monitors when their blue counts are clicked.
+now uses the additive `background.activity` RPC and `background_changed` event.
+The event carries no data: it invalidates the snapshot on shell, monitor or
+schedule lifecycle changes, without forwarding output bytes. Clients subscribe
+before reading and coalesce events received during requests. Disconnects clear
+stale counts; reconnect initialization refreshes the snapshot.
+
+`background.activity` returns `{ok:true,session_id,rows,omitted}`. Rows carry
+`id,kind,title,detail,state,startedAt,endedAt,action,scope`; schedules also carry
+`revision,nextRunAt,lastState,lastEndedAt`. Times are epoch milliseconds or null,
+except nextRunAt (ISO). Shells/watches belong to the session; schedules include
+its follow-ups and independent schedules in the same workspace. Other sessions'
+follow-ups are excluded. At most 200 rows are returned, active work first.
+`/activity` opens the unified panel; existing terminal.control, monitor.stop and
+schedule.pause/cancel RPCs perform explicit user actions. A stopped watcher does
+not kill its source shell. Finished/failed badges expire after thirty seconds;
+retained history remains inspectable in the panel and /runs.
+
+`set_model` accepts optional `provider_profile`, validated with the model before
+mutating the session. The picker sends one request instead of provider_select
+followed by set_model. Session metadata persists provider_profile (name only,
+never credentials). Runtime routing resolves that profile for each turn and
+inherited child. Ambiguous legacy routes fail with a request to use /model.
 
 `slash.exec` also exposes local extension management: `skills search <query>`,
 `skills browse`, `skills install <directory-or-SKILL.md>`, `plugins install

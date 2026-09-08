@@ -330,7 +330,7 @@ export async function executeCommand(
     throw new ValidationError('workdir', 'must refer to an existing workspace directory', workdir)
   }
   if (signal?.aborted) {
-    throw new ValidationError('exec_command', 'was cancelled before execution')
+    throw new DOMException('Command interrupted before execution.', 'AbortError')
   }
 
   if (optionalBoolean(inputs, 'run_in_background', false)) {
@@ -493,11 +493,20 @@ export async function executeCommand(
     // would drop the last line of every fast command.
     await settleDrains([stdoutDrain, stderrDrain], OUTPUT_SETTLE_MS)
 
-    if (signal?.aborted && !timedOut) {
-      throw new ValidationError('exec_command', 'was cancelled during execution')
-    }
     const stdoutResult = capOutput(stdoutBuffer.peek(maxOutputChars + 1).text, maxOutputChars)
     const stderrResult = capOutput(stderrBuffer.peek(maxOutputChars + 1).text, maxOutputChars)
+    if (signal?.aborted && !timedOut) {
+      // Cancellation is an execution outcome, not invalid model arguments.
+      // Preserve the evidence already emitted by the child for replay/inspection.
+      const reason = signal.reason instanceof Error ? signal.reason.message : typeof signal.reason === 'string' ? signal.reason : ''
+      throw new DOMException([
+        `Command interrupted before completion${reason ? ': ' + reason.slice(0, 300) : ''}.`,
+        'This is not a successful run; partial output follows.',
+        ...(stdoutResult.text ? ['stdout:\n' + stdoutResult.text] : []),
+        ...(stderrResult.text ? ['stderr:\n' + stderrResult.text] : []),
+        ...(stdoutResult.truncated || stderrResult.truncated ? ['Output truncated.'] : []),
+      ].join('\n'), 'AbortError')
+    }
     return {
       command: [command, ...args],
       cwd: await paths.relative(cwd),

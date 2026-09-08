@@ -1,6 +1,7 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { httpErrorBody } from './httpErrorBody.js'
 import { parseStreamingJson } from '@earendil-works/pi-ai'
 
 import {
@@ -318,7 +319,7 @@ export class AnthropicMessagesClient implements LlmClient {
     })
     if (!response.ok) {
       const body = await response.text()
-      throw anthropicHttpError(`completion request failed (${response.status}): ${body.slice(0, 4_096)}`, response)
+      throw anthropicHttpError(`completion request failed (${response.status}): ${httpErrorBody(body)}`, response)
     }
 
     const completion = parseEvent(await response.text())
@@ -401,7 +402,7 @@ export class AnthropicMessagesClient implements LlmClient {
     })
     if (!response.ok) {
       const body = await response.text()
-      throw anthropicHttpError(`stream request failed (${response.status}): ${body.slice(0, 4_096)}`, response)
+      throw anthropicHttpError(`stream request failed (${response.status}): ${httpErrorBody(body)}`, response)
     }
     if (!response.body) {
       throw new ProviderError('anthropic', 'stream request returned no response body')

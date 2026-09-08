@@ -39,7 +39,7 @@ const ranked = (input: string) => rankCompletionItems(slashCompletionsFromCatalo
 describe('slash catalog completions', () => {
   it.each([null, catalog])('keeps activity panels in the first menu page with a missing or older catalog', oldCatalog => {
     const rows = rankCompletionItems(tuiSlashCompletions('/', oldCatalog), '')
-    expect(rows.slice(0, 6).map(row => row.display)).toEqual(['agents', 'goal', 'loop', 'monitors', 'runs', 'schedules'])
+    expect(rows.slice(0, 7).map(row => row.display)).toEqual(['activity', 'agents', 'goal', 'loop', 'monitors', 'runs', 'schedules'])
   })
 
   it.each(['agents', 'goal', 'loop', 'monitors', 'runs', 'schedules', 'terminals', 'config', 'context', 'snapshots', 'workspaces', 'machine', 'custom-agents'])('finds the local %s command by prefix without daemon discovery', name => {

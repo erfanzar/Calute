@@ -76,6 +76,7 @@ export interface NativeSubagentHostOptions {
   readonly cwd: string
   /** Resolve the owning session's project root for a new or recovered child. */
   readonly resolveSourceWorkspace?: (sourceId: string) => string
+  readonly resolveSourceProvider?: (sourceId: string, model: string) => string | undefined
   /** Route identity captured for inherited children and checked on recovery. */
   readonly inheritedProviderRoute?: string
   /** Resolve the current route identity for an explicit provider profile. */
@@ -332,6 +333,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
   private validateProviderSelection: NativeSubagentHostOptions['validateProviderSelection']
   private validateInheritedSelection: NativeSubagentHostOptions['validateInheritedSelection']
   private resolveSourceWorkspace: NativeSubagentHostOptions['resolveSourceWorkspace']
+  private resolveSourceProvider: NativeSubagentHostOptions['resolveSourceProvider']
   private inheritedProviderRoute: NativeSubagentHostOptions['inheritedProviderRoute']
   private resolveProviderRoute: NativeSubagentHostOptions['resolveProviderRoute']
   private readonly hasWorkspaceWorktreeFactory: boolean
@@ -357,6 +359,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     this.restoreModelCallScopes = options.restoreModelCallScopes
     this.validateProviderSelection = options.validateProviderSelection
     this.validateInheritedSelection = options.validateInheritedSelection
+    this.resolveSourceProvider = options.resolveSourceProvider
     this.resolveSourceWorkspace = options.resolveSourceWorkspace
     this.inheritedProviderRoute = options.inheritedProviderRoute
     this.resolveProviderRoute = options.resolveProviderRoute
@@ -375,6 +378,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
     this.restoreModelCallScopes = options.restoreModelCallScopes
     this.validateProviderSelection = options.validateProviderSelection
     this.validateInheritedSelection = options.validateInheritedSelection
+    this.resolveSourceProvider = options.resolveSourceProvider
     this.resolveSourceWorkspace = options.resolveSourceWorkspace
     this.inheritedProviderRoute = options.inheritedProviderRoute
     this.resolveProviderRoute = options.resolveProviderRoute
@@ -435,7 +439,8 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
       ? this.fallbackPermissionMode
       : requestedPermissionMode
     const workspace = this.resolveWorkspace(options.sourceAgentId)
-    const providerRoute = this.captureProviderRoute(options.agent?.providerProfile, model)
+    const providerProfile = options.agent?.providerProfile ?? (options.sourceAgentId ? this.resolveSourceProvider?.(options.sourceAgentId, model) : undefined)
+    const providerRoute = this.captureProviderRoute(providerProfile, model)
     const task = await this.spawnResolved({
       ...(options.signal ? { signal: options.signal } : {}),
       definition,
@@ -443,7 +448,7 @@ class RichSubagentManagerPort implements SpawnedAgentManagerPort {
       ...(options.worktreeRef === undefined ? {} : { worktreeRef: options.worktreeRef }),
       ...(options.worktreeSource === undefined ? {} : { worktreeSource: options.worktreeSource }),
       input: prompt,
-      ...(options.agent?.providerProfile ? { providerProfile: options.agent.providerProfile } : {}),
+      ...(providerProfile ? { providerProfile } : {}),
       ...((options.agent?.reasoningEffort ?? definition.effort ?? this.fallbackEffort) ? { reasoningEffort: (options.agent?.reasoningEffort ?? definition.effort ?? this.fallbackEffort)! } : {}),
       model,
       workspace,

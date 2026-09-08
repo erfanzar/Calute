@@ -42,6 +42,12 @@ export const opsCommands: SlashCommand[] = [
     }
   },
   {
+    name: 'activity',
+    group: 'activity',
+    help: 'inspect background shells, watches and schedules; stop or pause work',
+    run: () => { patchOverlayState({ activity: true }) }
+  },
+  {
     name: 'monitors',
     group: 'activity',
     help: 'create and inspect terminal, file, WebSocket and webhook watches',

@@ -17,6 +17,7 @@
 // therefore keeps its own tail mirror, written to as output flows past and
 // never drained by anyone.
 
+import { ActivityChanges } from './activityChanges.js'
 import { terminalOutputPage, type TerminalOutputCursor, type TerminalOutputPage } from './terminalOutput.js'
 import type { RunHistory, RunRecord } from './runHistory.js'
 
@@ -138,6 +139,7 @@ interface TerminalEntry {
  * a dozen foreground commands.
  */
 export class TerminalRegistry {
+  readonly activityChanges = new ActivityChanges()
   private readonly entries = new Map<string, TerminalEntry>()
   private readonly historyLimit: number
   private readonly mirrorCapacity: number
@@ -187,6 +189,7 @@ export class TerminalRegistry {
     }
     this.entries.delete(id)
     this.entries.set(id, entry)
+    this.activityChanges.notify()
     this.trim()
     if (run) {
       try { this.runHistory?.checkpointTerminalOutput(ownerSessionId, run.id, '', 0) }
@@ -219,6 +222,7 @@ export class TerminalRegistry {
         entry.running = false
         entry.exitCode = normalizedExit(exitCode)
         entry.endedAt = this.now()
+        this.activityChanges.notify()
         this.observe(entry, { text: '', closed: true, exitCode: entry.exitCode })
         entry.observers.clear()
         if (checkpoint !== undefined) clearTimeout(checkpoint)
@@ -351,6 +355,7 @@ export class TerminalRegistry {
   /** Forget everything. Session teardown; does not signal anything. */
   clear(): void {
     this.entries.clear()
+    this.activityChanges.notify()
   }
 
   private liveControl(ownerSessionId: string, id: string): TerminalControl {

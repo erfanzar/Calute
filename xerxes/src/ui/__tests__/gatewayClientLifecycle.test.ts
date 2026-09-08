@@ -515,10 +515,26 @@ describe('GatewayClient session lifecycle', () => {
       { method: 'session.status', params: { session_key: 'live-session' } },
       { method: 'fetch_models', params: { profile_name: 'kimi-local' } }
     ])
-    expect(calls.slice(-2)).toEqual([
-      { method: 'provider_select', params: { name: 'openai-dev' } },
-      { method: 'set_model', params: { model: 'gpt-4.1', session_key: 'test:model-picker' } }
+    expect(calls.slice(-1)).toEqual([
+      { method: 'set_model', params: { model: 'gpt-4.1', provider_profile: 'openai-dev', session_key: 'test:model-picker' } }
     ])
+  })
+
+  it('does not insert a polluted GPT default into the Kimi picker', async () => {
+    const client = new GatewayClient({ projectDir: process.cwd(), sessionKey: 'test:model-picker-polluted' })
+    const port = client as unknown as { rawRequest: (method: string) => Promise<Record<string, unknown>> }
+    port.rawRequest = async method => method === 'provider_list' ? {
+      ok: true, profiles: [
+        { name: 'codex', provider: 'openai-codex', model: 'gpt-6-astra', active: false },
+        { name: 'kimi', provider: 'kimi-code', model: 'gpt-6-astra', active: true },
+      ],
+    } : { ok: true, session: { model: 'gpt-6-astra', profile_name: 'codex' } }
+    await expect(client.request('model.options', {})).resolves.toMatchObject({
+      model: 'gpt-6-astra', provider: 'codex', providers: [
+        { name: 'codex', is_current: true, configured_model: 'gpt-6-astra' },
+        { name: 'kimi', is_current: false, configured_model: '' },
+      ],
+    })
   })
 
   it('does not mark a stored profile current when the live runtime matches none', async () => {

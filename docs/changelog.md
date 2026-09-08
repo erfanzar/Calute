@@ -9,6 +9,15 @@ describe the earlier implementation and are not current setup instructions.
 
 ## Unreleased
 
+- Interrupted commands retain partial stdout/stderr and report cancellation with
+  its available reason, instead of mislabeling valid arguments as a validation error.
+- Added `/activity`: a unified panel for session shells/watches and workspace
+  schedules, with elapsed times, output/details, stop/pause controls and brief
+  completion/failure badges. Lifecycle events replace composer status polling.
+- Bound provider profiles to conversations and inherited subagents. Model picker
+  selection applies the provider and model together; GPT models cannot be routed
+  to Kimi subscriptions. HTML provider error pages now show concise messages.
+
 - Added live blue shell/watcher counts beside the composer settings, including
   while idle. Click a count to inspect background work; completed work clears.
 

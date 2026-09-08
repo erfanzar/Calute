@@ -1,6 +1,7 @@
 // Copyright 2026 The Xerxes-Agents Author @erfanzar (Erfan Zare Chavoshi).
 // Licensed under the Apache License, Version 2.0.
 
+import { ActivityChanges } from '../runtime/activityChanges.js'
 import { parseScheduleTime } from './time.js'
 import { cronTimezone, dayOffsets, wallInstants, wallTime, zoneFormatter } from './timezone.js'
 import { Database } from 'bun:sqlite'
@@ -186,6 +187,7 @@ export interface JobStoreOptions {
  * fail immediately on contention instead of blocking the daemon event loop.
  */
 export class JobStore {
+  readonly activityChanges = new ActivityChanges()
   readonly projectRoot: string | undefined
 
   constructor(readonly path: string, options: JobStoreOptions = {}) {
@@ -289,6 +291,7 @@ export class JobStore {
     try {
       writeFileSync(temporary, `${JSON.stringify(records, null, 2)}\n`, 'utf8')
       renameSync(temporary, this.path)
+      this.activityChanges.notify()
     } catch (error) {
       rmSync(temporary, { force: true })
       throw error

@@ -378,10 +378,40 @@ test.skipIf(process.platform === 'win32')('a caller cancel takes the whole proce
     } catch (error) {
       observedError = error
     }
-    expect(observedError).toBeInstanceOf(ValidationError)
+    expect(observedError).toBeInstanceOf(DOMException)
+    expect((observedError as Error).name).toBe('AbortError')
+    expect((observedError as Error).message).toContain('Command interrupted before completion')
 
     await Bun.sleep(300)
     expect(await logIsStill(logPath, 800)).toBe(true)
+  })
+})
+
+test('interrupted exec retains partial output through the tool registry without claiming invalid arguments', async () => {
+  await inTemporaryWorkspace(async (_root, paths) => {
+    const controller = new AbortController()
+    const terminals = new TerminalRegistry()
+    const registry = new ToolRegistry()
+    registerProcessTools(registry, paths, undefined, terminals)
+    let unobserve = () => {}
+    const unsubscribe = terminals.activityChanges.subscribe(() => {
+      const terminal = terminals.list('cancel-owner').find(entry => entry.running)
+      if (!terminal) return
+      unobserve = terminals.subscribe('cancel-owner', terminal.id, event => {
+        if (event.text.includes('partial-test-output')) controller.abort(new Error('Test interrupt'))
+      })
+    })
+    try {
+      const result = registry.execute(call('exec_command', {
+        cmd: process.execPath,
+        args: ['-e', 'console.log("partial-test-output"); await Bun.sleep(30000)'],
+        timeout_ms: 60000,
+      }), { sessionId: 'cancel-owner', metadata: {} }, controller.signal)
+      await expect(result).rejects.toThrow('Command interrupted before completion: Test interrupt')
+      await expect(result).rejects.toThrow('partial-test-output')
+      await expect(result).rejects.not.toThrow('Validation error')
+      expect(terminals.list('cancel-owner')[0]?.running).toBe(false)
+    } finally { unsubscribe(); unobserve() }
   })
 })
 
