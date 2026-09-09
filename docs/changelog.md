@@ -7,6 +7,21 @@ describe the earlier implementation and are not current setup instructions.
 
 ---
 
+## 0.4.5 — 2026-09-09
+
+- Explicit model selections now take precedence over intelligence tier hints when
+  spawning agents; working-tree isolation accepts an explicit HEAD reference.
+
+- Fixed saving custom agents whose names are derived from their filenames,
+  including agents created by project setup.
+- The custom-agent editor now lists and edits nested Markdown specialists and
+  preserves valid declared names that differ from their filenames.
+- Agent drafts without a discovery description now fail validation instead of
+  saving successfully and silently disappearing from the runtime catalog.
+- Background task creation now exposes, validates, and forwards worktree settings.
+- Cancelling SSH setup returns promptly even if SSH ignores termination.
+- A tunnel drop during renderer handoff no longer launches a TUI on a dead tunnel.
+
 ## 0.4.4 — 2026-09-09
 
 - Added bounded SSH reconnects, manual retry, connection progress, and recovery of

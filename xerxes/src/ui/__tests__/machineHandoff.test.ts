@@ -105,3 +105,27 @@ it('bounds retries and does not retry authentication failures or cancellation', 
   await expect(reconnectRemoteMachine(machine, { signal: controller.signal }, connect, cancelWait)).rejects.toThrow()
   expect(connect).toHaveBeenCalledOnce()
 })
+
+it('does not launch a local TUI if the tunnel drops while suspending the parent renderer', async () => {
+  const setup = child(), tunnel = child(), local = child()
+  const launch = vi.fn((binary: string, args: string[]) => {
+    if (args.includes('-L')) { writeFileSync(args[args.indexOf('-L') + 1]!.split(':')[0]!, ''); return tunnel }
+    if (binary === 'ssh') {
+      queueMicrotask(() => { setup.stdout.emit('data', 'XERXES_REMOTE_READY {"socketPath":"/remote/rpc.sock","projectDir":"/remote"}\n'); setup.emit('close', 0) })
+      return setup
+    }
+    queueMicrotask(() => local.emit('close', 0)); return local
+  })
+  await expect(connectRemoteMachine(machine, { spawnProcess: launch as unknown as typeof spawn, suspend: async action => { tunnel.emit('close', 255); await action() } })).rejects.toThrow('SSH tunnel closed')
+  expect(launch).toHaveBeenCalledTimes(2)
+})
+it('cancels remote setup promptly even if SSH ignores termination', async () => {
+  const setup = child()
+  setup.kill.mockImplementation(() => true)
+  const controller = new AbortController()
+  const work = connectRemoteMachine(machine, { signal: controller.signal, spawnProcess: (() => { queueMicrotask(() => controller.abort()); return setup }) as unknown as typeof spawn }).then(() => 'success', () => 'cancelled')
+  try {
+    const result = await Promise.race([work, new Promise<string>(resolve => setTimeout(() => resolve('hung'), 100))])
+    expect(result).toBe('cancelled')
+  } finally { setup.emit('close', null); await work }
+})

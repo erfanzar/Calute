@@ -250,6 +250,9 @@ export const CLAUDE_AGENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     message: stringSchema('Message for the subagent.'),
   }, ['target', 'message']),
   definition('TaskCreateTool', 'Create a background subagent task without waiting.', {
+    isolation: { type: 'string', enum: ['worktree'], description: 'Run in a separate Git checkout using the native worktree adapter.' },
+    worktree_ref: stringSchema('Git revision for worktree isolation. Defaults to HEAD.'),
+    worktree_source: { type: 'string', enum: ['working-tree'], description: 'Copy current tracked and untracked non-ignored files. Requires isolation=worktree; omit worktree_ref or use HEAD.' },
     model: stringSchema('Optional model override.'),
     provider_profile: stringSchema('Configured provider profile; requires explicit model.'),
     reasoning_effort: stringSchema('Reasoning effort offered for the explicit model.'),
@@ -512,6 +515,9 @@ export class ClaudeAgentTools {
     const name = optionalString(inputs, 'name')?.trim()
     const subagentType = optionalString(inputs, 'subagent_type')?.trim()
     const spec: ClaudeAgentSpec = {
+      isolation: parseIsolation(inputs.isolation),
+      worktreeRef: parseWorktreeRef(inputs.worktree_ref),
+      worktreeSource: parseWorktreeSource(inputs.worktree_source),
       providerProfile: optionalString(inputs, 'provider_profile'),
       reasoningEffort: optionalString(inputs, 'reasoning_effort'),
       intelligence: parseAgentIntelligence(inputs.intelligence),

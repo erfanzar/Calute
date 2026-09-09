@@ -59,16 +59,25 @@ export async function connectRemoteMachine(
     const output = await new Promise<string>((resolve, reject) => {
       const child = launch('ssh', [...ssh, '-T', '--', machine.target, command], { stdio: ['ignore', 'pipe', 'pipe'] })
       let stdout = '', stderr = ''
-      const abort = () => child.kill('SIGTERM')
-      const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error('Remote setup timed out; inspect ~/.xerxes/remote-runtime/setup.log.')) }, 300_000)
+      let killTimer: ReturnType<typeof setTimeout> | undefined
+      const stop = (error: Error) => {
+        cleanup()
+        child.kill('SIGTERM')
+        killTimer = setTimeout(() => child.kill('SIGKILL'), 1000)
+        killTimer.unref?.()
+        reject(error)
+      }
+      const abort = () => stop(new Error('Remote connection cancelled'))
+      const timer = setTimeout(() => stop(new Error('Remote setup timed out; inspect ~/.xerxes/remote-runtime/setup.log.')), 300_000)
+      const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', abort) }
       options.signal?.addEventListener('abort', abort, { once: true })
       if (options.signal?.aborted) abort()
       child.stdout?.on('data', chunk => { stdout = (stdout + String(chunk)).slice(-65536) })
       child.stderr?.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-8192) })
-      const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', abort) }
-      child.once('error', error => { cleanup(); reject(error) })
+      child.once('error', error => { cleanup(); clearTimeout(killTimer); reject(error) })
       child.once('close', code => {
         cleanup()
+        clearTimeout(killTimer)
         if (options.signal?.aborted) reject(new Error('Remote connection cancelled'))
         else if (code !== 0) reject(new Error(`Remote setup failed (${code}): ${stderr || stdout}`))
         else resolve(stdout)
@@ -105,6 +114,9 @@ export async function connectRemoteMachine(
       if (failure) throw failure
       options.onProgress?.("Opening remote workspace…")
       await (options.suspend ?? withTerminalSuspended)(() => new Promise<void>((resolve, reject) => {
+        // Suspending the parent can yield; the tunnel may die in that gap.
+        if (failure) { reject(failure); return }
+        if (options.signal?.aborted) { reject(new Error('Remote connection cancelled')); return }
         local = launch(process.execPath, [options.tuiEntry ?? process.argv[1]!], {
           stdio: 'inherit',
           env: { ...process.env, XERXES_REMOTE_SOCKET: socket, XERXES_PROJECT_DIR: remote.projectDir as string,

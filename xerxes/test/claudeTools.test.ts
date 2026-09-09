@@ -1428,6 +1428,8 @@ test('agent and swarm isolation is forwarded explicitly and unsupported runners 
   await expect(tools.execute('AgentTool', { title: 'Conflict', prompt: 'work', isolation: 'worktree', worktree_ref: 'other-branch', worktree_source: 'working-tree' }, { metadata: {} })).rejects.toThrow('no worktree_ref')
   await expect(tools.execute('SpawnAgents', { agents: [{ title: 'Valid', prompt: 'work' }, { title: 'Invalid', prompt: 'work', worktree_ref: 'HEAD' }] }, { metadata: {} })).rejects.toThrow('requires isolation=worktree')
   await expect(tools.execute('AgentTool', { title: 'Invalid', prompt: 'work', isolation: 'container' }, { metadata: {} })).rejects.toThrow('must be worktree')
+  await expect(tools.execute('TaskCreateTool', { title: 'Invalid', prompt: 'work', isolation: 'container' }, { metadata: {} })).rejects.toThrow('must be worktree')
+  await expect(tools.execute('TaskCreateTool', { title: 'Invalid', prompt: 'work', worktree_ref: 'release' }, { metadata: {} })).rejects.toThrow('requires isolation=worktree')
   await expect(tools.execute('SpawnAgents', { agents: [{ title: 'Invalid', prompt: 'work', isolation: true }] }, { metadata: {} })).rejects.toThrow('must be worktree')
   expect(seen).toHaveLength(3)
   let ran = false
@@ -1456,7 +1458,7 @@ test('agent tools forward explicit discovered provider and reasoning choices wit
     const redundant = { ...choice, intelligence: 'light', isolation: 'worktree', worktree_source: 'working-tree', worktree_ref: 'HEAD', wait: false }
     await tools.execute(name, name === 'SpawnAgents' ? { agents: [redundant], wait: false } : redundant, { metadata: {} })
     expect(requests.at(-1)).toMatchObject({ agent: { model: 'discovered', providerProfile: 'subscription', reasoningEffort: 'high' } })
-    if (name !== 'TaskCreateTool') expect(requests.at(-1)).toMatchObject({ worktreeSource: 'working-tree' })
+    expect(requests.at(-1)).toMatchObject({ worktreeSource: 'working-tree' })
     expect(requests.at(-1)).not.toHaveProperty('worktreeRef')
   }
   expect(requests).toHaveLength(6)
