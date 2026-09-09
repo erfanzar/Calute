@@ -3386,7 +3386,7 @@ test("daemon resumes only initialize resume IDs and lists saved sessions separat
       ok: true,
       daemon_protocol: 35,
       daemon_build_id: expect.any(String),
-      daemon_version: "0.4.3",
+      daemon_version: "0.4.4",
       session: { id: firstSessionId, key: firstSessionId, messages: 2 },
     });
     await client.next(eventFrame("init_done"));
@@ -7037,6 +7037,14 @@ test("an opted-in daemon snapshots the workspace before every turn and links it 
     await client.next(eventFrame("init_done"));
     await client.next(eventFrame("status_update"));
 
+    client.send({ jsonrpc: "2.0", id: 90, method: "slash", params: { command: "!echo after-shell > state.txt" } });
+    expect((await client.next(frame => frame.id === 90)).result).toMatchObject({ ok: true });
+    const shellSnapshot = snapshots.list()[0];
+    expect(shellSnapshot).toBeDefined();
+    expect(await Bun.file(join(workspace, "state.txt")).text()).toBe("after-shell\n");
+    await snapshots.restoreFile(shellSnapshot!.id, "state.txt");
+    expect(await Bun.file(join(workspace, "state.txt")).text()).toBe("before turn zero");
+
     client.send({
       jsonrpc: "2.0",
       id: 2,
@@ -7160,6 +7168,8 @@ test("a turn snapshot failure never fails the turn", async () => {
     });
     const end = await client.next(eventFrame("turn_end"));
     expect(end.params?.payload).toMatchObject({ cancelled: false });
+    const warning = await client.next(frame => frame.params?.type === "notification" && String(frame.params?.payload?.body ?? "").includes("Could not snapshot"));
+    expect(warning.params?.payload?.body).toContain("shadow repository unavailable");
   } finally {
     client.close();
     await server.stop();
@@ -10050,4 +10060,40 @@ test('model selection binds profile atomically without poisoning another profile
     expect(runtime.sessionStatus('picker')?.metadata.provider_profile).toBe('codex');
     expect(await call('session.status',{})).toMatchObject({session:{model:'gpt-6-astra',profile_name:'codex'}});
   } finally {client.close();await server.stop();await rm(directory,{recursive:true,force:true});}
+});
+
+test('project agent generation uses the selected model and returns a draft without writing', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-agent-generation-'));
+  const socketPath = join(directory, 'daemon.sock');
+  const runtime = new InMemoryDaemonRuntime(undefined, { model: 'selected-model', currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  let requestedModel = '';
+  let prompt = '';
+  let fail = false;
+  let closed = 0;
+  const server = new DaemonServer({ socketPath, runtime, projectDirectory: directory, projectAgentClientFactory: (model) => {
+    requestedModel = model;
+    return {
+      async *stream() {},
+      async complete(request: CompletionRequest) {
+        prompt = String(request.messages[0]?.content);
+        if (fail) throw new Error('Generation provider failed');
+        return { content: '---\nname: reviewer\ndescription: Review code\n---\nFind defects.', toolCalls: [] };
+      },
+      close() { closed++; },
+    } as unknown as LlmClient;
+  } });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'agentPreset.projectGenerate', params: { description: 'Find concurrency bugs' } });
+    expect((await client.next(frame => frame.id === 1)).result).toMatchObject({ ok: true, id: 'reviewer', revision: null });
+    expect(requestedModel).toBe('selected-model');
+    expect(prompt).toContain('Find concurrency bugs');
+    expect(existsSync(join(directory, '.xerxes/agents/reviewer.md'))).toBe(false);
+    expect(closed).toBe(1);
+    fail = true;
+    client.send({ jsonrpc: '2.0', id: 2, method: 'agentPreset.projectGenerate', params: { description: 'Review code' } });
+    expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: false, error: expect.stringContaining('Generation provider failed') });
+    expect(closed).toBe(2);
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
 });

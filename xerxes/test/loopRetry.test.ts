@@ -31,6 +31,44 @@ async function collect(events: AsyncIterable<StreamEvent>): Promise<StreamEvent[
   return result
 }
 
+test('proactive compaction runs again after tool results grow the same turn', async () => {
+  const state = createAgentState()
+  state.messages.push({ role: 'assistant', content: 'large initial history' })
+  let requests = 0
+  let reductions = 0
+  const events = await collect(runTurn({ model: 'gpt-test', state, userMessage: 'continue', tools: [READ_FILE], permissionMode: 'accept-all' }, {
+    contextCompactionDue: messages => messages.some(message => String(message.content).includes('large')),
+    reduceContext: async messages => {
+      reductions++
+      return { messages: messages.map(message => ({ ...message, content: String(message.content).replaceAll('large', 'small') })), tokensFreed: 100 }
+    },
+    llm: { async *stream(request) {
+      expect(request.messages.some(message => String(message.content).includes('large'))).toBe(false)
+      requests++
+      if (requests < 3) yield { toolCalls: [{ id: `read-${requests}`, type: 'function', function: { name: 'ReadFile', arguments: { path: 'file' } } }] }
+      else yield { content: 'done' }
+    } },
+    toolExecutor: { execute: async () => 'large tool output' },
+  }))
+  expect(reductions).toBe(3)
+  expect(requests).toBe(3)
+  expect(events.filter(event => event.type === 'turn_done')).toHaveLength(1)
+})
+
+test('failed proactive compaction prevents an oversized provider call and preserves history', async () => {
+  const state = createAgentState()
+  let requests = 0
+  const events = await collect(runTurn({ model: 'gpt-test', state, userMessage: 'important request' }, {
+    contextCompactionDue: () => true,
+    reduceContext: async () => { throw new Error('summary service unavailable') },
+    llm: { async *stream() { requests++; yield { content: 'must not run' } } },
+  }))
+  expect(requests).toBe(0)
+  expect(state.messages[0]?.content).toBe('important request')
+  expect(events.some(event => event.type === 'provider_retry' && event.error.includes('summary service unavailable'))).toBe(true)
+  expect(events.filter(event => event.type === 'turn_done')).toHaveLength(1)
+})
+
 test('tool calls emitted across separate deltas are assembled without duplicating cumulative batches', async () => {
   class SplitToolCallClient implements LlmClient {
     calls = 0

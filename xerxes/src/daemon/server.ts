@@ -35,6 +35,7 @@ import {
 } from "../agents/definitions.js";
 import { persistedSubagentSnapshotValues } from "../agents/subagentPersistence.js";
 import { listProjectAgents, readProjectAgent, writeProjectAgent } from "../agents/projectEditor.js";
+import { generateProjectAgent } from "../agents/projectGenerator.js";
 import { AgentPresetRoster, type AgentPresetEntry } from "../agents/presets.js";
 import { CodexSession, fetchCodexModelCatalog } from "../auth/codexAuth.js";
 import { profileQuota } from '../auth/profileUsage.js';
@@ -148,6 +149,7 @@ import {
 } from "../llms/samplingDefaults.js";
 import {
   closeLlmClient,
+  completeLlm,
   createLlmClient,
   requireConfiguredModel,
   type LlmClient,
@@ -350,6 +352,8 @@ const CONCURRENT_DISPATCH_METHODS = new Set([
   "forge.inspect",
   "forge.list",
   "provider_models",
+  "runtime.status",
+  "schedule.list",
 ]);
 
 /**
@@ -694,6 +698,8 @@ export interface DaemonServerOptions {
   readonly autoTitle?: boolean;
   /** Test seam for title generation; production uses the real client factory. */
   readonly titleClientFactory?: TitleClientFactory;
+  /** Host-injected provider port for authoring unsaved project agents. */
+  readonly projectAgentClientFactory?: (model: string, profile: ProviderProfile | undefined) => LlmClient;
   /** Browser state shared with native operator tools; `/browser` never invents a browser backend. */
   readonly browserManager?: BrowserManager;
   /**
@@ -860,6 +866,7 @@ export class DaemonServer {
   private readonly autoCompactThreshold: number;
   private readonly autoTitle: boolean;
   private readonly titleClientFactory: TitleClientFactory | undefined;
+  private readonly projectAgentClientFactory: DaemonServerOptions['projectAgentClientFactory'];
   private readonly browserManager: BrowserManager;
   private readonly channelManager: ChannelManager | undefined;
   private readonly channelWebhookServer: ChannelWebhookServer | undefined;
@@ -1001,6 +1008,7 @@ export class DaemonServer {
     );
     this.autoTitle = options.autoTitle ?? true;
     this.titleClientFactory = options.titleClientFactory;
+    this.projectAgentClientFactory = options.projectAgentClientFactory;
     this.channelManager = options.channelManager;
     this.monitorWebhookServer = options.monitorWebhookServer;
     this.channelWebhookServer =
@@ -1240,12 +1248,12 @@ export class DaemonServer {
   /**
    * Capture the workspace as it stands before a turn runs.
    *
-   * Fire-and-forget with the rejection swallowed: a snapshot is a safety net,
-   * and a net that can fail the turn it protects is worse than no net. The
+   * Await capture before work can change the files. Failure is visible but
+   * does not prevent the requested work from running. The
    * record carries the session id and the index of the turn it precedes, which
    * is what makes "take me back to before turn 7" answerable at all.
    */
-  private captureTurnSnapshot(sessionKey: string): void {
+  private async captureTurnSnapshot(sessionKey: string, owner?: DaemonTransportConnection): Promise<void> {
     if (!this.autoSnapshotTurns) {
       return;
     }
@@ -1256,13 +1264,16 @@ export class DaemonServer {
     const { cwd, id, turnCount } = session;
     // The factory itself can throw, and it runs on the submit path: without
     // this the turn would fail before it ever reached the runtime.
-    void (async () =>
-      this.snapshotManagerFactory(cwd).snapshot(`turn-${turnCount}`, {
+    try {
+      await this.snapshotManagerFactory(cwd).snapshot(`turn-${turnCount}`, {
         sessionId: id,
         turnIndex: turnCount,
-      }))().catch((error: unknown) => {
-      console.warn(`Could not snapshot the workspace before a turn: ${errorMessage(error)}`);
-    });
+      });
+    } catch (error) {
+      const message = `Could not snapshot ${cwd} before this work: ${errorMessage(error)}`;
+      console.warn(message);
+      if (owner) this.emitSlash(owner, message, "warning");
+    }
   }
 
   /**
@@ -3488,7 +3499,9 @@ export class DaemonServer {
 
     const SHELL_TIMEOUT_MS = 120_000;
     const SHELL_OUTPUT_CAP = 30_000;
-    const cwd = this.projectDirectory ?? process.cwd();
+    const session = this.runtime.sessionStatus(connection.activeSessionKey);
+    const cwd = session?.cwd ?? this.projectDirectory ?? process.cwd();
+    if (session) await this.captureTurnSnapshot(session.sessionKey, connection);
     const shell = process.platform === "win32" ? "cmd.exe" : "/bin/sh";
     const shellArgs = process.platform === "win32" ? ["/d", "/s", "/c", shellCommand] : ["-c", shellCommand];
 
@@ -3649,6 +3662,22 @@ export class DaemonServer {
     try {
       if (method === "agentPreset.projectList") return { ok: true, agents: listProjectAgents(cwd) };
       if (method === "agentPreset.projectRead") return { ok: true, ...readProjectAgent(cwd, id) };
+      if (method === "agentPreset.projectGenerate") {
+        if (typeof params.description !== "string") throw new Error("description must be a string");
+        const model = session?.model || optionalString(this.runtime.status().model);
+        if (!model) throw new Error("Select a model before generating an agent.");
+        const generated = await generateProjectAgent(params.description, async (prompt) => {
+          const profileName = session ? this.sessionProfileName(session) : null;
+          const profile = profileName ? this.profileStore.get(profileName) : undefined;
+          if (profileName && !profile) throw new Error(`Provider profile ${profileName} is unavailable. Select a provider before generating.`);
+          const client = this.projectAgentClientFactory ? this.projectAgentClientFactory(model, profile) : createCompactionClient(model, profile, this.runtime.status());
+          try {
+            const result = await completeLlm(client, { model, messages: [{ role: "user", content: prompt }], maxTokens: 4096 }, this.sessionSignal(key), { timeoutMs: 90_000 });
+            return result.content;
+          } finally { await closeLlmClient(client); }
+        });
+        return { ok: true, ...generated };
+      }
       if (method === "agentPreset.projectWrite") {
         if (params.revision !== null && typeof params.revision !== "string") throw new Error("revision must be a string or null for a new agent");
         if (typeof params.content !== "string") throw new Error("content must be a string");
@@ -6291,6 +6320,7 @@ export class DaemonServer {
         messages: session.messages,
         model,
         reason,
+        maxContextTokens: this.promptBudget(model) || 64_000,
       });
       signal?.throwIfAborted();
       if (!outcome.compacted) {
@@ -6462,10 +6492,7 @@ export class DaemonServer {
     }
     const failures = this.autoCompactFailures.get(sessionKey) ?? 0;
     if (failures >= MAX_AUTO_COMPACT_FAILURES) {
-      // Silent from here on: the actionable line was emitted on the attempt
-      // that reached the limit, and repeating it every turn is the same noise
-      // the retry loop was.
-      return Promise.resolve();
+      throw new Error("Automatic compaction failed repeatedly. History is preserved; run /compact before continuing.");
     }
     if (owner) {
       this.emitSlash(
@@ -6492,6 +6519,10 @@ export class DaemonServer {
       signal?.throwIfAborted();
       this.recordAutoCompactFailure(sessionKey, owner, errorMessage(error));
     }
+    if (sessionContextTokens(session, model) >= due) {
+      await this.runtime.flushSessions();
+      throw new Error("Context remains above the automatic compaction threshold. History is preserved; run /compact to retry.");
+    }
   }
 
   private recordAutoCompactFailure(
@@ -6501,6 +6532,8 @@ export class DaemonServer {
   ): void {
     const failures = (this.autoCompactFailures.get(sessionKey) ?? 0) + 1;
     this.autoCompactFailures.set(sessionKey, failures);
+    const session = this.runtime.sessionStatus(sessionKey);
+    if (session) session.metadata.last_compaction_failure = { reason, failures, at: new Date().toISOString() };
     if (!owner) {
       return;
     }
@@ -6510,7 +6543,7 @@ export class DaemonServer {
     }
     this.emitSlash(
       owner,
-      `Auto-compaction failed ${failures} times in a row (${reason}) and is now off for this session. `
+      `Auto-compaction failed ${failures} times in a row (${reason}); further turns are paused. `
         + "Run `/compact` to see the error, or `/new` to start a fresh session.",
       "error",
     );
@@ -6520,6 +6553,8 @@ export class DaemonServer {
   private clearAutoCompactFailures(sessionKey: string): void {
     this.autoCompactFailures.delete(sessionKey);
     this.autoCompactDisabledWarned.delete(sessionKey);
+    const session = this.runtime.sessionStatus(sessionKey);
+    if (session) delete session.metadata.last_compaction_failure;
   }
 
   /**
@@ -9134,7 +9169,6 @@ export class DaemonServer {
     this.seedProvisionalTitle(sessionKey, options.displayText ?? text);
     // Before compaction, so the capture reflects the tree the user is looking
     // at rather than one an auto-compaction turn may already have edited.
-    this.captureTurnSnapshot(sessionKey);
     let goalTimeGuard: GoalTimeGuard | undefined;
     let goalTokenBudget: GoalTokenBudget | undefined;
     let beganTurn = false;
@@ -9143,6 +9177,8 @@ export class DaemonServer {
       // Reserve cancellation ownership synchronously, then persist the goal
       // claim before compaction or provider work can begin.
       await beforeLaunch?.();
+      options.signal?.throwIfAborted();
+      await this.captureTurnSnapshot(sessionKey, owner);
       options.signal?.throwIfAborted();
       if (!owner || this.turnOwners.get(sessionKey) === owner) {
         await this.autoCompactIfDue(sessionKey, owner, options.signal);
@@ -9220,8 +9256,8 @@ export class DaemonServer {
         await (goalTokenBudget ? withModelCallBudget(goalTokenBudget, execute) : execute());
       }
       catch (error) {
-        if ((goalTimeGuard?.signal.aborted || goalTokenBudget?.tokenFailure) && !beganTurn) {
-          emit({ type: "turn_end", payload: { cancelled: true, unstarted: true,
+        if (!beganTurn) {
+          emit({ type: "turn_end", payload: { cancelled: options.signal?.aborted === true || Boolean(goalTokenBudget?.tokenFailure), unstarted: true,
             session_id: this.runtime.sessionStatus(sessionKey)?.id ?? sessionKey } });
         }
         throw error;

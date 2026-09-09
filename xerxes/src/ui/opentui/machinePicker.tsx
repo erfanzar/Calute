@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { TextareaRenderable } from '@opentui/core'
 
 import { useGateway } from '../app/gatewayContext.js'
-import { connectRemoteMachine, parseRemoteMachine, type RemoteMachine } from '../lib/machineHandoff.js'
+import { connectRemoteMachine, reconnectRemoteMachine, parseRemoteMachine, type RemoteMachine } from '../lib/machineHandoff.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
 import type { Theme } from '../theme.js'
 import { windowItems } from './overlayLayout.js'
@@ -34,6 +34,7 @@ export function MachinePicker({ t, onCancel, connect = connectRemoteMachine }: M
   const [browser, setBrowser] = useState<'hosts' | 'folders' | null>(null)
   const input = useRef<TextareaRenderable | null>(null)
   const active = useRef(true)
+  const sessions = useRef(new Map<string, string>())
   const controller = useRef<AbortController | null>(null)
 
   useEffect(() => {
@@ -61,10 +62,12 @@ export function MachinePicker({ t, onCancel, connect = connectRemoteMachine }: M
       if (!active.current || cancellation.signal.aborted) return
       const result = asRpcResult(raw)
       if (!result?.ok) throw new Error(result?.error ?? 'Could not connect to machine')
-      await connect(parseRemoteMachine(result.machine), { signal: cancellation.signal })
+      const machine = parseRemoteMachine(result.machine)
+      const key = JSON.stringify([machine.target, machine.workspacePath])
+      await reconnectRemoteMachine(machine, { signal: cancellation.signal, resumeSessionId: sessions.current.get(key), onSessionId: id => sessions.current.set(key, id), onProgress: message => { if (active.current) setNotice(message) } }, connect)
       if (active.current) setNotice('Remote session closed. You are back in your local workspace.')
     } catch (cause) {
-      if (active.current) setError(rpcErrorMessage(cause))
+      if (active.current) { setNotice(''); setError(rpcErrorMessage(cause)) }
     } finally {
       controller.current = null
       if (active.current) setBusy(false)
@@ -98,7 +101,7 @@ export function MachinePicker({ t, onCancel, connect = connectRemoteMachine }: M
 
   useKeyboard(key => {
     if (browser) return
-    if (['escape', 'up', 'down', 'return', 'enter', 'tab'].includes(key.name) || (!editing && key.name === 'n')) {
+    if (['escape', 'up', 'down', 'return', 'enter', 'tab'].includes(key.name) || (!editing && ['n', 'r'].includes(key.name))) {
       key.preventDefault(); key.stopPropagation()
     }
     if (key.name === 'escape') {
@@ -123,6 +126,7 @@ export function MachinePicker({ t, onCancel, connect = connectRemoteMachine }: M
       return
     }
     if (key.name === 'n') { add(); return }
+    if (key.name === 'r') { void open(); return }
     if (key.name === 'up') setIndex(old => Math.max(0, old - 1))
     if (key.name === 'down') setIndex(old => Math.min(Math.max(0, machines.length - 1), old + 1))
     if (key.name === 'return' || key.name === 'enter') { if (!machines.length) add(); else void open() }
@@ -135,7 +139,7 @@ export function MachinePicker({ t, onCancel, connect = connectRemoteMachine }: M
   const examples = ['e.g. training-server', 'e.g. me@gpu-host or an SSH alias', 'e.g. /home/me/projects/my-app']
   if (browser) return <MachineBrowser t={t} target={browser === 'folders' ? draft[1] : undefined} initialPath={browser === 'folders' ? draft[2] : ''} onCancel={() => setBrowser(null)} onSelect={value => { setDraft(old => old.map((item, i) => i === (browser === 'hosts' ? 1 : 2) ? value : item)); setBrowser(null) }} />
   return (
-    <ModalShell height={height} width={width} panelHeight={Math.min(height, editing ? 26 : machines.length ? 16 + Math.min(visible, machines.length) * 3 : compact ? 18 : 26)} panelWidth={Math.min(88, Math.max(1, width - 4))} t={t} title={editing ? 'Add workspace' : 'Remote workspaces'} headerRight={<text flexShrink={0} fg={t.color.muted}>{editing ? 'SSH' : `${machines.length} saved`}</text>}>
+    <ModalShell height={height} width={width} panelHeight={Math.min(height, editing ? 26 : machines.length ? 19 + Math.min(visible, machines.length) * 3 : compact ? 18 : 26)} panelWidth={Math.min(88, Math.max(1, width - 4))} t={t} title={editing ? 'Add workspace' : 'Remote workspaces'} headerRight={<text flexShrink={0} fg={t.color.muted}>{editing ? 'SSH' : `${machines.length} saved`}</text>}>
       <box paddingLeft={2} paddingRight={2} flexDirection="column" flexGrow={1} minHeight={0}>
       <box border={['bottom']} borderColor={t.color.border} paddingBottom={compact ? 0 : 1} marginBottom={compact ? 0 : 1}><text flexShrink={0} fg={t.color.muted} truncate wrapMode="none">Your projects, on any machine.</text></box>
       {loading ? <InfoRow color={t.color.muted}>Loading saved machines…</InfoRow> : null}
@@ -154,9 +158,10 @@ export function MachinePicker({ t, onCancel, connect = connectRemoteMachine }: M
         <text flexShrink={0} fg={t.color.muted} truncate wrapMode="none">{`  ${machine.workspacePath}`}</text>
       </box>)}</box>}
       {error ? <text flexShrink={0} fg={t.color.error} wrapMode="word">{error}</text> : null}
+      {error && !editing && machines.length > 0 ? <box onMouseDown={() => void open()}><text flexShrink={0} fg={t.color.accent}><b>R Retry connection</b></text></box> : null}
       {notice ? <text flexShrink={0} fg={t.color.text} wrapMode="word">{notice}</text> : null}
       {!compact && !editing ? <box marginTop={1}><text flexShrink={0} fg={t.color.muted}>Local rendering · remote execution over SSH. Exit to return here.</text></box> : null}
-      <box border={['top']} borderColor={t.color.border} paddingTop={compact ? 0 : 1} marginTop={1} flexShrink={0}><text flexShrink={0} fg={t.color.muted} truncate wrapMode="none">{busy ? editing ? 'Saving…' : 'Connecting…' : editing ? 'Tab next · Enter save · Esc back' : machines.length ? '↑↓ select · Enter connect · N add · Esc close' : 'Enter add workspace · Esc close'}</text></box>
+      <box border={['top']} borderColor={t.color.border} paddingTop={compact ? 0 : 1} marginTop={1} flexShrink={0}><text flexShrink={0} fg={t.color.muted} truncate wrapMode="none">{busy ? editing ? 'Saving…' : 'Connecting… · Esc cancel' : editing ? 'Tab next · Enter save · Esc back' : machines.length ? '↑↓ select · Enter connect · R retry · N add · Esc close' : 'Enter add workspace · Esc close'}</text></box>
       </box>
     </ModalShell>
   )

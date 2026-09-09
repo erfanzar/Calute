@@ -1415,3 +1415,9 @@ Bang-command adapter responses preserve native `{code,stdout,stderr}` even when
 submitting one `turn.submit` through `prompt.submit`, carrying command/output as
 context and retaining output in `display_text`. Session switches and explicit
 interrupts suppress late automatic follow-ups. Interpolation remains output-only.
+
+`agentPreset.projectGenerate {description}` returns `{ok,id,content,revision:null}`
+for an unsaved, validated project-agent Markdown draft. It uses the session's
+provider/model, accepts 1–12,000 characters, and bounds the provider call to 90
+seconds. Failure returns `{ok:false,error}`. It does not write files or modify the
+conversation. Review/edit and use `agentPreset.projectWrite` to save explicitly.

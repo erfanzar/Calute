@@ -30,6 +30,26 @@ class TextClient implements LlmClient {
   }
 }
 
+test('proactive compaction metadata survives turn synchronization and blocks oversized inference', async () => {
+  let session: DaemonSession
+  let reductions = 0
+  const runner = new AgentTurnRunner({
+    model: 'gpt-test', llm: new TextClient(), contextLimit: 100_000, maxTokens: 1000,
+    reduceContext: async messages => {
+      reductions++
+      session.metadata.last_compaction = { reason: 'mid-turn-auto-compact', tokens_after: 10 }
+      return { messages: messages.slice(-1), tokensFreed: 150_000 }
+    },
+  })
+  const runtime = new InMemoryDaemonRuntime(runner)
+  session = await runtime.openSession('compaction-metadata')
+  session.messages = [{ role: 'user', content: 'historical output '.repeat(50_000) }]
+  await runtime.submitTurn(session.sessionKey, 'continue', () => {})
+  expect(reductions).toBe(1)
+  expect(session.metadata.last_compaction).toMatchObject({ reason: 'mid-turn-auto-compact' })
+  expect(session.messages.some(message => String(message.content).includes('historical output'))).toBe(false)
+})
+
 test('goal evidence resolves a real completed tool call before the next provider inference', async () => {
   const root = await mkdtemp(join(tmpdir(), 'xerxes-goal-evidence-'))
   try {

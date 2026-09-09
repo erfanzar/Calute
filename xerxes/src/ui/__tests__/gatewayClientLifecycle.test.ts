@@ -1163,3 +1163,11 @@ it('preserves structured machine payloads and typed failures through slash adapt
   expect(await client.request('slash.exec', { command: 'machine connect missing' })).toEqual({ ok: false, error: 'Unknown machine', output: 'error: Unknown machine' })
   expect(wire).toHaveBeenCalledWith('slash', { command: '/machine connect compute' })
 })
+
+it('allows bounded multi-request compaction recovery beyond the ordinary RPC deadline', async () => {
+  const client = new GatewayClient({ projectDir: process.cwd(), sessionKey: 'test:compact' })
+  const wire = vi.fn(async () => ({ ok: true, compacted: true }))
+  ;(client as unknown as { rawRequest: typeof wire }).rawRequest = wire
+  await client.request('slash.exec', { command: 'compact' })
+  expect(wire).toHaveBeenCalledWith('slash', { command: '/compact' }, 1_800_000)
+})

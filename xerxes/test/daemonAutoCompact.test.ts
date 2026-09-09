@@ -889,7 +889,6 @@ async function withCompactionDaemon(
           params: { text: "hello" },
         });
         await client.next((frame) => frame.id === id);
-        await client.next(eventFrame("turn_begin"));
         await client.next(eventFrame("turn_end"));
       },
     });
@@ -1040,7 +1039,7 @@ test("auto-compaction stops after three consecutive failures instead of retrying
       await submit(3);
       await client.next(notificationWith("Auto-compaction skipped"));
       await submit(4);
-      const bail = await client.next(notificationWith("now off for this session"));
+      const bail = await client.next(notificationWith("further turns are paused"));
       expect(String(bail.params?.payload?.body ?? "")).toContain("/compact");
 
       // Three attempts, each exhausting the three summary budgets.
@@ -1048,6 +1047,8 @@ test("auto-compaction stops after three consecutive failures instead of retrying
       expect(callsBeforeBail).toBe(9);
       await submit(5);
       expect(requests).toHaveLength(callsBeforeBail);
+      expect(runtime.sessionStatus("looping")?.metadata.last_compaction_failure).toMatchObject({ failures: 3 });
+      expect(client.matching(eventFrame("turn_begin"))).toHaveLength(0);
     },
   );
 });

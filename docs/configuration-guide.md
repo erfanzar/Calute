@@ -1012,6 +1012,12 @@ and preview again; file-to-directory and directory-to-file transitions involving
 such obstructions are not automatically dismantled. This check does not prevent
 filesystem changes racing the subsequent restore or recover all I/O failures.
 
+The CLI captures workspace snapshots before model turns and `!` shell commands.
+Capture finishes before that work begins; a failed capture displays a warning
+without blocking the requested work. Ignored files and excluded secret files
+are not captured. Older sessions may have no automatic snapshots from before
+this behavior was enabled; a new snapshot cannot recover an earlier file state.
+
 `/snapshots` opens the snapshot timeline in the TUI. Entries show capture time and
 linked turn/session information where recorded. Use Up/Down to select, Tab to
 focus the scrollable diff, Page Up/Down to scroll, and Left/Right for long lines.
@@ -1800,3 +1806,46 @@ selected module. Install only modules you intend to run. Provider, channel and
 hook plugins require an embedding host and are rejected by this installer.
 These commands install local bundles/modules; they do not download marketplace
 packages.
+
+## Automatic context recovery
+
+Automatic compaction checks the estimated prompt size before a new turn and
+between model/tool rounds. It uses the routed model's context window, reserves
+output capacity, and honors `auto_compact_threshold` (default `0.8`; `0` disables
+automatic checks). Large transcripts are summarized in bounded chronological
+segments, then combined, instead of sending the entire oversized history to a
+single request. The original transcript is archived before replacement.
+
+If automatic compaction cannot make room, the next model request is paused.
+After three consecutive failures, use `/compact` to retry explicitly; the
+failure reason is retained in session metadata. Failed compaction does not
+discard the conversation. Manual recovery may take several provider requests;
+the TUI allows up to 30 minutes for `/compact`, while status and follow-up lists
+remain responsive.
+
+### Generate a custom agent in the TUI
+
+Open `/custom-agents` (or `/agents edit`), select a specialist to read its full delegation
+summary, and press **Enter** to edit its Markdown. The browser shows names in a
+separate list and stacks the detail panel on narrow terminals.
+
+Press **G** or click **G Generate**, describe the specialist, then press **Ctrl+G**.
+For example: “A JAX reviewer who checks array shapes and sharding and proposes
+focused regression tests.” Xerxes uses the current session's provider and model
+to generate a draft. Review or edit it, then press **Ctrl+S** to save it under
+`.xerxes/agents`. Existing files are never overwritten by a new draft. **N** still
+creates a blank agent; **Esc** discards an unsaved draft. Provider failures retain
+your description so you can retry.
+
+### Reconnecting remote workspaces
+
+In `/machine`, press **R** (or click **R Retry connection** after an error) to
+retry the selected workspace. Transient SSH drops retry automatically up to three
+times, after 2, 5 and 10 seconds. Progress shows setup, tunnel opening and retry
+status; **Esc** cancels. Authentication and host-key errors require fixing the
+connection and are not retried automatically.
+
+When the remote TUI recorded its active session, retries from this picker resume
+that session. Reconnecting does not resend your last prompt or restart its tools.
+A remote host reboot can still interrupt remote processes; session recovery does
+not guarantee that those processes survived.

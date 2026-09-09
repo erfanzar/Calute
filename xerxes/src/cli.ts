@@ -61,7 +61,9 @@ import {
   ToolRegistry,
   type ToolExecutionContext,
 } from "./executors/toolRegistry.js";
-import { createCompactionAgent } from "./agents/compactionAgent.js";
+import { compactMessagesIfNeeded, precompactArchivePath } from "./daemon/compactionRunner.js";
+import { recordCompaction } from "./context/compactionHistory.js";
+import { FILE_READS_METADATA_KEY, fileStateTracker } from "./tools/fileState.js";
 import { AuditEmitter } from "./audit/emitter.js";
 import { JSONLSinkCollector } from "./audit/collector.js";
 import { estimateContextTokens } from "./context/windowUsage.js";
@@ -1105,6 +1107,7 @@ async function runDaemon(
     onConnected: () => { if (!stopping) runtime.reload({}); },
   }).catch(error => console.error(`mcp: ${errorMessage(error)}`));
   const daemon = new DaemonServer({
+    autoSnapshotTurns: true,
     managedPlugins,
     agentSettingsDefaults: config.runtime.agent_intelligence,
     socketPath,
@@ -2080,7 +2083,8 @@ function daemonRuntime(
       // Compaction as a mid-turn recovery, not only a between-turn chore: the
       // loop can retry an overflowed round once, but only if something is
       // willing to shrink the history for it.
-      reduceContext: async (messages) => {
+      autoCompactThreshold: () => Number(runtime?.status().auto_compact_threshold ?? 0.8),
+      reduceContext: async (messages, signal) => {
         const active = getActiveSession<DaemonSession>();
         const model = active?.model || connection.model;
         const profile = active && (active.metadata.provider_profile || !(config.runtime.provider || config.runtime.base_url || config.runtime.api_key)) ? sessionProvider(profileStore, active, model) : undefined;
@@ -2096,16 +2100,32 @@ function daemonRuntime(
         }
         const priced = messages as unknown as Readonly<Record<string, unknown>>[];
         const before = estimateContextTokens(priced, { model });
-        const agent = createCompactionAgent({
+        const contextWindow = resolvedProfileContextLimit(profile ?? profileStore.active(), model);
+        const outcome = await compactMessagesIfNeeded({
           model,
-          completion: compactionCompletionPort(compactionLlm, model),
-          summaryMaxTokens: OVERFLOW_SUMMARY_MAX_TOKENS,
+          completion: compactionCompletionPort(compactionLlm, model, undefined, signal),
+          summaryBudgets: [OVERFLOW_SUMMARY_MAX_TOKENS],
+          messages: priced,
+          reason: "mid-turn-auto-compact",
+          ...(contextWindow ? { maxContextTokens: Math.max(4096, contextWindow - OVERFLOW_SUMMARY_MAX_TOKENS) } : {}),
+          ...(active ? { archivePath: precompactArchivePath(transcriptStore.pathFor(active.id)) } : {}),
         });
         // `ContextMessage` is deliberately `Record<string, unknown>` so
         // compaction survives provider-specific fields it does not model.
         // It only drops or replaces whole messages, so the typed shape the
         // loop handed in is preserved through the round trip.
-        const reduced = await agent.summarizeMessages(priced) as unknown as ChatMessage[];
+        if (!outcome.compacted) {
+          const reason = outcome.error ?? `Compaction ${outcome.reason}; history retained`;
+          if (active) active.metadata.last_compaction_failure = { reason, at: new Date().toISOString() };
+          throw new Error(reason);
+        }
+        signal?.throwIfAborted();
+        if (active) {
+          recordCompaction(active.metadata, outcome.stamp);
+          fileStateTracker.clearSession(active.id);
+          active.metadata[FILE_READS_METADATA_KEY] = [];
+        }
+        const reduced = outcome.messages as unknown as ChatMessage[];
         return {
           messages: reduced,
           tokensFreed: Math.max(

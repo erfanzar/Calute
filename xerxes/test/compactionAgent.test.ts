@@ -10,6 +10,35 @@ import {
   type CompactionCompletionRequest,
 } from '../src/agents/compactionAgent.js'
 import { DEFAULT_COMPACTION_SUMMARY_MAX_TOKENS } from '../src/context/index.js'
+import { SmartTokenCounter } from '../src/context/tokenCounter.js'
+
+test('oversized recovery bounds every request and preserves both ends of the source', async () => {
+  const requests: CompactionCompletionRequest[] = []
+  const counter = new SmartTokenCounter()
+  const agent = new CompactionAgent({ maxContextTokens: 4096, summaryMaxTokens: 256, completion: request => {
+    requests.push(request)
+    expect(counter.countTokens(request.prompt)).toBeLessThan(4096)
+    return 'Summary of this chronological segment with the unfinished work.'
+  } })
+  const original = 'FIRST-MARKER\n' + 'Long execution output and important work. '.repeat(4000) + '\nLAST-MARKER'
+  expect(await agent.summarizeContext(original)).toContain('unfinished work')
+  expect(requests.length).toBeGreaterThan(2)
+  expect(requests.some(request => request.prompt.includes('FIRST-MARKER'))).toBe(true)
+  expect(requests.some(request => request.prompt.includes('LAST-MARKER'))).toBe(true)
+})
+
+test('a failed chunk leaves the original transcript untouched', async () => {
+  let calls = 0
+  const messages = history()
+  messages.splice(2, 0, { role: 'assistant', content: 'important history '.repeat(20_000) })
+  const before = structuredClone(messages)
+  const agent = new CompactionAgent({ maxContextTokens: 4096, completion: () => {
+    if (++calls === 2) throw new Error('provider unavailable')
+    return 'summary'
+  } })
+  await expect(agent.summarizeMessages(messages)).rejects.toThrow('provider unavailable')
+  expect(messages).toEqual(before)
+})
 
 function history(): Array<Record<string, unknown>> {
   return [

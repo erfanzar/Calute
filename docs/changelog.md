@@ -7,7 +7,16 @@ describe the earlier implementation and are not current setup instructions.
 
 ---
 
-## Unreleased
+## 0.4.4 — 2026-09-09
+
+- Added bounded SSH reconnects, manual retry, connection progress, and recovery of
+  the last recorded remote session.
+- Redesigned the custom-agent browser and added model-generated, editable drafts.
+- Enabled automatic workspace snapshots before model turns and shell commands.
+- Fixed automatic compaction checks inside long-running tool loops, bounded
+  oversized compaction requests, and preserved compaction state across saves.
+- Kept status RPCs responsive during compaction and extended the manual
+  compaction timeout.
 
 - Interrupted commands retain partial stdout/stderr and report cancellation with
   its available reason, instead of mislabeling valid arguments as a validation error.

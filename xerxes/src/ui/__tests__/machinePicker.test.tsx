@@ -49,6 +49,10 @@ describe('machine picker', () => {
       expect(rpc).toHaveBeenCalledWith('slash.exec', { command: 'machine connect gpu' })
       expect(connect).toHaveBeenCalledOnce()
       expect(setup.captureCharFrame()).toContain('SSH unavailable')
+      expect(setup.captureCharFrame()).toContain('R Retry connection')
+      await act(async () => { setup.mockInput.pressKey('r'); await Bun.sleep(0) })
+      await setup.flush()
+      expect(connect).toHaveBeenCalledTimes(2)
       expect(onCancel).not.toHaveBeenCalled()
     } finally { act(() => setup.renderer.destroy()) }
   })

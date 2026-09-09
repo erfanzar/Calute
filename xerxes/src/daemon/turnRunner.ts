@@ -136,6 +136,7 @@ export interface AgentTurnRunnerOptions {
    * only report the failure and stop.
    */
   readonly reduceContext?: ContextReducer
+  readonly autoCompactThreshold?: () => number
   /**
    * The live tool registry, when the host owns one. Used only to resolve the
    * per-tool usage-policy sections that ride with the request's visible tool
@@ -530,7 +531,29 @@ export class AgentTurnRunner implements TurnRunner {
         ...(permissionBroker ? { permissionBroker } : {}),
         ...(this.options.policy ? { policy: this.options.policy } : {}),
         ...(toolExecutor ? { toolExecutor } : {}),
-        ...(this.options.reduceContext ? { reduceContext: this.options.reduceContext } : {}),
+        ...(this.options.reduceContext ? { reduceContext: async (messages, signal) => {
+          try {
+            return await this.options.reduceContext!(messages, signal)
+          } finally {
+            // The host records archive/failure metadata on the session. Keep it
+            // in the turn state too, which replaces session metadata on save.
+            for (const key of ['compaction_history', 'last_compaction', 'last_compaction_failure']) {
+              if (session.metadata[key] !== undefined) state.metadata[key] = session.metadata[key]
+            }
+          }
+        } } : {}),
+        contextCompactionDue: messages => {
+          const limit = routedProvider?.contextLimit ?? this.options.contextLimit
+          if (!limit || limit <= 0) return false
+          const threshold = this.options.autoCompactThreshold?.() ?? 0.8
+          if (threshold <= 0) return false
+          const output = this.options.maxTokens ?? routedProvider?.maxOutputTokens?.(attemptModel) ?? this.options.maxOutputTokens?.(attemptModel) ?? 8192
+          return estimateContextTokens(messages as unknown as Record<string, unknown>[], {
+            model: attemptModel,
+            ...(systemPrompt ? { systemPrompt } : {}),
+            ...(session.requestScaffold?.toolSchemas ? { toolSchemas: session.requestScaffold.toolSchemas } : {}),
+          }) >= Math.max(4096, limit - output) * Math.min(1, threshold)
+        },
         persistToolResult: this.toolResultPersister(session),
         // Declared per tool at registration. Absent, the loop stays strictly
         // sequential, so an undeclared tool can never be run concurrently by
@@ -1503,7 +1526,7 @@ function daemonEventFromStream(
       }
     case 'turn_done': {
       const contextTokens = estimateContextTokens(
-        state.messages.map(message => ({ role: message.role, content: message.content })),
+        state.messages as unknown as Record<string, unknown>[],
         {
           model: event.model,
           ...(session.requestScaffold?.systemPrompt ? { systemPrompt: session.requestScaffold.systemPrompt } : {}),

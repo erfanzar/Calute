@@ -47,3 +47,50 @@ it('creates through the daemon and cancels edits without saving', async () => {
     expect(screen.captureCharFrame()).toContain('No custom agents.')
   } finally { act(() => screen.renderer.destroy()) }
 })
+it('generates an editable draft without saving automatically', async () => {
+  const content = '---\nname: jax-reviewer\ndescription: Review JAX\n---\nCheck array shapes.'
+  const rpc = vi.fn(async (method: string) => method === 'agentPreset.projectList' ? { ok: true, agents: [] } : method === 'agentPreset.projectGenerate' ? { ok: true, id: 'jax-reviewer', content } : { ok: true })
+  const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><CustomAgentEditor t={DARK_THEME} onClose={() => {}} /></GatewayProvider>, { width: 110, height: 32 })
+  try {
+    await screen.flush()
+    act(() => screen.mockInput.pressKey('g'))
+    await screen.flush()
+    await act(async () => screen.mockInput.typeText('Review JAX shapes'))
+    act(() => screen.mockInput.pressKey('g', { ctrl: true }))
+    await screen.flush(); await screen.flush()
+    expect(rpc).toHaveBeenCalledWith('agentPreset.projectGenerate', { description: 'Review JAX shapes' })
+    expect(screen.captureCharFrame()).toContain('Check array shapes.')
+    expect(rpc.mock.calls.some(([method]) => method === 'agentPreset.projectWrite')).toBe(false)
+    act(() => screen.mockInput.pressKey('s', { ctrl: true }))
+    await screen.flush(); await screen.flush()
+    expect(rpc).toHaveBeenCalledWith('agentPreset.projectWrite', { id: '', content, revision: null })
+  } finally { act(() => screen.renderer.destroy()) }
+})
+it('keeps a generation description when the provider fails', async () => {
+  const rpc = vi.fn(async (method: string) => method === 'agentPreset.projectList' ? { ok: true, agents: [] } : { ok: false, error: 'Provider unavailable' })
+  const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><CustomAgentEditor t={DARK_THEME} onClose={() => {}} /></GatewayProvider>, { width: 100, height: 28 })
+  try {
+    await screen.flush()
+    act(() => screen.mockInput.pressKey('g'))
+    await screen.flush()
+    await act(async () => screen.mockInput.typeText('Check array shapes'))
+    act(() => screen.mockInput.pressKey('g', { ctrl: true }))
+    await screen.flush(); await screen.flush()
+    expect(screen.captureCharFrame()).toContain('Provider unavailable')
+    expect(screen.captureCharFrame()).toContain('Check array shapes')
+  } finally { act(() => screen.renderer.destroy()) }
+})
+it.each([[120, 36], [44, 22]])('shows selected descriptions separately from the agent names at %sx%s', async (width, height) => {
+  const agents = Array.from({ length: 15 }, (_, i) => ({ id: `specialist-${i}`, description: `Find concurrency defects in scheduler ${i}. Verify cancellation and provide focused regression tests.` }))
+  const rpc = vi.fn(async () => ({ ok: true, agents }))
+  const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><CustomAgentEditor t={DARK_THEME} onClose={() => {}} /></GatewayProvider>, { width, height })
+  try {
+    await screen.flush()
+    expect(screen.captureCharFrame()).toContain('WHEN TO DELEGATE')
+    expect(screen.captureCharFrame()).toContain('G Generate')
+    for (let i = 0; i < 14; i++) await act(async () => screen.mockInput.pressKey('ARROW_DOWN'))
+    await screen.flush()
+    expect(screen.captureCharFrame()).toContain('specialist-14')
+    expect(screen.captureCharFrame()).toContain('15/15')
+  } finally { act(() => screen.renderer.destroy()) }
+})

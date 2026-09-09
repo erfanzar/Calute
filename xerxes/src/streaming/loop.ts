@@ -330,6 +330,8 @@ export interface TurnDependencies {
    * report the overflow, because it has no compaction policy of its own.
    */
   readonly reduceContext?: ContextReducer
+  /** Host-owned threshold checked before every model round, including tool continuations. */
+  readonly contextCompactionDue?: (messages: readonly ChatMessage[]) => boolean
   readonly retryDelays?: readonly number[]
   /**
    * Ceiling for provider-suggested Retry-After waits (ms). Route-owned via the
@@ -475,6 +477,14 @@ export async function* runTurn(
             content: `[steer from user]\n${content}`,
           })
         }
+      }
+      if (dependencies.reduceContext && dependencies.contextCompactionDue?.(state.messages)) {
+        const reduced = await dependencies.reduceContext(state.messages, signal)
+        signal?.throwIfAborted()
+        if (reduced.tokensFreed <= 0 || dependencies.contextCompactionDue(reduced.messages)) {
+          throw new Error('Automatic compaction could not make room for the next model round; history retained. Run /compact to retry.')
+        }
+        state.messages.splice(0, state.messages.length, ...reduced.messages)
       }
       // Per-attempt accumulators sit at round scope so the surviving attempt is
       // readable after the retry loop, but every attempt starts from a clean

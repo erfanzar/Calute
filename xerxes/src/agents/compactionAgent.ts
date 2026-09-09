@@ -43,6 +43,8 @@ export type CompactionCompletionPort = (
 
 export interface CompactionAgentOptions {
   readonly completion: CompactionCompletionPort
+  /** Effective input budget, after reserving the model's output allowance. */
+  readonly maxContextTokens?: number
   readonly model?: string
   readonly summaryMaxTokens?: number
   readonly targetLength?: string
@@ -84,6 +86,7 @@ export class CompactionAgent {
   readonly targetLength: string
   private readonly completion: CompactionCompletionPort
   private readonly tokenCounter: SmartTokenCounter
+  private readonly maxContextTokens: number
 
   constructor(options: CompactionAgentOptions) {
     if (typeof options.completion !== 'function') throw new TypeError('completion must be a function')
@@ -98,6 +101,10 @@ export class CompactionAgent {
     // old 2_048-token ceiling truncated that mid-summary and stored the fragment.
     this.summaryMaxTokens = requestedMaxTokens
     this.tokenCounter = options.tokenCounter ?? new SmartTokenCounter({ model: this.model })
+    this.maxContextTokens = options.maxContextTokens ?? 64_000
+    if (!Number.isSafeInteger(this.maxContextTokens) || this.maxContextTokens < 4096) {
+      throw new RangeError('maxContextTokens must be an integer of at least 4096')
+    }
   }
 
   /** Summarize a text context while preserving caller-requested topics. */
@@ -113,6 +120,33 @@ export class CompactionAgent {
     preserveTopics: readonly string[] = [],
   ): Promise<CompactionTextResult> {
     if (!context || context.length < 200) return { ok: true, text: context }
+    const overhead = this.tokenCounter.countTokens(buildCompactionPromptFromText({ context: '', targetLength: this.targetLength, preserveTopics }))
+    const inputBudget = Math.max(512, Math.floor(this.maxContextTokens * 0.8) - overhead)
+    if (this.tokenCounter.countTokens(context) > inputBudget) {
+      const summaries: string[] = []
+      let remaining = context
+      while (remaining.length) {
+        let low = 1
+        let high = remaining.length
+        while (low < high) {
+          const middle = Math.ceil((low + high) / 2)
+          if (this.tokenCounter.countTokens(remaining.slice(0, middle)) <= inputBudget) low = middle
+          else high = middle - 1
+        }
+        // Do not split a UTF-16 surrogate pair between chunks.
+        if (low < remaining.length && /[\uD800-\uDBFF]/u.test(remaining[low - 1]!)) low -= 1
+        const part = await this.summarizeContextResult(remaining.slice(0, low), preserveTopics)
+        if (!part.ok) return part
+        if (!part.text.trim()) throw new Error('Compaction returned an empty chunk summary; original history retained')
+        summaries.push(part.text)
+        remaining = remaining.slice(low)
+      }
+      const combined = summaries.join('\n\n--- Next chronological segment ---\n\n')
+      if (this.tokenCounter.countTokens(combined) >= this.tokenCounter.countTokens(context)) {
+        throw new Error('Compaction did not reduce chunk summaries; original history retained')
+      }
+      return this.summarizeContextResult(combined, preserveTopics)
+    }
     const response = await this.completion({
       prompt: buildCompactionPromptFromText({ context, targetLength: this.targetLength, preserveTopics }),
       temperature: 0.3,
@@ -140,8 +174,8 @@ export class CompactionAgent {
     let compactable: readonly ContextMessage[] | undefined
     const provision = new CompactionProvisioner({
       model: this.model,
-      maxContextTokens: currentTokens,
-      targetTokens: Math.max(1, Math.floor(currentTokens / 2)),
+      maxContextTokens: Math.min(currentTokens, this.maxContextTokens),
+      targetTokens: Math.max(1, Math.floor(Math.min(currentTokens, this.maxContextTokens) / 2)),
       tokenCounter: this.tokenCounter,
       summaryAgent: candidate => {
         compactable = candidate

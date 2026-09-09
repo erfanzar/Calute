@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -42,6 +42,9 @@ export async function connectRemoteMachine(
     spawnProcess?: typeof spawn
     suspend?: (run: () => Promise<void>) => Promise<void>
     tuiEntry?: string
+    resumeSessionId?: string
+    onSessionId?: (id: string) => void
+    onProgress?: (message: string) => void
   } = {}
 ): Promise<void> {
   const command = remoteMachineCommand(machine)
@@ -50,7 +53,9 @@ export async function connectRemoteMachine(
   const ssh = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3']
   const directory = await mkdtemp(join(tmpdir(), 'xr-'))
   const socket = join(directory, 'rpc.sock')
+  const sessionFile = join(directory, "active-session")
   try {
+    options.onProgress?.("Checking remote runtime…")
     const output = await new Promise<string>((resolve, reject) => {
       const child = launch('ssh', [...ssh, '-T', '--', machine.target, command], { stdio: ['ignore', 'pipe', 'pipe'] })
       let stdout = '', stderr = ''
@@ -77,6 +82,7 @@ export async function connectRemoteMachine(
       typeof remote.projectDir !== 'string' || !remote.projectDir.startsWith('/') || /[\r\n\0]/u.test(remote.projectDir)) throw new Error('Invalid remote daemon address.')
     // Own this connection: multiplexed -N can exit successfully after handing
     // the forwarding to an unrelated persistent master, defeating cleanup.
+    options.onProgress?.("Opening SSH tunnel…")
     const tunnel = launch('ssh', [...ssh, '-S', 'none', '-o', 'ControlMaster=no', '-o', 'ForkAfterAuthentication=no', '-N', '-T', '-o', 'ExitOnForwardFailure=yes', '-L', `${socket}:${remote.socketPath}`, '--', machine.target], { stdio: ['ignore', 'ignore', 'pipe'] })
     let failure: Error | undefined
     let local: ReturnType<typeof spawn> | undefined
@@ -97,12 +103,13 @@ export async function connectRemoteMachine(
         await delay(25)
       }
       if (failure) throw failure
+      options.onProgress?.("Opening remote workspace…")
       await (options.suspend ?? withTerminalSuspended)(() => new Promise<void>((resolve, reject) => {
         local = launch(process.execPath, [options.tuiEntry ?? process.argv[1]!], {
           stdio: 'inherit',
           env: { ...process.env, XERXES_REMOTE_SOCKET: socket, XERXES_PROJECT_DIR: remote.projectDir as string,
             XERXES_REMOTE_LABEL: machine.alias,
-            XERXES_CWD: remote.projectDir as string, XERXES_TUI_RESUME: '', XERXES_TUI_QUERY: '', XERXES_TUI_ACTIVE_SESSION_FILE: '' }
+            XERXES_CWD: remote.projectDir as string, XERXES_TUI_RESUME: options.resumeSessionId ?? '', XERXES_TUI_QUERY: '', XERXES_TUI_ACTIVE_SESSION_FILE: sessionFile }
         })
         local.once('error', reject)
         local.once('close', code => failure ? reject(failure) : code === 0 ? resolve() : reject(new Error(`Local remote-workspace TUI exited (${code}).`)))
@@ -114,6 +121,40 @@ export async function connectRemoteMachine(
       tunnel.kill('SIGTERM')
     }
   } finally {
+    try {
+      const saved: unknown = JSON.parse(await readFile(sessionFile, 'utf8'))
+      if (saved && typeof saved === 'object' && 'session_id' in saved && typeof saved.session_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(saved.session_id)) options.onSessionId?.(saved.session_id)
+    } catch (error) {
+      if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) options.onProgress?.('Could not recover the session ID; use the remote session picker.')
+    }
     await rm(directory, { recursive: true, force: true })
+  }
+}
+
+/** Retry transport interruptions, never authentication or host-key failures. */
+export function retryableRemoteFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/permission denied|authentication|host key|host identification|cancelled|canceled/i.test(message)) return false
+  return /SSH tunnel closed|connection (?:reset|refused|closed)|timed out|network is unreachable|no route to host|broken pipe/i.test(message)
+}
+
+export async function reconnectRemoteMachine(
+  machine: RemoteMachine,
+  options: NonNullable<Parameters<typeof connectRemoteMachine>[1]> = {},
+  connect = connectRemoteMachine,
+  wait: (ms: number, signal?: AbortSignal) => Promise<void> = async (ms, signal) => { await delay(ms, undefined, { signal }) },
+): Promise<void> {
+  let resumeSessionId = options.resumeSessionId
+  for (let attempt = 0; ; attempt++) {
+    options.signal?.throwIfAborted()
+    try {
+      await connect(machine, { ...options, resumeSessionId, onSessionId: id => { resumeSessionId = id; options.onSessionId?.(id) } })
+      return
+    } catch (error) {
+      if (options.signal?.aborted || attempt >= 3 || !retryableRemoteFailure(error)) throw error
+      const seconds = [2, 5, 10][attempt]!
+      options.onProgress?.(`Connection interrupted. Retry ${attempt + 1}/3 in ${seconds}s · Esc cancel`)
+      await wait(seconds * 1000, options.signal)
+    }
   }
 }

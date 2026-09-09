@@ -15,6 +15,22 @@ function workspaceFixture(prefix: string): { directory: string; shadow: string; 
   return { directory, shadow: join(directory, 'shadow'), workspace }
 }
 
+test('snapshots exclude their own storage when it lives inside the workspace', async () => {
+  const { directory, workspace } = workspaceFixture('xerxes-nested-shadow-')
+  try {
+    const shadow = join(workspace, 'private-state')
+    const manager = new SnapshotManager(workspace, { shadowRoot: shadow })
+    writeFileSync(join(workspace, 'a.txt'), 'original')
+    const first = await manager.snapshot('first')
+    writeFileSync(join(shadow, 'must-not-capture.txt'), 'private state')
+    writeFileSync(join(workspace, 'a.txt'), 'changed')
+    await manager.snapshot('second')
+    await manager.rollback(first.id)
+    expect(readFileSync(join(shadow, 'must-not-capture.txt'), 'utf8')).toBe('private state')
+    expect(readFileSync(join(workspace, 'a.txt'), 'utf8')).toBe('original')
+  } finally { rmSync(directory, { recursive: true, force: true }) }
+})
+
 test('snapshot records carry the session and turn they precede', async () => {
   if (!Bun.which('git')) return
   const { directory, shadow, workspace } = workspaceFixture('xerxes-snapshot-link-')

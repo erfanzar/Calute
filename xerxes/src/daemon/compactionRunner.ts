@@ -280,6 +280,7 @@ export interface CompactionStamp {
 }
 
 export interface CompactMessagesRequest {
+  readonly maxContextTokens?: number;
   /**
    * Sidecar the pre-compaction transcript is appended to before the caller
    * swaps in the summary. Omitted only where no transcript path exists;
@@ -343,6 +344,7 @@ export async function compactMessagesIfNeeded(
         completion: request.completion,
         model: request.model,
         summaryMaxTokens,
+        ...(request.maxContextTokens === undefined ? {} : { maxContextTokens: request.maxContextTokens }),
       }).summarizeMessages(original);
     } catch (error) {
       lastError = error;

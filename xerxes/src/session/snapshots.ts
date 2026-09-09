@@ -551,7 +551,15 @@ export class SnapshotManager {
     const path = join(infoDirectory, 'exclude')
     const existing = existsSync(path) ? readFileSync(path, 'utf8') : ''
     const present = new Set(existing.split(/\r?\n/))
-    const missing = SHADOW_EXCLUDE_PATTERNS.filter(pattern => !present.has(pattern))
+    // The state home can live inside the workspace (notably when started
+    // from ~). Never snapshot credentials, transcripts, or the shadow repo
+    // itself just because their directory has a nonstandard name.
+    const statePatterns = [this.shadowRoot, xerxesHome()].flatMap(root => {
+      const path = relative(this.workspaceDirectory, root)
+      if (!path || path === '..' || path.startsWith(`..${sep}`) || isAbsolute(path)) return []
+      return ['/' + path.split(sep).join('/').replace(/[\\*?\[\]]/gu, '\\$&') + '/']
+    })
+    const missing = [...SHADOW_EXCLUDE_PATTERNS, ...statePatterns].filter(pattern => !present.has(pattern))
     if (missing.length === 0) return
     const separator = existing.length > 0 && !existing.endsWith('\n') ? '\n' : ''
     writeFileSync(path, `${existing}${separator}${missing.join('\n')}\n`, 'utf8')

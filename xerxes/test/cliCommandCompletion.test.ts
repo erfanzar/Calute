@@ -69,6 +69,8 @@ test('normal daemon wakes the owner after exec_command completion without a sepa
     expect(reactions).toBe(1)
     expect(evidence).toContain('completion-proof')
     expect(evidence).toContain('untrusted source data')
+    const snapshots = await rpc('snapshot.list')
+    expect(snapshots.result?.snapshots).toEqual(expect.arrayContaining([expect.objectContaining({ label: 'turn-0' })]))
     const inspected = await rpc('context.inspect', { section: 'instructions' })
     expect(inspected.result?.entries).toEqual(expect.arrayContaining([expect.objectContaining({ title: 'bootstrap' })]))
     await rpc('shutdown')

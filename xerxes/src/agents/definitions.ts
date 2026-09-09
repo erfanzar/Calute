@@ -244,6 +244,11 @@ const RECOGNIZED_MARKDOWN_FRONTMATTER_FIELDS: ReadonlySet<string> = new Set([
 /** Parse a Markdown definition with optional YAML frontmatter. */
 export function parseAgentMarkdown(path: string, source = 'user'): AgentDefinition {
   const content = readFileSync(path, 'utf8')
+  return parseAgentMarkdownContent(content, path, source)
+}
+
+/** Validate an unsaved editor draft using exactly the same rules as files. */
+export function parseAgentMarkdownContent(content: string, path: string, source = 'user'): AgentDefinition {
   const frontmatter = markdownFrontmatter(content)
   const fields = frontmatter ? yamlMap(parseYaml(frontmatter.fields, path), `${path} frontmatter`) : {}
   if (fields.name !== undefined && (typeof fields.name !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(fields.name))) {

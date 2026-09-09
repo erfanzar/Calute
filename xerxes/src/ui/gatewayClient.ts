@@ -1552,7 +1552,11 @@ export class GatewayClient extends EventEmitter {
   private async slashExec(params: Record<string, unknown>): Promise<RpcObject> {
     const raw = String(params.command ?? '').trim()
     const command = raw.startsWith('/') || raw.startsWith('!') || raw.startsWith('#') ? raw : `/${raw}`
-    const result = (await this.rawRequest('slash', { command })) as RpcObject
+    // Recovery can require several bounded summarization calls. Keep its RPC
+    // alive while read-only status polling continues on the same connection.
+    const result = (await (/^\/?compact(?:\s|$)/u.test(command.trim())
+      ? this.rawRequest('slash', { command }, 30 * 60_000)
+      : this.rawRequest('slash', { command }))) as RpcObject
     if (result.ok === false) {
       return { ...result, output: 'error: ' + String(result.error ?? 'command was rejected') }
     }
