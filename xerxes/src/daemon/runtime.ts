@@ -434,6 +434,8 @@ export interface InMemoryDaemonRuntimeOptions {
   readonly sessionDirectory?: string;
   /** Cancel resources owned exclusively by a session before it is evicted. */
   readonly onSessionEvict?: (sessionId: string) => unknown;
+  /** Exact worker IDs currently owned by this daemon, for restored panel state. */
+  readonly liveSubagentIds?: () => readonly string[];
   /**
    * Stop the delegated work a session started, because the user interrupted
    * its turn. Unlike eviction this is a pause, not a reclaim: implementations
@@ -1031,6 +1033,21 @@ export class InMemoryDaemonRuntime implements DaemonRuntime {
         : undefined;
       applySystemPromptAddendum(session, options.systemPromptAddendum);
       if (effectiveTranscript) {
+        const liveIds = this.options.liveSubagentIds?.();
+        const saved = session.metadata.xerxes_subagent_snapshots_v1;
+        if (liveIds && Array.isArray(saved)) {
+          const live = new Set(liveIds);
+          session.metadata.xerxes_subagent_snapshots_v1 = saved.map((value: unknown) => {
+            if (!value || typeof value !== "object"
+              || !("id" in value) || typeof value.id !== "string"
+              || !("status" in value) || typeof value.status !== "string"
+              || live.has(value.id) || !["running", "pending", "queued"].includes(value.status)) return value;
+            return {
+              ...value, status: "interrupted", queue_size: 0,
+              error: "The previous worker is no longer owned by this daemon. Retry the agent to continue.",
+            };
+          });
+        }
         // A goal reloaded from disk keeps saying what it is, but this process
         // has not been told to keep driving it unattended. Continuation is
         // re-armed by an explicit goal call, never by the act of reopening a

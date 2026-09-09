@@ -188,7 +188,7 @@ export class AcpAgentRunner {
         ...(this.options.policy ? { policy: this.options.policy } : {}),
         ...(executor ? { toolExecutor: executor } : {}),
       }, controller.signal))) {
-        if (event.type === 'permission_request') {
+        if (event.type === 'permission_request' || event.type === 'provider_wait') {
           continue
         }
         if (event.type === 'turn_done' && feedback && !controller.signal.aborted) {

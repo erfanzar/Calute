@@ -721,3 +721,19 @@ test.each([0, -1, Number.POSITIVE_INFINITY, Number.NaN])('cancellation remains r
     await pending
   }
 })
+
+test('provider wait is visible before a silent request and cleared on failure', async () => {
+  const release = Promise.withResolvers<void>()
+  const events: StreamEvent[] = []
+  const pending = (async () => {
+    for await (const event of runTurn({ model: 'test', state: createAgentState(), userMessage: 'hello' }, {
+      retryDelays: [],
+      llm: { async *stream() { await release.promise; throw new Error('invalid request'); yield { content: 'unreachable' } } },
+    })) events.push(event)
+  })()
+  await new Promise(resolve => setTimeout(resolve, 10))
+  expect(events.filter(event => event.type === 'provider_wait')).toEqual([{ type: 'provider_wait', active: true }])
+  release.resolve()
+  await pending
+  expect(events.filter(event => event.type === 'provider_wait')).toEqual([{ type: 'provider_wait', active: true }, { type: 'provider_wait', active: false }])
+})

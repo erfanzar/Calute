@@ -527,60 +527,70 @@ export async function* runTurn(
           roundFirstOutputAt = undefined
           roundFirstStreamTokenAt = undefined
           roundCompletedAt = 0
-          for await (const delta of watchProviderStream(
-            dependencies.llm.stream(
-              completionRequest(
-                request,
-                state.messages,
-                forceToolFreeSummary ? [] : request.tools,
-                outputTokenOverride,
+          yield { type: 'provider_wait', active: true }
+          let awaitingOutput = true
+          try {
+            for await (const delta of watchProviderStream(
+              dependencies.llm.stream(
+                completionRequest(
+                  request,
+                  state.messages,
+                  forceToolFreeSummary ? [] : request.tools,
+                  outputTokenOverride,
+                ),
+                attemptSignal.controller.signal,
               ),
-              attemptSignal.controller.signal,
-            ),
-            streamInactivityTimeoutMs,
-            attemptSignal,
-          )) {
-            const hasStreamToken = Boolean(delta.content || delta.thinking)
-            if ((roundFirstOutputAt === undefined && hasModelOutput(delta))
-              || (roundFirstStreamTokenAt === undefined && hasStreamToken)) {
-              const observedAt = now()
-              if (roundFirstOutputAt === undefined && hasModelOutput(delta)) roundFirstOutputAt = observedAt
-              if (roundFirstStreamTokenAt === undefined && hasStreamToken) roundFirstStreamTokenAt = observedAt
-            }
-            const parts = processDelta(delta, parser, textParts, thinkingParts)
-            for (const part of parts) {
-              // Live incremental emission: each deduped part is yielded the
-              // moment it arrives, so consumers render text while the provider
-              // is still streaming. 95c53d6 buffered whole rounds here, which
-              // silenced live output end to end; this restores the inline
-              // yield. The deduper still withholds exactly one thing — the
-              // not-yet-diverged replay prefix it must hold back — so retry
-              // replay suppression is unchanged.
-              for (const visible of textDeduper.push(part)) yield visible
-            }
-            if (delta.toolCalls) {
-              const merged = [...roundToolCalls]
-              for (const toolCall of delta.toolCalls) {
-                const existing = merged.findIndex(candidate => candidate.id === toolCall.id)
-                if (existing === -1) {
-                  merged.push(toolCall)
-                } else {
-                  merged[existing] = toolCall
-                }
+              streamInactivityTimeoutMs,
+              attemptSignal,
+            )) {
+              const hasStreamToken = Boolean(delta.content || delta.thinking)
+              if (awaitingOutput && hasModelOutput(delta)) {
+                awaitingOutput = false
+                yield { type: 'provider_wait', active: false }
               }
-              roundToolCalls = merged
+              if ((roundFirstOutputAt === undefined && hasModelOutput(delta))
+                || (roundFirstStreamTokenAt === undefined && hasStreamToken)) {
+                const observedAt = now()
+                if (roundFirstOutputAt === undefined && hasModelOutput(delta)) roundFirstOutputAt = observedAt
+                if (roundFirstStreamTokenAt === undefined && hasStreamToken) roundFirstStreamTokenAt = observedAt
+              }
+              const parts = processDelta(delta, parser, textParts, thinkingParts)
+              for (const part of parts) {
+                // Live incremental emission: each deduped part is yielded the
+                // moment it arrives, so consumers render text while the provider
+                // is still streaming. 95c53d6 buffered whole rounds here, which
+                // silenced live output end to end; this restores the inline
+                // yield. The deduper still withholds exactly one thing — the
+                // not-yet-diverged replay prefix it must hold back — so retry
+                // replay suppression is unchanged.
+                for (const visible of textDeduper.push(part)) yield visible
+              }
+              if (delta.toolCalls) {
+                const merged = [...roundToolCalls]
+                for (const toolCall of delta.toolCalls) {
+                  const existing = merged.findIndex(candidate => candidate.id === toolCall.id)
+                  if (existing === -1) {
+                    merged.push(toolCall)
+                  } else {
+                    merged[existing] = toolCall
+                  }
+                }
+                roundToolCalls = merged
+              }
+              if (delta.thinkingSignature) {
+                thinkingSignature = delta.thinkingSignature
+              }
+              if (delta.usage) {
+                lastUsage = mergeUsage(lastUsage, delta.usage)
+              }
+              // Every adapter normalizes its own truncation token onto 'length',
+              // so one assignment beside the usage merge is the whole detection.
+              if (delta.finishReason) {
+                finishReason = delta.finishReason
+              }
             }
-            if (delta.thinkingSignature) {
-              thinkingSignature = delta.thinkingSignature
-            }
-            if (delta.usage) {
-              lastUsage = mergeUsage(lastUsage, delta.usage)
-            }
-            // Every adapter normalizes its own truncation token onto 'length',
-            // so one assignment beside the usage merge is the whole detection.
-            if (delta.finishReason) {
-              finishReason = delta.finishReason
-            }
+          } finally {
+            if (awaitingOutput) yield { type: 'provider_wait', active: false }
           }
           for (const flushed of parser.process('')) {
             if (flushed.type === 'text') {

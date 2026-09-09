@@ -9,6 +9,10 @@ describe the earlier implementation and are not current setup instructions.
 
 ## Unreleased
 
+- Reconcile restored active-agent statuses with workers owned by this daemon.
+- Show provider response waits explicitly and avoid generic working verbs during silence.
+- Deliver compaction and retry progress before the first model output, and retain terminal errors from silent attempts.
+
 - Show the compaction spinner for automatic and mid-turn summaries, preserve
   lifecycle statuses through the TUI adapter, and clear the indicator on failure.
 

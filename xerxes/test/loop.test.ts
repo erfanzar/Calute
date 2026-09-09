@@ -276,7 +276,8 @@ test('agent loop pairs model tool calls with results and preserves thinking sepa
   // rather than jumping once at turn_done. Round text streams inline as the
   // provider emits it, so each round's deltas precede that round's usage_update.
   expect(events.map(event => event.type)).toEqual([
-    'text', 'thinking', 'text', 'usage_update', 'tool_start', 'tool_end', 'text', 'usage_update', 'turn_done',
+    'provider_wait', 'provider_wait', 'text', 'thinking', 'text', 'usage_update', 'tool_start', 'tool_end',
+    'provider_wait', 'provider_wait', 'text', 'usage_update', 'turn_done',
   ])
   expect(state.thinkingContent).toEqual(['private rationale', ''])
   expect(state.messages.map(message => message.role)).toEqual(['user', 'assistant', 'tool', 'assistant'])

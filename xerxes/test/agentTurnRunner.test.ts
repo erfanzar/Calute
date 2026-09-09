@@ -30,6 +30,31 @@ class TextClient implements LlmClient {
   }
 }
 
+test('silent provider waits are delivered live and terminal errors are not lost in pre-content buffering', async () => {
+  const release = Promise.withResolvers<void>()
+  const started = Promise.withResolvers<void>()
+  const runner = new AgentTurnRunner({ model: 'test-model', llm: {
+    async *stream(): AsyncGenerator<LlmDelta> {
+      started.resolve()
+      await release.promise
+      throw new Error('invalid request: test failure')
+    },
+  } })
+  const runtime = new InMemoryDaemonRuntime(runner)
+  const session = await runtime.openSession('silent-provider')
+  const events: DaemonEvent[] = []
+  const turn = runtime.submitTurn(session.sessionKey, 'continue', event => { events.push(event) })
+  try {
+    await started.promise
+    expect(events.some(event => event.type === 'status_update' && event.payload.kind === 'provider_wait')).toBe(true)
+  } finally {
+    release.resolve()
+    await turn
+  }
+  expect(events.some(event => event.type === 'notification' && String(event.payload.message).includes('test failure'))).toBe(true)
+  expect(events.some(event => event.type === 'status_update' && event.payload.kind === 'provider_ready')).toBe(true)
+})
+
 test('proactive compaction metadata survives turn synchronization and blocks oversized inference', async () => {
   let session: DaemonSession
   let reductions = 0
@@ -37,6 +62,7 @@ test('proactive compaction metadata survives turn synchronization and blocks ove
     model: 'gpt-test', llm: new TextClient(), contextLimit: 100_000, maxTokens: 1000,
     reduceContext: async messages => {
       reductions++
+      expect(events.some(event => event.type === 'status_update' && event.payload.kind === 'compressing')).toBe(true)
       session.metadata.last_compaction = { reason: 'mid-turn-auto-compact', tokens_after: 10 }
       return { messages: messages.slice(-1), tokensFreed: 150_000 }
     },
@@ -46,7 +72,7 @@ test('proactive compaction metadata survives turn synchronization and blocks ove
   session.messages = [{ role: 'user', content: 'historical output '.repeat(50_000) }]
   const events: DaemonEvent[] = []
   await runtime.submitTurn(session.sessionKey, 'continue', event => { events.push(event) })
-  expect(events.filter(event => event.type === 'status_update').map(event => event.payload.kind).filter(Boolean)).toEqual(['compressing', 'compaction'])
+  expect(events.filter(event => event.type === 'status_update').map(event => event.payload.kind).filter(Boolean)).toEqual(['compressing', 'compaction', 'provider_wait', 'provider_ready'])
   expect(reductions).toBe(1)
   expect(session.metadata.last_compaction).toMatchObject({ reason: 'mid-turn-auto-compact' })
   expect(session.messages.some(message => String(message.content).includes('historical output'))).toBe(false)
@@ -364,6 +390,8 @@ test('agent turn runner maps portable loop events and supplied live capacity to 
   }
 
   expect(events).toEqual([
+    { type: 'status_update', payload: { kind: 'provider_wait', text: 'Waiting for model response…' } },
+    { type: 'status_update', payload: { kind: 'provider_ready', text: '' } },
     // Text streams inline while the provider is still emitting; the round's
     // live token/context status_update lands once per provider round, right
     // after that round's deltas, and the terminal status_update closes the
@@ -461,7 +489,7 @@ test('agent turn runner keeps live context monotonic when a later round is fully
   for await (const event of runner.run(session, 'read it', new AbortController().signal)) events.push(event)
 
   const liveContext = events
-    .filter(event => event.type === 'status_update' && event.payload.usage_complete === undefined)
+    .filter(event => event.type === 'status_update' && event.payload.usage_complete === undefined && event.payload.context_tokens !== undefined)
     .map(event => Number(event.payload.context_tokens))
   expect(liveContext).toEqual([110, 107])
   expect(session.extra.runtime_telemetry).toMatchObject({
@@ -1725,4 +1753,28 @@ test('runtime tool inventory reflects live registration, deferral and agent filt
     expect(() => runtime.toolInventory('inventory')).toThrow('enforcement profile')
     expect(client.requests).toHaveLength(0)
   } finally { await runtime.shutdown(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test('resume reconciles saved active agents against exact live worker ownership', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-ownership-'))
+  try {
+    const options = { sessionDirectory: directory, currentProjectDirectory: directory }
+    const original = new InMemoryDaemonRuntime(undefined, options)
+    const session = await original.openSession('ownership')
+    session.messages.push({ role: 'user', content: 'important work' })
+    session.messages.push({ role: 'assistant', content: 'Working on it.' })
+    session.metadata.xerxes_subagent_snapshots_v1 = [
+      { id: 'dead', status: 'running', summary: 'partial work' },
+      { id: 'alive', status: 'running' },
+      { id: 'done', status: 'completed', summary: 'finished report' },
+    ]
+    await original.flushSessions()
+    const restored = new InMemoryDaemonRuntime(undefined, { ...options, liveSubagentIds: () => ['alive'] })
+    const resumed = await restored.openSession(session.id, undefined, { resume: true })
+    expect(resumed.metadata.xerxes_subagent_snapshots_v1).toMatchObject([
+      { id: 'dead', status: 'interrupted', summary: 'partial work' },
+      { id: 'alive', status: 'running' },
+      { id: 'done', status: 'completed', summary: 'finished report' },
+    ])
+  } finally { await rm(directory, { recursive: true, force: true }) }
 })

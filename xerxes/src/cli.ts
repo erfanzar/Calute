@@ -2207,6 +2207,7 @@ function daemonRuntime(
         return { ok: false, error: errorMessage(error) };
       }
     },
+    liveSubagentIds: () => subagentHost?.managerPort.listHandles().filter(snapshot => ['running', 'pending'].includes(snapshot.status)).map(snapshot => snapshot.id) ?? [],
     // An interaction-mode change (set_mode / set_plan_mode /
     // SetInteractionModeTool) must never cancel this session's running
     // subagents: mode only re-scopes the parent turn's next tool surface,

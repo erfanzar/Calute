@@ -262,7 +262,7 @@ export function LiveProgressPill() {
         }
 
         const parts = [
-          `${livenessVerb(verbs, liveness.elapsedMs)} ${formatStatusDuration(liveness.elapsedMs / 1000)}`,
+          `${turn.providerWaiting ? 'Waiting for model response…' : liveness.phase === 'stalled' ? 'Waiting for activity…' : livenessVerb(verbs, liveness.elapsedMs)} ${formatStatusDuration(liveness.elapsedMs / 1000)}`,
           `${toolCount} tool${toolCount === 1 ? '' : 's'}`
         ]
 

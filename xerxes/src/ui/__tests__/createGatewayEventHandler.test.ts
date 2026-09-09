@@ -64,6 +64,18 @@ const liveClarify = () =>
   })
 
 describe('createGatewayEventHandler', () => {
+  it('preserves provider waiting until response or failure ends that phase', () => {
+    const { handler } = buildHarness()
+    const send = (payload: Record<string, unknown>) => {
+      for (const event of adaptDaemonEvent('status_update', payload)) handler(event)
+    }
+    send({ kind: 'provider_wait', text: 'Waiting for model response…' })
+    expect(getTurnState().providerWaiting).toBe(true)
+    send({ input_tokens: 123 })
+    expect(getTurnState().providerWaiting).toBe(true)
+    send({ kind: 'provider_ready', text: '' })
+    expect(getTurnState().providerWaiting).toBe(false)
+  })
   it('shows compaction until its lifecycle ends, despite intervening telemetry', () => {
     const { handler } = buildHarness()
     const send = (payload: Record<string, unknown>) => {

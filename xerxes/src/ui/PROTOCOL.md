@@ -1428,3 +1428,7 @@ when the attempt ends. These events also cover mid-turn automatic compaction and
 context-overflow recovery. The end event clears the activity indicator; it does
 not imply success. Error reporting remains separate. Ordinary telemetry does not
 clear an active compaction indicator.
+
+Provider requests emit `status_update` with `kind: "provider_wait"` before
+waiting for output and `kind: "provider_ready"` when output begins or that
+attempt ends. These activity events do not replace usage or session metadata.

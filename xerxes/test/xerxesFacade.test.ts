@@ -135,7 +135,7 @@ test('fresh facade streams expose the shared event vocabulary and do not retain 
     }
     events.push(next.value)
   }
-  expect(events.map(event => event.type)).toEqual(['text', 'turn_done'])
+  expect(events.map(event => event.type)).toEqual(['provider_wait', 'provider_wait', 'text', 'turn_done'])
 })
 
 test('Xerxes facade routes tool calls through an attached sandbox router', async () => {

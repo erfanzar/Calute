@@ -10,6 +10,7 @@ import { $uiState } from './uiStore.js'
 const buildTurnState = (): TurnState => ({
   activity: [],
   compacting: false,
+  providerWaiting: false,
   outcome: '',
   toolLineToId: {},
   reasoning: '',
@@ -125,6 +126,7 @@ export interface TurnState {
   activity: ActivityItem[]
   /** True while the daemon is compacting this session's transcript. */
   compacting: boolean
+  providerWaiting: boolean
   outcome: string
   reasoning: string
   reasoningActive: boolean

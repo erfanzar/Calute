@@ -582,6 +582,11 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'status.update': {
         const p = ev.payload
 
+        if (p?.kind === 'provider_wait' || p?.kind === 'provider_ready') {
+          patchTurnState({ providerWaiting: p.kind === 'provider_wait' })
+          return
+        }
+
         if (!p?.text) {
           return
         }

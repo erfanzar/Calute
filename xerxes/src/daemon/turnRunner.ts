@@ -604,6 +604,13 @@ export class AgentTurnRunner implements TurnRunner {
         for await (const item of multiplexTurnEvents(turnEvents, this.options.subagentEvents, session.id)) {
           if (!sawContent && item.kind === 'turn') {
             const event = item.event
+            // Waiting and compaction must be visible before model output exists.
+            // Keep only terminal failure events buffered for fallback selection.
+            if (event.type === 'provider_wait' || event.type === 'compaction'
+              || (event.type === 'provider_retry' && !event.final)) {
+              yield decorate(item)
+              continue
+            }
             if (
               event.type === 'provider_retry'
               && event.final
@@ -628,7 +635,10 @@ export class AgentTurnRunner implements TurnRunner {
           }
           yield decorate(item)
         }
-        if (!restartWithFallback) break
+        if (!restartWithFallback) {
+          for (const buffered of preContent) yield decorate(buffered)
+          break
+        }
         fallbackAttempted = true
         // Narrowed by the restart condition above: both are defined here.
         const nextModel = fallbackModel as string
@@ -1454,6 +1464,8 @@ function daemonEventFromStream(
   contextLimit?: number,
 ): DaemonEvent {
   switch (event.type) {
+    case 'provider_wait':
+      return { type: 'status_update', payload: { kind: event.active ? 'provider_wait' : 'provider_ready', text: event.active ? 'Waiting for model response…' : '' } }
     case 'compaction':
       return { type: 'status_update', payload: { kind: event.active ? 'compressing' : 'compaction', text: event.active ? 'Compacting conversation…' : 'Compaction ended.' } }
     case 'text':

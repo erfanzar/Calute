@@ -2959,7 +2959,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 class FailingSaveTranscriptStore extends DaemonTranscriptStore {
+  private saves = 0
   override async save(): Promise<void> {
+    // Allow the turn-start checkpoint; fail once the provider has emitted output.
+    if (++this.saves === 1) return
     throw new Error('transcript store unavailable')
   }
 }
