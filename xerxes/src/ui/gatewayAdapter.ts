@@ -366,6 +366,9 @@ export function adaptDaemonEvent(type: string, payload: Record<string, unknown>)
       ]
 
     case 'status_update': {
+      if (payload.kind === 'compressing' || payload.kind === 'compaction') {
+        return [{ type: 'status.update', payload: { kind: payload.kind, text: str(payload.text) } }]
+      }
       const mode = optionalStr(payload.mode)
       const activePermissionMode = permissionMode(payload.permission_mode)
       const reasoningEffort = optionalStr(payload.reasoning_effort)

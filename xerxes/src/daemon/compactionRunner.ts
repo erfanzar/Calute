@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 
 import {
   CompactionResponseShapeError,
+  DEFAULT_COMPACTION_REQUEST_TOKENS,
   createCompactionAgent,
   type CompactionCompletionPort,
 } from "../agents/compactionAgent.js";
@@ -334,20 +335,32 @@ export async function compactMessagesIfNeeded(
     return { compacted: false, reason: "below-threshold" };
   }
   let lastError: unknown;
+  let requestTokenLimit = DEFAULT_COMPACTION_REQUEST_TOKENS;
   // One lever, shrinking: the summary's token budget. Compaction is atomic —
   // the agent returns the original transcript on failure and the caller only
   // swaps on success — so each attempt starts from the same clean state.
-  for (const summaryMaxTokens of request.summaryBudgets ?? COMPACTION_SUMMARY_BUDGETS) {
+  const summaryBudgets = request.summaryBudgets ?? COMPACTION_SUMMARY_BUDGETS;
+  for (let attempt = 0; attempt < summaryBudgets.length; attempt++) {
+    const summaryMaxTokens = summaryBudgets[attempt]!;
     let compacted: readonly ContextMessage[];
     try {
       compacted = await createCompactionAgent({
         completion: request.completion,
         model: request.model,
         summaryMaxTokens,
+        maxRequestTokens: requestTokenLimit,
         ...(request.maxContextTokens === undefined ? {} : { maxContextTokens: request.maxContextTokens }),
       }).summarizeMessages(original);
     } catch (error) {
       lastError = error;
+      // A smaller output budget does not fix a stalled large input request.
+      // Retry once with much smaller chronological chunks, even for the
+      // mid-turn caller that deliberately supplies only one summary budget.
+      if (classifyError(error).kind === ErrorKind.TIMEOUT && requestTokenLimit > 8_000) {
+        requestTokenLimit = 8_000;
+        attempt--;
+        continue;
+      }
       if (!compactionAttemptIsRetryable(error)) break;
       continue;
     }

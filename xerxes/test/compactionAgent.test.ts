@@ -142,3 +142,17 @@ test('an unreadable response shape is typed data, not an indistinguishable provi
   expect(providerError).toBeInstanceOf(Error)
   expect(providerError).not.toBeInstanceOf(CompactionResponseShapeError)
 })
+
+test('large model windows do not expand individual compaction requests', async () => {
+  const counter = new SmartTokenCounter()
+  const requests: CompactionCompletionRequest[] = []
+  const agent = new CompactionAgent({ maxContextTokens: 264_000, completion: request => {
+    requests.push(request)
+    expect(counter.countTokens(request.prompt)).toBeLessThanOrEqual(32_000)
+    return 'Preserved work summary.'
+  } })
+  await agent.summarizeContext('FIRST-MARKER\n' + 'Long command output from the existing session. '.repeat(18_000) + '\nLAST-MARKER')
+  expect(requests.length).toBeGreaterThan(2)
+  expect(requests.some(request => request.prompt.includes('FIRST-MARKER'))).toBe(true)
+  expect(requests.some(request => request.prompt.includes('LAST-MARKER'))).toBe(true)
+})

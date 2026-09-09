@@ -43,6 +43,8 @@ export type CompactionCompletionPort = (
 
 export interface CompactionAgentOptions {
   readonly completion: CompactionCompletionPort
+  /** Cap each summary request independently of the model's context window. */
+  readonly maxRequestTokens?: number
   /** Effective input budget, after reserving the model's output allowance. */
   readonly maxContextTokens?: number
   readonly model?: string
@@ -73,6 +75,7 @@ export class CompactionResponseShapeError extends TypeError {
 }
 
 const COMPACTION_PROMPT_PLACEHOLDER = '__XERXES_COMPACTION_SUMMARY_PLACEHOLDER__'
+export const DEFAULT_COMPACTION_REQUEST_TOKENS = 32_000
 
 /**
  * Model-backed context compactor with an injected completion boundary.
@@ -87,6 +90,7 @@ export class CompactionAgent {
   private readonly completion: CompactionCompletionPort
   private readonly tokenCounter: SmartTokenCounter
   private readonly maxContextTokens: number
+  private readonly maxRequestTokens: number
 
   constructor(options: CompactionAgentOptions) {
     if (typeof options.completion !== 'function') throw new TypeError('completion must be a function')
@@ -102,6 +106,10 @@ export class CompactionAgent {
     this.summaryMaxTokens = requestedMaxTokens
     this.tokenCounter = options.tokenCounter ?? new SmartTokenCounter({ model: this.model })
     this.maxContextTokens = options.maxContextTokens ?? 64_000
+    this.maxRequestTokens = options.maxRequestTokens ?? DEFAULT_COMPACTION_REQUEST_TOKENS
+    if (!Number.isSafeInteger(this.maxRequestTokens) || this.maxRequestTokens < 4096) {
+      throw new RangeError('maxRequestTokens must be an integer of at least 4096')
+    }
     if (!Number.isSafeInteger(this.maxContextTokens) || this.maxContextTokens < 4096) {
       throw new RangeError('maxContextTokens must be an integer of at least 4096')
     }
@@ -121,7 +129,7 @@ export class CompactionAgent {
   ): Promise<CompactionTextResult> {
     if (!context || context.length < 200) return { ok: true, text: context }
     const overhead = this.tokenCounter.countTokens(buildCompactionPromptFromText({ context: '', targetLength: this.targetLength, preserveTopics }))
-    const inputBudget = Math.max(512, Math.floor(this.maxContextTokens * 0.8) - overhead)
+    const inputBudget = Math.max(512, Math.floor(Math.min(this.maxContextTokens, this.maxRequestTokens) * 0.8) - overhead)
     if (this.tokenCounter.countTokens(context) > inputBudget) {
       const summaries: string[] = []
       let remaining = context

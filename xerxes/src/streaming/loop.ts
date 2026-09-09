@@ -479,7 +479,10 @@ export async function* runTurn(
         }
       }
       if (dependencies.reduceContext && dependencies.contextCompactionDue?.(state.messages)) {
-        const reduced = await dependencies.reduceContext(state.messages, signal)
+        yield { type: 'compaction', active: true }
+        let reduced: Awaited<ReturnType<ContextReducer>>
+        try { reduced = await dependencies.reduceContext(state.messages, signal) }
+        finally { yield { type: 'compaction', active: false } }
         signal?.throwIfAborted()
         if (reduced.tokensFreed <= 0 || dependencies.contextCompactionDue(reduced.messages)) {
           throw new Error('Automatic compaction could not make room for the next model round; history retained. Run /compact to retry.')
@@ -618,7 +621,10 @@ export async function* runTurn(
             && signal?.aborted !== true
           ) {
             contextReductionAttempted = true
-            const reduction = await reduceContextSafely(dependencies.reduceContext, state.messages, signal)
+            yield { type: 'compaction', active: true }
+            let reduction: Awaited<ReturnType<typeof reduceContextSafely>>
+            try { reduction = await reduceContextSafely(dependencies.reduceContext, state.messages, signal) }
+            finally { yield { type: 'compaction', active: false } }
             if (reduction !== undefined && reduction.tokensFreed > 0) {
               state.messages.splice(0, state.messages.length, ...reduction.messages)
               yield {

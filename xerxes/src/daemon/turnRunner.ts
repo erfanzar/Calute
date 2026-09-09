@@ -1454,6 +1454,8 @@ function daemonEventFromStream(
   contextLimit?: number,
 ): DaemonEvent {
   switch (event.type) {
+    case 'compaction':
+      return { type: 'status_update', payload: { kind: event.active ? 'compressing' : 'compaction', text: event.active ? 'Compacting conversation…' : 'Compaction ended.' } }
     case 'text':
       return { type: 'text_part', payload: { text: event.text } }
     case 'thinking':

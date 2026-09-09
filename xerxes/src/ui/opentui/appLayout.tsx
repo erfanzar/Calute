@@ -256,7 +256,7 @@ export function LiveProgressPill() {
           // a spinner is the only honest "still working" signal.
           const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
           const frame = frames[Math.floor(Date.now() / 80) % frames.length]
-          label.content = `${frame} compacting context…`
+          label.content = `${frame} Compacting conversation…`
           label.fg = t.color.accent
           return
         }

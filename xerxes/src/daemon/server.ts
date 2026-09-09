@@ -6399,6 +6399,7 @@ export class DaemonServer {
         session.status = previousStatus;
       }
       if (notify) {
+        this.emit(notify, "status_update", { kind: "compaction", text: "Compaction ended." });
         this.emitStatus(notify, session);
       }
       await completion.close();

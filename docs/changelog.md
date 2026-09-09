@@ -7,6 +7,15 @@ describe the earlier implementation and are not current setup instructions.
 
 ---
 
+## Unreleased
+
+- Show the compaction spinner for automatic and mid-turn summaries, preserve
+  lifecycle statuses through the TUI adapter, and clear the indicator on failure.
+
+- Bound compaction input chunks independently of the model context window and
+  retry timeouts with smaller chunks, including mid-turn compaction.
+- Identify automatic compaction failures explicitly while retaining the original conversation.
+
 ## 0.4.5 — 2026-09-09
 
 - Explicit model selections now take precedence over intelligence tier hints when

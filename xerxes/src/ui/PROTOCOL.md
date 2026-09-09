@@ -1421,3 +1421,10 @@ for an unsaved, validated project-agent Markdown draft. It uses the session's
 provider/model, accepts 1–12,000 characters, and bounds the provider call to 90
 seconds. Failure returns `{ok:false,error}`. It does not write files or modify the
 conversation. Review/edit and use `agentPreset.projectWrite` to save explicitly.
+
+Compaction lifecycle uses `status_update` with `kind: "compressing"` and a
+user-facing `text` while work is in progress, followed by `kind: "compaction"`
+when the attempt ends. These events also cover mid-turn automatic compaction and
+context-overflow recovery. The end event clears the activity indicator; it does
+not imply success. Error reporting remains separate. Ordinary telemetry does not
+clear an active compaction indicator.

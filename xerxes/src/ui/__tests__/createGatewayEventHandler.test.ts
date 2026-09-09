@@ -64,6 +64,18 @@ const liveClarify = () =>
   })
 
 describe('createGatewayEventHandler', () => {
+  it('shows compaction until its lifecycle ends, despite intervening telemetry', () => {
+    const { handler } = buildHarness()
+    const send = (payload: Record<string, unknown>) => {
+      for (const event of adaptDaemonEvent('status_update', payload)) handler(event)
+    }
+    send({ kind: 'compressing', text: 'Compacting conversation…' })
+    expect(getTurnState().compacting).toBe(true)
+    send({ input_tokens: 123 })
+    expect(getTurnState().compacting).toBe(true)
+    send({ kind: 'compaction', text: 'Compaction ended.' })
+    expect(getTurnState().compacting).toBe(false)
+  })
   it('updates and clears the shared goal display from live status without erasing it on telemetry', () => {
     const { handler } = buildHarness()
     patchUiState({ info: { model: 'test', skills: {}, tools: {}, goal: 'Old review', goal_phase: 'active' } })

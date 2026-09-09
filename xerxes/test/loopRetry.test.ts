@@ -51,6 +51,7 @@ test('proactive compaction runs again after tool results grow the same turn', as
     toolExecutor: { execute: async () => 'large tool output' },
   }))
   expect(reductions).toBe(3)
+  expect(events.filter(event => event.type === 'compaction')).toEqual(Array.from({ length: 3 }, () => [{ type: 'compaction' as const, active: true }, { type: 'compaction' as const, active: false }]).flat())
   expect(requests).toBe(3)
   expect(events.filter(event => event.type === 'turn_done')).toHaveLength(1)
 })
@@ -64,6 +65,7 @@ test('failed proactive compaction prevents an oversized provider call and preser
     llm: { async *stream() { requests++; yield { content: 'must not run' } } },
   }))
   expect(requests).toBe(0)
+  expect(events.filter(event => event.type === 'compaction')).toEqual([{ type: 'compaction', active: true }, { type: 'compaction', active: false }])
   expect(state.messages[0]?.content).toBe('important request')
   expect(events.some(event => event.type === 'provider_retry' && event.error.includes('summary service unavailable'))).toBe(true)
   expect(events.filter(event => event.type === 'turn_done')).toHaveLength(1)

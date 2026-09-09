@@ -2117,7 +2117,7 @@ function daemonRuntime(
         if (!outcome.compacted) {
           const reason = outcome.error ?? `Compaction ${outcome.reason}; history retained`;
           if (active) active.metadata.last_compaction_failure = { reason, at: new Date().toISOString() };
-          throw new Error(reason);
+          throw new Error(`Automatic context compaction failed: ${reason}. Original conversation retained.`);
         }
         signal?.throwIfAborted();
         if (active) {

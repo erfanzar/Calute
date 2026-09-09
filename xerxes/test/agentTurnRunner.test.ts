@@ -44,7 +44,9 @@ test('proactive compaction metadata survives turn synchronization and blocks ove
   const runtime = new InMemoryDaemonRuntime(runner)
   session = await runtime.openSession('compaction-metadata')
   session.messages = [{ role: 'user', content: 'historical output '.repeat(50_000) }]
-  await runtime.submitTurn(session.sessionKey, 'continue', () => {})
+  const events: DaemonEvent[] = []
+  await runtime.submitTurn(session.sessionKey, 'continue', event => { events.push(event) })
+  expect(events.filter(event => event.type === 'status_update').map(event => event.payload.kind).filter(Boolean)).toEqual(['compressing', 'compaction'])
   expect(reductions).toBe(1)
   expect(session.metadata.last_compaction).toMatchObject({ reason: 'mid-turn-auto-compact' })
   expect(session.messages.some(message => String(message.content).includes('historical output'))).toBe(false)

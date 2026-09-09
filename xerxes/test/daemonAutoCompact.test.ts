@@ -1297,3 +1297,25 @@ test("external compaction cancellation does not retry with a smaller summary bud
   expect(outcome.compacted).toBe(false);
   expect(calls).toBe(1);
 });
+
+test('a timed-out compaction retries with smaller input chunks even with one summary budget', async () => {
+  const requests: number[] = [];
+  const messages = [
+    { role: 'user', content: 'FIRST-MARKER ' + 'Important older work and command output. '.repeat(8000) },
+    { role: 'assistant', content: 'Recent answer.' },
+    { role: 'user', content: 'Continue the unfinished task.' },
+  ];
+  const original = structuredClone(messages);
+  const outcome = await compactMessagesIfNeeded({
+    model: 'gpt-6-astra', maxContextTokens: 264_000, reason: 'test', summaryBudgets: [1024], messages,
+    completion: request => {
+      requests.push(request.prompt.length);
+      if (requests.length === 1) throw new Error('The operation timed out.');
+      expect(request.prompt.length).toBeLessThan(requests[0]! / 2);
+      return 'Summary preserving unfinished work.';
+    },
+  });
+  expect(outcome.compacted).toBe(true);
+  expect(requests.length).toBeGreaterThan(2);
+  expect(messages).toEqual(original);
+});

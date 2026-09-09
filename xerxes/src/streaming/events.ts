@@ -64,6 +64,7 @@ export type TurnStopReason =
   | 'unconfigured_tools'
 
 export type StreamEvent =
+  | { readonly type: 'compaction'; readonly active: boolean }
   | { readonly text: string; readonly type: 'text' }
   | { readonly text: string; readonly type: 'thinking' }
   | { readonly attempt: number; readonly delay: number; readonly error: string; readonly final: boolean; readonly maxAttempts: number; readonly type: 'provider_retry' }
