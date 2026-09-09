@@ -1378,7 +1378,7 @@ test('invalid swarm tiers fail before any child is registered', async () => {
       sendInput: async id => agentSnapshot(id ?? 'missing'), wait: async () => ({ completed: [], pending: [] }),
     },
   })
-  for (const invalid of [ { intelligence: 'smart' }, { intelligence: 'bogus' }, { intelligence: 12 }, { intelligence: 'light', model: 'explicit' } ]) {
+  for (const invalid of [ { intelligence: 'smart' }, { intelligence: 'bogus' }, { intelligence: 12 } ]) {
     await expect(tools.execute('SpawnAgents', { agents: [
       { title: 'Valid task', prompt: 'valid', intelligence: 'light' },
       { title: 'Invalid task', prompt: 'invalid', ...invalid },
@@ -1425,7 +1425,7 @@ test('agent and swarm isolation is forwarded explicitly and unsupported runners 
   expect(seen).toEqual(['worktree', 'worktree', undefined])
   expect(refs).toEqual(['release', undefined, undefined])
   expect(sources).toEqual([undefined, 'working-tree', undefined])
-  await expect(tools.execute('AgentTool', { title: 'Conflict', prompt: 'work', isolation: 'worktree', worktree_ref: 'HEAD', worktree_source: 'working-tree' }, { metadata: {} })).rejects.toThrow('no worktree_ref')
+  await expect(tools.execute('AgentTool', { title: 'Conflict', prompt: 'work', isolation: 'worktree', worktree_ref: 'other-branch', worktree_source: 'working-tree' }, { metadata: {} })).rejects.toThrow('no worktree_ref')
   await expect(tools.execute('SpawnAgents', { agents: [{ title: 'Valid', prompt: 'work' }, { title: 'Invalid', prompt: 'work', worktree_ref: 'HEAD' }] }, { metadata: {} })).rejects.toThrow('requires isolation=worktree')
   await expect(tools.execute('AgentTool', { title: 'Invalid', prompt: 'work', isolation: 'container' }, { metadata: {} })).rejects.toThrow('must be worktree')
   await expect(tools.execute('SpawnAgents', { agents: [{ title: 'Invalid', prompt: 'work', isolation: true }] }, { metadata: {} })).rejects.toThrow('must be worktree')
@@ -1452,8 +1452,14 @@ test('agent tools forward explicit discovered provider and reasoning choices wit
   for (const request of requests) expect(request).toMatchObject({ agent: { model: 'discovered', providerProfile: 'subscription', reasoningEffort: 'high' } })
   const { model: _model, ...withoutModel } = choice
   await expect(tools.execute('AgentTool', withoutModel, { metadata: {} })).rejects.toThrow('require model')
-  await expect(tools.execute('SpawnAgents', { agents: [{ ...choice, intelligence: 'smart' }] }, { metadata: {} })).rejects.toThrow('cannot be combined')
-  expect(requests).toHaveLength(3)
+  for (const name of ['AgentTool', 'TaskCreateTool', 'SpawnAgents']) {
+    const redundant = { ...choice, intelligence: 'light', isolation: 'worktree', worktree_source: 'working-tree', worktree_ref: 'HEAD', wait: false }
+    await tools.execute(name, name === 'SpawnAgents' ? { agents: [redundant], wait: false } : redundant, { metadata: {} })
+    expect(requests.at(-1)).toMatchObject({ agent: { model: 'discovered', providerProfile: 'subscription', reasoningEffort: 'high' } })
+    if (name !== 'TaskCreateTool') expect(requests.at(-1)).toMatchObject({ worktreeSource: 'working-tree' })
+    expect(requests.at(-1)).not.toHaveProperty('worktreeRef')
+  }
+  expect(requests).toHaveLength(6)
 })
 
 test('all delegation entry points forward allocation cancellation and close a late allocation', async () => {

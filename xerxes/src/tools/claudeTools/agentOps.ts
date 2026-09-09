@@ -237,9 +237,9 @@ export const CLAUDE_AGENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     worktree_ref: stringSchema('Optional Git revision for worktree isolation. Defaults to HEAD. Resolved at each allocation; use a commit ID for a fixed baseline.'),
     isolation: { type: 'string', enum: ['worktree'], description: 'Run in a separate Git checkout. Requires a configured native worktree adapter; starts at committed HEAD.' },
     name: stringSchema('Stable subagent name.'),
-    model: stringSchema('Optional model override. Mutually exclusive with intelligence.'),
-    provider_profile: stringSchema('Configured provider profile from list_available_models. Requires explicit model; do not combine with intelligence.'),
-    reasoning_effort: stringSchema('Reasoning effort offered by list_available_models. Requires explicit model; do not combine with intelligence.'),
+    model: stringSchema('Optional explicit model override. Takes precedence over intelligence presets.'),
+    provider_profile: stringSchema('Configured provider profile from list_available_models. Requires explicit model. Explicit model settings override intelligence presets.'),
+    reasoning_effort: stringSchema('Reasoning effort offered by list_available_models. Requires explicit model. Explicit model settings override intelligence presets.'),
     intelligence: { type: 'string', enum: [...AGENT_INTELLIGENCE_LEVELS], description: 'Choose light for simple tasks, balanced for normal work, smart for difficult reasoning. Uses user-configured model mappings; omit to use the configured default.' },
     run_in_background: booleanSchema('Return immediately while the subagent keeps working.', false),
     wait: booleanSchema('Wait for the subagent to finish.', true),
@@ -277,9 +277,9 @@ export const CLAUDE_AGENT_TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           prompt: stringSchema('The delegated task.'),
           name: stringSchema('Optional stable subagent handle.'),
           subagent_type: stringSchema('Agent definition to run.'),
-          model: stringSchema('Optional model override. Mutually exclusive with intelligence.'),
-    provider_profile: stringSchema('Configured provider profile from list_available_models. Requires explicit model; do not combine with intelligence.'),
-    reasoning_effort: stringSchema('Reasoning effort offered by list_available_models. Requires explicit model; do not combine with intelligence.'),
+          model: stringSchema('Optional explicit model override. Takes precedence over intelligence presets.'),
+    provider_profile: stringSchema('Configured provider profile from list_available_models. Requires explicit model. Explicit model settings override intelligence presets.'),
+    reasoning_effort: stringSchema('Reasoning effort offered by list_available_models. Requires explicit model. Explicit model settings override intelligence presets.'),
           intelligence: { type: 'string', enum: [...AGENT_INTELLIGENCE_LEVELS], description: 'Choose light for simple tasks, balanced for normal work, smart for difficult reasoning. Uses user-configured model mappings; omit to use the configured default.' },
         },
       },
@@ -366,7 +366,7 @@ function configuredIntelligenceSchema(schema: Readonly<Record<string, unknown>>,
     const properties = value.properties as Record<string, unknown> | undefined
     if (properties && typeof properties === 'object' && !Array.isArray(properties) && 'intelligence' in properties) {
       if (!tiers.length) delete properties.intelligence
-      else properties.intelligence = { type: 'string', enum: [...tiers], description: 'Configured model tier. Omit to use the default; do not combine with model.' }
+      else properties.intelligence = { type: 'string', enum: [...tiers], description: 'Configured model tier. Omit to use the default. Ignored when an explicit model is supplied.' }
     }
     for (const child of Object.values(value)) {
       if (Array.isArray(child)) child.forEach(visit)
@@ -801,7 +801,8 @@ export class ClaudeAgentTools {
   }
 
   private resolveSpec(spec: ClaudeAgentSpec): ClaudeAgentSpec {
-    if ((spec.providerProfile || spec.reasoningEffort) && (!spec.model?.trim() || spec.intelligence)) throw new ValidationError('model', 'explicit provider/reasoning selectors require model and cannot be combined with intelligence', spec.model)
+    if ((spec.providerProfile || spec.reasoningEffort) && !spec.model?.trim()) throw new ValidationError('model', 'explicit provider/reasoning selectors require model', spec.model)
+    if (spec.worktreeSource === 'working-tree' && spec.worktreeRef === 'HEAD') spec = { ...spec, worktreeRef: undefined }
     if (spec.worktreeSource && (spec.worktreeRef || spec.isolation !== 'worktree')) throw new ValidationError('worktree_source', 'requires isolation=worktree and no worktree_ref', spec.worktreeSource)
     if (spec.worktreeRef && spec.isolation !== 'worktree') throw new ValidationError('worktree_ref', 'requires isolation=worktree', spec.worktreeRef)
     const selected = resolveAgentIntelligenceSettings(this.intelligence, spec.intelligence, spec.model)

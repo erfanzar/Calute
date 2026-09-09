@@ -2164,8 +2164,8 @@ quota remains explicitly unknown. Capability discovery may refresh metadata cach
 but does not switch the active provider or the parent conversation model.
 
 AgentTool, TaskCreateTool and SpawnAgents now accept explicit provider_profile and
-reasoning_effort alongside model. These cannot be combined with intelligence tiers
-or used without a model. Existing native provider routing handles execution;
+reasoning_effort alongside model. Explicit models override redundant intelligence
+tier hints; provider/reasoning selectors require a model. Existing native provider routing handles execution;
 catalog membership is not a promise of entitlement. Default prompt guidance points
 to discovery; details stay in the tool schema to respect the prompt size limit.
 

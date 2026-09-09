@@ -25,3 +25,9 @@ test('structured tiers retain profile and reasoning while legacy strings remain 
   expect(resolveAgentIntelligenceSettings(config, 'light')).toEqual({ model: 'fast' })
   expect(() => parseAgentIntelligenceConfig({ smart: { model: 'deep', api_key: 'must-not-store' } })).toThrow()
 })
+
+test('explicit models override even unmapped tier hints without inheriting tier routing', async () => {
+  const { resolveAgentIntelligenceSettings } = await import('../src/agents/intelligence.js')
+  expect(resolveAgentIntelligenceSettings({}, 'light', 'exact-model')).toEqual({ model: 'exact-model' })
+  expect(resolveAgentIntelligenceSettings({ light: { model: 'other', provider_profile: 'other-provider', reasoning_effort: 'low' } }, 'light', 'exact-model')).toEqual({ model: 'exact-model' })
+})

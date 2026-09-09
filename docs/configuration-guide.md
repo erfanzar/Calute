@@ -1849,3 +1849,10 @@ When the remote TUI recorded its active session, retries from this picker resume
 that session. Reconnecting does not resend your last prompt or restart its tools.
 A remote host reboot can still interrupt remote processes; session recovery does
 not guarantee that those processes survived.
+
+Explicit subagent models take precedence over `intelligence` tier hints. When
+passing `model`, `provider_profile`, and `reasoning_effort` from model discovery,
+a redundant tier does not override those choices. Provider/reasoning selectors
+still require an explicit model. For worktree delegation, `working-tree` plus
+`worktree_ref: HEAD` means capture the current working tree; a conflicting named
+branch remains invalid.

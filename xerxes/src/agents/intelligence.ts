@@ -61,7 +61,6 @@ export function resolveAgentIntelligenceModel(config: AgentIntelligenceConfig, i
 }
 
 export function resolveAgentIntelligenceSettings(config: AgentIntelligenceConfig, intelligence?: AgentIntelligence, model?: string): AgentTierSettings | undefined {
-  if (intelligence && model?.trim()) throw new ValidationError('intelligence', 'choose either intelligence or an explicit model, not both', intelligence)
   if (model?.trim()) return { model: model.trim() }
   const level = intelligence ?? config.default
   if (!level || level === 'inherit') return undefined
