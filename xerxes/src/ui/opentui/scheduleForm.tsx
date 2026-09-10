@@ -6,10 +6,11 @@ import type { TextareaRenderable } from '@opentui/core'
 import { useEffect, useRef, useState } from 'react'
 import { useOptionalGateway } from '../app/gatewayContext.js'
 import type { Theme } from '../theme.js'
+import { scheduleDescription, type ScheduleTemplate } from '../lib/scheduleTemplates.js'
 import { Text } from './primitives.js'
 import { SettingsFormLayout } from './settingsFormLayout.js'
 export interface ScheduleDraft { max_total_tokens?: number | null; stop_condition?: string | null; target_session_id?: string | null; expires_at?: string | null; max_runs?: number | null; runs_started?: number; max_model_calls?: number | null; deliver?: string; recipient?: string; missed_run_policy?: "coalesce" | "skip"; misfire_grace_seconds?: number; timezone?: string; id: string; revision: string; prompt: string; schedule: string; paused: boolean; next_run_at?: string; timeout_seconds?: number | null; max_retries?: number | null; interval_seconds?: number | null }
-export function ScheduleForm({ t, initial, onClose, onSaved, followup = false }: { t: Theme; followup?: boolean; initial?: ScheduleDraft; onClose: () => void; onSaved: (id: string) => void }) {
+export function ScheduleForm({ t, initial, onClose, onSaved, followup = false, template }: { t: Theme; template?: ScheduleTemplate; followup?: boolean; initial?: ScheduleDraft; onClose: () => void; onSaved: (id: string) => void }) {
   const gateway = useOptionalGateway()
   const [field, setField] = useState(0)
   const [totalTokens, setTotalTokens] = useState(String(initial?.max_total_tokens ?? ''))
@@ -17,12 +18,12 @@ export function ScheduleForm({ t, initial, onClose, onSaved, followup = false }:
   const [target, setTarget] = useState(initial?.target_session_id || (!initial && followup) ? 'session' : 'independent')
   const [expiresAt, setExpiresAt] = useState(initial?.expires_at ?? (!initial && followup ? new Date(Date.now() + 86400000).toISOString() : ''))
   const [maxRuns, setMaxRuns] = useState(initial?.max_runs == null ? (!initial && followup ? '10' : '') : String(initial.max_runs))
-  const [prompt, setPrompt] = useState(initial?.prompt ?? '')
-  const [timing, setTiming] = useState((initial?.interval_seconds != null || (!initial && followup)) ? 2 : initial && !initial.schedule ? 1 : 0)
+  const [prompt, setPrompt] = useState(initial?.prompt ?? template?.prompt ?? '')
+  const [timing, setTiming] = useState((initial?.interval_seconds != null || (!initial && followup && !template)) ? 2 : initial && !initial.schedule ? 1 : 0)
   const once = timing === 1
   const intervalMode = timing === 2
   const [interval, setIntervalValue] = useState(String(initial?.interval_seconds ?? (followup ? 600 : 3600)))
-  const [cron, setCron] = useState(initial?.schedule || '0 9 * * *')
+  const [cron, setCron] = useState(initial?.schedule || template?.schedule || '0 9 * * *')
   const [timezone, setTimezone] = useState(initial?.timezone ?? 'UTC')
   const [at, setAt] = useState(initial?.next_run_at ?? '')
   const [paused, setPaused] = useState(initial?.paused ?? true)
@@ -116,7 +117,7 @@ export function ScheduleForm({ t, initial, onClose, onSaved, followup = false }:
     subtitle="Choose the work, timing and limits. New jobs start paused."
     fields={labels.map((label, id) => ({ id, label, value: values[id]!, group: id < 4 ? '01  TASK & TIMING' : id < 9 ? '02  EXECUTION' : id < 11 ? '03  DELIVERY' : '04  BUDGET & LIFETIME' }))}
     selected={field} onSelect={setField} busy={busy ? 'Saving…' : ''} error={error}
-    compactHelp={field === 9 ? <Text color={t.ds.meta} wrap="wrap">↑/↓ {destinations.map(value => value.name).join(' · ') || destinationError || 'none'}</Text> : undefined}
+    compactHelp={field === 9 ? <Text color={t.ds.meta} wrap="wrap">↑/↓ {destinations.map(value => value.name).join(' · ') || destinationError || 'none'}</Text> : <Text color={t.ds.meta} wrap="wrap">{scheduleDescription(cron, timezone, intervalMode ? Number(interval) : undefined, once ? at : undefined)}</Text>}
     editor={editable ? <textarea key={field} ref={input} focused={!busy} placeholder={field === 0 ? 'Describe the task to run…' : 'Enter a value…'} minHeight={field === 0 ? 3 : 1} maxHeight={3} focusedBackgroundColor={t.color.statusBg} focusedTextColor={t.color.text} onContentChange={() => {
         const value = input.current?.plainText ?? ''
         if (field === 16) setTotalTokens(value)
@@ -144,6 +145,7 @@ export function ScheduleForm({ t, initial, onClose, onSaved, followup = false }:
     </>}
     summary={<>
       <Text color={paused ? t.color.warn : t.color.accent} wrap="wrap">{paused ? 'Paused · enable when ready' : 'Enabled · runs on schedule'}</Text>
+      <Text color={t.color.text} wrap="wrap">{scheduleDescription(cron, timezone, intervalMode ? Number(interval) : undefined, once ? at : undefined)}</Text>
       <Text color={t.ds.secondary} wrap="wrap">{preview}</Text>
       <Text color={t.ds.meta} wrap="wrap">Attempts used: {initial?.runs_started ?? 0} · retries and manual runs count</Text>
       <Text color={t.ds.meta} wrap="wrap">Runs never overlap. The owning daemon must be online.</Text>

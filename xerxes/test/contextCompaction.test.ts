@@ -23,16 +23,12 @@ import {
 import type { LlmClient } from '../src/llms/client.js'
 
 /**
- * Minimal client for the deferred-port tests: `completeLlm` prefers `complete`
- * when present, and `closeLlmClient` calls `close` when present, so those two are
- * the whole contract exercised here.
+ * Minimal streaming client for the deferred-port lifecycle tests.
  */
 function stubCompletionClient(content: string, onClose?: () => void): LlmClient {
   return {
     complete: async () => ({ content, toolCalls: [] }),
-    stream: () => {
-      throw new Error('the deferred port must use complete(), not stream()')
-    },
+    async *stream() { yield { content, finishReason: 'stop' } },
     ...(onClose ? { close: async () => onClose() } : {}),
   } as unknown as LlmClient
 }

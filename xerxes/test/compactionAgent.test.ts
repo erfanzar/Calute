@@ -156,3 +156,53 @@ test('large model windows do not expand individual compaction requests', async (
   expect(requests.some(request => request.prompt.includes('FIRST-MARKER'))).toBe(true)
   expect(requests.some(request => request.prompt.includes('LAST-MARKER'))).toBe(true)
 })
+
+test('a late chunk timeout retries only that segment and retains earlier summaries', async () => {
+  const requests: string[] = []
+  let failed = false
+  const agent = new CompactionAgent({ maxRequestTokens: 16000, completion: request => {
+    requests.push(request.prompt)
+    if (requests.length === 2 && !failed) { failed = true; throw new Error('The operation timed out.') }
+    return 'Preserved completed work and remaining tasks.'
+  } })
+  const text = 'FIRST-SEGMENT-MARKER\n' + 'Important history and command evidence. '.repeat(10000)
+  await expect(agent.summarizeContext(text)).resolves.toContain('Preserved')
+  expect(failed).toBe(true)
+  expect(requests.filter(prompt => prompt.includes('FIRST-SEGMENT-MARKER'))).toHaveLength(1)
+  expect(requests[2]!.length).toBeLessThan(requests[1]!.length)
+})
+
+test('independent summary segments run at most three at a time and retain source order', async () => {
+  let active = 0; let peak = 0; let sequence = 0;
+  const prompts: string[] = [];
+  const agent = new CompactionAgent({ maxRequestTokens: 4096, completion: async request => {
+    const id = ++sequence; prompts.push(request.prompt);
+    active++; peak = Math.max(peak, active);
+    await Bun.sleep(id % 3 === 0 ? 1 : 10);
+    active--;
+    return `Preserved segment ${id} with its evidence.`;
+  } });
+  await agent.summarizeContext('Chronological repository evidence and important user requests. '.repeat(3000));
+  expect(peak).toBe(3);
+  const combined = prompts.at(-1)!;
+  expect(combined.indexOf('Preserved segment 1')).toBeLessThan(combined.indexOf('Preserved segment 2'));
+  expect(combined.indexOf('Preserved segment 2')).toBeLessThan(combined.indexOf('Preserved segment 3'));
+});
+
+test('a failed parallel segment drains its siblings before returning failure', async () => {
+  let active = 0;
+  let calls = 0;
+  const failure = new Error('provider refused this summary');
+  const agent = new CompactionAgent({ maxRequestTokens: 4096, completion: async () => {
+    const id = ++calls;
+    active++;
+    try {
+      if (id === 1) throw failure;
+      await Bun.sleep(20);
+      return 'Completed summary.';
+    } finally { active--; }
+  } });
+  await expect(agent.summarizeContext('Important user constraints and saved work. '.repeat(3000))).rejects.toBe(failure);
+  expect(active).toBe(0);
+  expect(calls).toBe(3);
+});

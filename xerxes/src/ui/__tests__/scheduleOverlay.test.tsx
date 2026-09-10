@@ -135,3 +135,18 @@ it.each([[220, 65], [40, 18]])('opens scoped follow-ups and a bounded new draft 
     await vi.waitFor(() => expect(getOverlayState().loops).toBe(false))
   } finally { act(() => screen.renderer.destroy()) }
 })
+
+it('opens a template as a paused editable draft without creating a job on selection or cancel', async () => {
+  const rpc = vi.fn(async () => ({ ok: true, jobs: [], next_run_at: '2099-01-01T09:00:00.000Z' }))
+  const screen = await testRender(<GatewayProvider value={{ rpc } as unknown as GatewayServices}><ScheduleOverlay t={DARK_THEME} /></GatewayProvider>, { width: 140, height: 42 })
+  try {
+    await screen.flush(); act(() => screen.mockInput.pressKey('b')); await screen.flush()
+    expect(screen.captureCharFrame()).toContain('Morning briefing')
+    act(() => screen.mockInput.pressKey('RETURN')); await screen.flush()
+    expect(screen.captureCharFrame()).toContain('Weekdays at 09:00 (UTC)')
+    expect(screen.captureCharFrame()).toContain('Summarize recent changes')
+    expect(screen.captureCharFrame()).toContain('Paused')
+    act(() => screen.mockInput.pressKey('ESCAPE')); await screen.flush()
+    expect(rpc.mock.calls.some(([method]) => method === 'schedule.create')).toBe(false)
+  } finally { act(() => screen.renderer.destroy()) }
+})

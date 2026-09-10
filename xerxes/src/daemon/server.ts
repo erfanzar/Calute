@@ -1639,7 +1639,20 @@ export class DaemonServer {
           await queueHandback;
         };
         // Serialize dispatch per connection so handlers cannot race on shared state.
-        connection.queue = connection.queue.then(handle, handle);
+        // A long session operation may already own this connection's queue.
+        // Releasing a read-only handler *after* it reaches that queue is too
+        // late: status polling would wait behind the provider call itself.
+        // Only these snapshot reads may bypass the queue once a session exists;
+        // initialization and every mutation retain their arrival ordering.
+        let readySnapshot = false;
+        if (this.runtime.sessionStatus(connection.activeSessionKey)) {
+          try {
+            const method = parseJsonRpcRequest(line).method;
+            readySnapshot = method === 'runtime.status' || method === 'schedule.list';
+          } catch { /* Normal dispatch reports malformed frames. */ }
+        }
+        if (readySnapshot) void handle();
+        else connection.queue = connection.queue.then(handle, handle);
       }
       newline = connection.buffer.indexOf("\n");
     }
@@ -2006,6 +2019,13 @@ export class DaemonServer {
       await this.runtime.flushSessions();
       this.notifySessionStateChanged(session.id);
       if (result.ok && goalInput.trim().toLowerCase() === 'resume') {
+        // A previous interrupt leaves this latch set until a turn starts.
+        // Clear it for an explicit idle resume: the wake admission checks the
+        // latch before starting a turn, so otherwise neither can make progress.
+        // Never clear a cancellation belonging to a still-running turn/setup.
+        if (!session.activeTurnId && !this.turnOwners.has(key) && session.status === 'idle') {
+          session.cancelRequested = false;
+        }
         await this.stageGoalWake(key);
         this.kickGoalWake(key, event => this.emit(connection, event.type, event.payload), connection);
       } else if (goal?.phase !== 'active') {
@@ -2183,6 +2203,41 @@ export class DaemonServer {
         }
         const { snapshot, revision, diff, files, action } = await manager.preview(params.snapshot_id, true, params.path as string | undefined);
         return { ok: true, snapshot_id: snapshot.id, revision, diff: diff.slice(0, 100_000), truncated: diff.length > 100_000, files, ...(action ? { action } : {}) };
+      } catch (error) { return { ok: false, error: errorMessage(error) }; }
+    }
+    if (method === "capabilities.list" || method === "capabilities.inspect") {
+      try {
+        const session = this.runtime.sessionStatus(sessionKey(connection, params));
+        if (!session) return { ok: false, error: "Active session required" };
+        await this.refreshSkills(session);
+        if (method === "capabilities.inspect") {
+          if (typeof params.name !== 'string') return { ok: false, error: 'Skill name required' };
+          const skill = this.skillRegistry.get(params.name);
+          if (!skill) return { ok: false, error: 'Skill no longer available; refresh the catalog' };
+          return { ok: true, instructions: skill.instructions.slice(0, 32000), truncated: skill.instructions.length > 32000, source: skill.sourcePath };
+        }
+        const inventory = await this.listTools(connection, session, false);
+        const counts = new Map<string, number>();
+        for (const record of session.toolExecutions) {
+          if (typeof record !== 'object' || record === null || !('name' in record) || typeof record.name !== 'string') continue;
+          counts.set(record.name, (counts.get(record.name) ?? 0) + 1);
+        }
+        const activations = new Map<string, number>();
+        for (const message of session.messages) {
+          if (message.role !== 'user' || typeof message.content !== 'string') continue;
+          const name = /^\[Skill ([^ :\]\n]+)(?::[^ \]\n]+)? activated\]/.exec(message.content)?.[1];
+          if (name) activations.set(name, (activations.get(name) ?? 0) + 1);
+        }
+        const skills = this.skillRegistry.all();
+        return {
+          ok: true, usage_scope: 'retained session history', total_skills: skills.length,
+          skills: skills.slice(0, 1000).map(skill => ({ name: skill.metadata.name, description: skill.metadata.description, tags: [...skill.metadata.tags], source: skill.sourcePath, platform_supported: skillMatchesPlatform(skill), uses: activations.get(skill.metadata.name) ?? 0 })),
+          tools: Array.isArray(inventory.tools) ? inventory.tools.map((tool: Record<string, unknown>) => ({ ...tool, uses: counts.get(String(tool.name)) ?? 0 })) : [],
+          tools_source: inventory.source,
+          model: session.model ?? this.runtime.status().model ?? '',
+          provider_profile: this.sessionProfileName(session) ?? '',
+          reasoning_effort: session.metadata.reasoning_effort ?? '',
+        };
       } catch (error) { return { ok: false, error: errorMessage(error) }; }
     }
     if (method === "tool.inventory") {
@@ -6314,9 +6369,16 @@ export class DaemonServer {
     try {
       const archivePath = await this.precompactArchivePath(session.id);
       signal?.throwIfAborted();
+      let summaryRequest = 0;
       const outcome = await compactMessagesIfNeeded({
         ...(archivePath === undefined ? {} : { archivePath }),
-        completion: completion.port,
+        completion: async request => {
+          summaryRequest += 1;
+          if (notify) this.emit(notify, 'status_update', {
+            kind: 'compressing', text: `Compacting: summary request ${summaryRequest}…`,
+          });
+          return completion.port(request);
+        },
         messages: session.messages,
         model,
         reason,

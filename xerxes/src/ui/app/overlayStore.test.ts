@@ -141,6 +141,7 @@ describe('background hotkey blocking policy', () => {
       ['secret', { secret: { envVar: 'API_KEY', prompt: 'Key?', requestId: 'r1' } }],
       ['sessions', { sessions: true }],
       ['skillsHub', { skillsHub: true }],
+      ['capabilities', { capabilities: true }],
       ['sudo', { sudo: { requestId: 'r1' } }],
       ['terminals', { terminals: true }]
     ]

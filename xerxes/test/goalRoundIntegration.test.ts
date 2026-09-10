@@ -692,3 +692,21 @@ class SocketTestClient {
     this.socket.destroy();
   }
 }
+
+test('explicit goal resume clears a prior idle cancellation before scheduling the next round', async () => {
+  const runner = new GoalScriptRunner(session => {
+    completeGoal(session.metadata, session.id, getGoal(session.metadata, session.id)!, Date.now());
+  });
+  await withServer('xerxes-goal-resume-cancel-', runner, async (client, runtime) => {
+    const session = runtime.sessionStatus('goal-session')!;
+    const goal = createGoal(session.metadata, session.id, { objective: 'finish after interruption' }, Date.now());
+    pauseGoal(session.metadata, session.id, goal, Date.now());
+    session.cancelRequested = true;
+    client.send({ jsonrpc: '2.0', id: 2, method: 'session.goal', params: { input: 'resume' } });
+    const result = await client.next(frame => frame.id === 2);
+    expect(result.result).toMatchObject({ ok: true });
+    await waitFor(() => runner.turns.length === 1);
+    expect(runner.turns[0]?.goalRound).toBe(1);
+    await waitFor(() => getGoal(session.metadata, session.id)?.phase === 'complete');
+  });
+});

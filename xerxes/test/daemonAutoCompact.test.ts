@@ -129,6 +129,10 @@ class SocketTestClient {
   }
 }
 
+function summaryStream(content: string): Response {
+  return new Response('data: ' + JSON.stringify({ choices: [{ delta: { content }, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+}
+
 function fakeOpenAiFetch(requests: unknown[]): FetchImplementation {
   return async (input, init) => {
     const url = typeof input === "string" ? input : input.toString();
@@ -141,11 +145,7 @@ function fakeOpenAiFetch(requests: unknown[]): FetchImplementation {
       ? JSON.parse(init.body)
       : undefined;
     requests.push(body);
-    return new Response(
-      JSON.stringify({
-        choices: [{ message: { content: "durable auto-compact summary" } }],
-      }),
-    );
+    return summaryStream("durable auto-compact summary");
   };
 }
 
@@ -375,7 +375,7 @@ test("cancel during pre-turn auto-compaction prevents the admitted turn from lau
     async () => {
       compactionStarted.resolve();
       await releaseCompaction.promise;
-      return new Response(JSON.stringify({ choices: [{ message: { content: "summary" } }] }));
+      return summaryStream("summary");
     },
     { preconnect: globalThis.fetch.preconnect },
   );
@@ -470,7 +470,7 @@ test("disconnect during pre-turn auto-compaction does not start an ownerless tur
     async () => {
       compactionStarted.resolve();
       await releaseCompaction.promise;
-      return new Response(JSON.stringify({ choices: [{ message: { content: "summary" } }] }));
+      return summaryStream("summary");
     },
     { preconnect: globalThis.fetch.preconnect },
   );
@@ -552,7 +552,7 @@ test("a second submit cannot wait behind compaction and launch after its owner d
     async () => {
       compactionStarted.resolve();
       await releaseCompaction.promise;
-      return new Response(JSON.stringify({ choices: [{ message: { content: "summary" } }] }));
+      return summaryStream("summary");
     },
     { preconnect: globalThis.fetch.preconnect },
   );
@@ -625,7 +625,7 @@ test("a submit serialized behind manual compaction keeps its newly appended prom
     async () => {
       compactionStarted.resolve();
       await releaseCompaction.promise;
-      return new Response(JSON.stringify({ choices: [{ message: { content: "summary" } }] }));
+      return summaryStream("summary");
     },
     { preconnect: globalThis.fetch.preconnect },
   );
@@ -702,7 +702,7 @@ test("manual compaction does not restore stale idle status over a live turn", as
     async () => {
       compactionStarted.resolve();
       await releaseCompaction.promise;
-      return new Response(JSON.stringify({ choices: [{ message: { content: "summary" } }] }));
+      return summaryStream("summary");
     },
     { preconnect: globalThis.fetch.preconnect },
   );
@@ -924,7 +924,7 @@ test("context accounting prices tool_calls, so a tool-heavy session compacts bef
     {
       fetch: scriptedOpenAiFetch(
         requests,
-        () => new Response(JSON.stringify({ choices: [{ message: { content: "tool summary" } }] })),
+        () => summaryStream("tool summary"),
       ),
       sessionKey: "tool-heavy",
       // 30% of the 96_000-token prompt budget for gpt-4.
@@ -975,9 +975,7 @@ test("a compaction call that overflows the window retries with a smaller summary
       fetch: scriptedOpenAiFetch(requests, (call) =>
         call === 1
           ? contextOverflowResponse()
-          : new Response(
-            JSON.stringify({ choices: [{ message: { content: "second-try summary" } }] }),
-          )),
+          : summaryStream("second-try summary")),
       sessionKey: "overflow",
       threshold: 0.01,
     },
@@ -1060,7 +1058,7 @@ test("a disabled threshold still warns once as the prompt budget fills", async (
     {
       fetch: scriptedOpenAiFetch(
         requests,
-        () => new Response(JSON.stringify({ choices: [{ message: { content: "unused" } }] })),
+        () => summaryStream("unused"),
       ),
       // 8_192-token window with a 2_048-token reply reserve: a 6_144-token
       // prompt budget, so the warning fires without a huge fixture.
@@ -1311,11 +1309,28 @@ test('a timed-out compaction retries with smaller input chunks even with one sum
     completion: request => {
       requests.push(request.prompt.length);
       if (requests.length === 1) throw new Error('The operation timed out.');
-      expect(request.prompt.length).toBeLessThan(requests[0]! / 2);
+      if (requests.length === 2) expect(request.prompt.length).toBeLessThan(requests[0]! / 2);
       return 'Summary preserving unfinished work.';
     },
   });
   expect(outcome.compacted).toBe(true);
   expect(requests.length).toBeGreaterThan(2);
   expect(messages).toEqual(original);
+});
+
+test('compaction collects the stream with explicit low effort instead of a buffered completion', async () => {
+  const port = compactionCompletionPort({
+    async complete() { throw new Error('Buffered completion must not be used'); },
+    async *stream(request) {
+      expect(request.thinking).toEqual({ effort: 'low' });
+      yield { content: 'First part. ' };
+      yield { content: 'Remaining work.', finishReason: 'stop' };
+    },
+  }, 'gpt-6-astra', 1000);
+  expect(await port({ prompt: 'Summarize', maxTokens: 2048, stream: false, temperature: 0 })).toBe('First part. Remaining work.');
+});
+
+test('compaction never stores an incomplete streamed summary', async () => {
+  const port = compactionCompletionPort({ async *stream() { yield { content: 'partial summary', finishReason: 'length' }; } }, 'gpt-6-astra', 1000);
+  await expect(port({ prompt: 'Summarize', maxTokens: 32, stream: false, temperature: 0 })).rejects.toThrow('summary did not finish');
 });

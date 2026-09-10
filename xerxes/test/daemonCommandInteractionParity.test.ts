@@ -327,11 +327,7 @@ test('slash compact rewrites and persists the active native session without subm
   const providerRequests: unknown[] = []
   globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
     providerRequests.push(typeof init?.body === 'string' ? JSON.parse(init.body) : undefined)
-    return new Response(
-      JSON.stringify({
-        choices: [{ message: { content: 'durable parity summary' } }],
-      }),
-    )
+    return new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: 'durable parity summary' }, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } })
   }) as typeof globalThis.fetch
   await server.start()
   const client = await DaemonParityClient.connect(socketPath)

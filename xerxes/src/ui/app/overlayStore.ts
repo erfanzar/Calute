@@ -33,6 +33,7 @@ const buildOverlayState = (): OverlayState => ({
   reasoningPicker: false,
   secret: null,
   sessions: false,
+  capabilities: false,
   skillsHub: false,
   sudo: null,
   terminals: false
@@ -75,6 +76,7 @@ const OVERLAY_FLAG_KEYS = [
   'reasoningPicker',
   'secret',
   'sessions',
+  'capabilities',
   'skillsHub',
   'sudo',
   'terminals'
@@ -124,6 +126,7 @@ export const OVERLAY_BLOCKS_BACKGROUND_HOTKEYS: Record<OverlayFlagKey, boolean> 
   reasoningPicker: true,
   secret: true,
   sessions: true,
+  capabilities: true,
   skillsHub: true,
   sudo: true,
   terminals: true
@@ -211,6 +214,7 @@ export const resetFlowOverlays = () =>
     pluginsHub: $overlayState.get().pluginsHub,
     reasoningPicker: $overlayState.get().reasoningPicker,
     sessions: $overlayState.get().sessions,
+    capabilities: $overlayState.get().capabilities,
     skillsHub: $overlayState.get().skillsHub,
     terminals: $overlayState.get().terminals
   })

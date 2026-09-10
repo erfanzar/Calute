@@ -915,6 +915,20 @@ with bounded conflict details. No automatic reversal runs after process death.
 
 ### Runtime tool inventory
 
+`capabilities.list` returns a read-only catalog for the attached session:
+`{ok:true,skills,total_skills,tools,tools_source,usage_scope,model,provider_profile,reasoning_effort}`.
+Skills contain name, description, tags, source, platform_supported and uses;
+tools extend the tool inventory records with uses. `usage_scope` is
+`retained session history`: tool execution records and canonical user skill
+activation messages, not lifetime totals. At most 1000 skills are returned;
+`total_skills` reports the full discovered count. Discovery preserves existing
+skill trust rules. `capabilities.inspect` accepts `{name}` from that catalog
+and returns `{ok:true,instructions,source,truncated}` with a 32000-character
+preview. It does not expand commands, activate skills, or call a provider.
+Missing sessions, unknown skills and discovery failures return `{ok:false,error}`.
+Neither endpoint appends transcript messages. The TUI `/features` opens this
+catalog; the daemon's existing text `/features` response remains compatible.
+
 `tool.inventory` is a read-only session-scoped projection of the runtime tool
 registry, with an optional embedding-host catalog taking precedence. It returns
 `{ok:true,tools,source,execution_readiness}`. Sources are `runtime-registry`,

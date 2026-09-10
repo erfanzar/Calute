@@ -2295,11 +2295,7 @@ test("daemon compact uses the active provider to summarize instead of the naive 
     }
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
     requests.push(body);
-    return new Response(
-      JSON.stringify({
-        choices: [{ message: { content: "durable compact summary" } }],
-      }),
-    );
+    return new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: "durable compact summary" }, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
   };
   globalThis.fetch = modelFetch as typeof globalThis.fetch;
   await server.start();
@@ -2385,9 +2381,7 @@ test("compaction archives the transcript it replaces beside the session file", a
   });
   const nativeFetch = globalThis.fetch;
   const summaryFetch: FetchImplementation = async () =>
-    new Response(
-      JSON.stringify({ choices: [{ message: { content: "archived summary" } }] }),
-    );
+    new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: "archived summary" }, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
   globalThis.fetch = summaryFetch as typeof globalThis.fetch;
   await server.start();
   const client = await SocketTestClient.connect(socketPath);
@@ -2487,9 +2481,7 @@ test("undo rejects while another connection is compacting the same session", asy
   const summaryFetch: FetchImplementation = async () => {
     summaryStarted.resolve();
     await releaseSummary.promise;
-    return new Response(
-      JSON.stringify({ choices: [{ message: { content: "gated summary" } }] }),
-    );
+    return new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: "gated summary" }, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
   };
   globalThis.fetch = summaryFetch as typeof globalThis.fetch;
   await server.start();
@@ -2524,6 +2516,11 @@ test("undo rejects while another connection is compacting the same session", asy
 
     compacting.send({ jsonrpc: "2.0", id: 20, method: "session.compress", params: {} });
     await summaryStarted.promise;
+    // These reads use the very same socket as the blocked compaction.
+    compacting.send({ jsonrpc: '2.0', id: 30, method: 'runtime.status', params: {} });
+    compacting.send({ jsonrpc: '2.0', id: 31, method: 'schedule.list', params: {} });
+    expect((await compacting.next(frame => frame.id === 30)).result?.ok).toBe(true);
+    expect((await compacting.next(frame => frame.id === 31)).result).toBeDefined();
     mutating.send({ jsonrpc: "2.0", id: 21, method: "session.undo", params: {} });
     expect((await mutating.next((frame) => frame.id === 21)).result).toEqual({
       ok: false,
@@ -2575,9 +2572,7 @@ test("retry rejects while another connection has a turn pending behind compactio
   const summaryFetch: FetchImplementation = async () => {
     summaryStarted.resolve();
     await releaseSummary.promise;
-    return new Response(
-      JSON.stringify({ choices: [{ message: { content: "gated summary" } }] }),
-    );
+    return new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: "gated summary" }, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
   };
   globalThis.fetch = summaryFetch as typeof globalThis.fetch;
   await server.start();
@@ -2674,9 +2669,7 @@ test("compaction writes no archive when the daemon's transcripts are elsewhere",
   const server = new DaemonServer({ socketPath, runtime, profileStore });
   const nativeFetch = globalThis.fetch;
   const summaryFetch: FetchImplementation = async () =>
-    new Response(
-      JSON.stringify({ choices: [{ message: { content: "unarchived summary" } }] }),
-    );
+    new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: "unarchived summary" }, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
   globalThis.fetch = summaryFetch as typeof globalThis.fetch;
   await server.start();
   const client = await SocketTestClient.connect(socketPath);
@@ -10095,5 +10088,39 @@ test('project agent generation uses the selected model and returns a draft witho
     client.send({ jsonrpc: '2.0', id: 2, method: 'agentPreset.projectGenerate', params: { description: 'Review code' } });
     expect((await client.next(frame => frame.id === 2)).result).toMatchObject({ ok: false, error: expect.stringContaining('Generation provider failed') });
     expect(closed).toBe(2);
+  } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+
+test('capability catalog exposes admitted skills and retained usage without activating previews', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'xerxes-capabilities-'));
+  const skills = join(directory, 'user-skills');
+  await mkdir(join(skills, 'review'), { recursive: true });
+  await writeFile(join(skills, 'review', 'SKILL.md'), '---\nname: review\ndescription: Review changes\n---\nInspect code carefully.');
+  const runtime = new InMemoryDaemonRuntime({
+    toolInventory: () => [{ name: 'ReadFile', exposure: 'loaded', reason: 'Fixture tool' }],
+    async *run() { throw new Error('Preview must not run a provider'); },
+  }, { currentProjectDirectory: directory, sessionDirectory: join(directory, 'sessions') });
+  const socketPath = join(directory, 'daemon.sock');
+  const server = new DaemonServer({ socketPath, runtime, skillDirectories: [skills] });
+  await server.start();
+  const client = await SocketTestClient.connect(socketPath);
+  try {
+    client.send({ jsonrpc: '2.0', id: 1, method: 'capabilities.list', params: {} });
+    expect((await client.next(frame => frame.id === 1)).result).toMatchObject({ ok: false });
+    client.send({ jsonrpc: '2.0', id: 2, method: 'initialize', params: { session_key: 'catalog', project_dir: directory } });
+    await client.next(frame => frame.id === 2);
+    await client.next(eventFrame('init_done')); await client.next(eventFrame('status_update'));
+    const session = runtime.sessionStatus('catalog')!;
+    session.toolExecutions.push({ name: 'ReadFile' }, { name: 'ReadFile' }, null);
+    session.messages.push({ role: 'user', content: '[Skill review activated]\nInspect code carefully.' });
+    const before = session.messages.length;
+    client.send({ jsonrpc: '2.0', id: 3, method: 'capabilities.list', params: {} });
+    expect((await client.next(frame => frame.id === 3)).result).toMatchObject({ ok: true, usage_scope: 'retained session history', skills: expect.arrayContaining([expect.objectContaining({ name: 'review', uses: 1 })]), tools: [expect.objectContaining({ name: 'ReadFile', uses: 2 })] });
+    client.send({ jsonrpc: '2.0', id: 4, method: 'capabilities.inspect', params: { name: 'review' } });
+    expect((await client.next(frame => frame.id === 4)).result).toMatchObject({ ok: true, instructions: expect.stringContaining('Inspect code carefully.') });
+    client.send({ jsonrpc: '2.0', id: 5, method: 'capabilities.inspect', params: { name: '../../missing' } });
+    expect((await client.next(frame => frame.id === 5)).result).toMatchObject({ ok: false });
+    expect(session.messages.length).toBe(before);
   } finally { client.close(); await server.stop(); await rm(directory, { recursive: true, force: true }); }
 });

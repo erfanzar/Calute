@@ -121,6 +121,7 @@ export interface OverlayState {
   pluginsHub: boolean
   secret: null | SecretReq
   sessions: boolean
+  capabilities: boolean
   skillsHub: boolean
   sudo: null | SudoReq
   terminals: boolean

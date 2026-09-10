@@ -114,8 +114,8 @@ test('the shared compaction template covers every high-loss section and its own 
     targetLength: 'detailed',
   })
 
-  expect(prompt).toContain('<analysis>')
-  expect(prompt).toContain('</analysis>')
+  expect(prompt).toContain('Write only the final summary.')
+  expect(prompt).not.toContain('<analysis>')
   expect(prompt).toContain('## User requests')
   expect(prompt).toContain('## Current task')
   expect(prompt).toContain('## Files touched')
@@ -123,7 +123,8 @@ test('the shared compaction template covers every high-loss section and its own 
   expect(prompt).toContain('## Errors and fixes')
   expect(prompt).toContain('## Open questions')
   expect(prompt).toContain('## Next step')
-  expect(prompt).toContain('Every non-tool user message in the slice, in order, one bullet each')
+  expect(prompt).toContain('Preserve unresolved user requests, corrections and standing constraints.')
+  expect(prompt).toContain('Group completed requests and repeated continuation prompts')
   expect(prompt).toContain('quoted VERBATIM')
   expect(prompt).toContain('absolute path')
   // The summary lands between a preserved head and a preserved live tail, so restating the tail
@@ -133,7 +134,7 @@ test('the shared compaction template covers every high-loss section and its own 
   expect(prompt).toContain(COMPACTION_LENGTH_INSTRUCTIONS.detailed)
   expect(prompt).toContain('- Ensure these topics are covered: socket path, daemon restart')
   expect(prompt).not.toContain('EXISTING SUMMARY TO REFRESH')
-  expect(prompt.endsWith('Begin with <analysis>.')).toBe(true)
+  expect(prompt.endsWith('Begin with ## User requests.')).toBe(true)
 })
 
 test('the analysis scratchpad is stripped, including from a response truncated inside the block', () => {

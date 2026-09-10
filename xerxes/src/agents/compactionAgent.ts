@@ -11,6 +11,7 @@ import {
   type ContextMessage,
 } from '../context/index.js'
 import { SmartTokenCounter } from '../context/tokenCounter.js'
+import { classifyError, ErrorKind } from '../runtime/errorClassifier.js'
 
 export {
   COMPACTION_LENGTH_INSTRUCTIONS,
@@ -101,8 +102,8 @@ export class CompactionAgent {
     if (!Number.isSafeInteger(requestedMaxTokens) || requestedMaxTokens < 1) {
       throw new RangeError('summaryMaxTokens must be a positive integer')
     }
-    // The template asks for eight enumerated sections including every user turn verbatim; the
-    // old 2_048-token ceiling truncated that mid-summary and stored the fragment.
+    // Reserve enough space for the final working record; intermediate segments
+    // use a smaller allowance so merging them remains tractable.
     this.summaryMaxTokens = requestedMaxTokens
     this.tokenCounter = options.tokenCounter ?? new SmartTokenCounter({ model: this.model })
     this.maxContextTokens = options.maxContextTokens ?? 64_000
@@ -127,11 +128,20 @@ export class CompactionAgent {
     context: string,
     preserveTopics: readonly string[] = [],
   ): Promise<CompactionTextResult> {
+    return this.summarizeWithBudget(context, preserveTopics, this.maxRequestTokens)
+  }
+
+  private async summarizeWithBudget(
+    context: string,
+    preserveTopics: readonly string[],
+    requestBudget: number,
+    outputBudget: number = this.summaryMaxTokens,
+  ): Promise<CompactionTextResult> {
     if (!context || context.length < 200) return { ok: true, text: context }
     const overhead = this.tokenCounter.countTokens(buildCompactionPromptFromText({ context: '', targetLength: this.targetLength, preserveTopics }))
-    const inputBudget = Math.max(512, Math.floor(Math.min(this.maxContextTokens, this.maxRequestTokens) * 0.8) - overhead)
+    const inputBudget = Math.max(512, Math.floor(Math.min(this.maxContextTokens, requestBudget) * 0.8) - overhead)
     if (this.tokenCounter.countTokens(context) > inputBudget) {
-      const summaries: string[] = []
+      const chunks: string[] = []
       let remaining = context
       while (remaining.length) {
         let low = 1
@@ -143,24 +153,48 @@ export class CompactionAgent {
         }
         // Do not split a UTF-16 surrogate pair between chunks.
         if (low < remaining.length && /[\uD800-\uDBFF]/u.test(remaining[low - 1]!)) low -= 1
-        const part = await this.summarizeContextResult(remaining.slice(0, low), preserveTopics)
-        if (!part.ok) return part
-        if (!part.text.trim()) throw new Error('Compaction returned an empty chunk summary; original history retained')
-        summaries.push(part.text)
+        chunks.push(remaining.slice(0, low))
         remaining = remaining.slice(low)
+      }
+      const summaries: string[] = []
+      // Only top-level, independent segments run in parallel. Timeout splits
+      // remain serial so retries cannot multiply this three-request bound.
+      const concurrency = requestBudget === this.maxRequestTokens ? 3 : 1
+      for (let offset = 0; offset < chunks.length; offset += concurrency) {
+        const parts = await Promise.allSettled(chunks.slice(offset, offset + concurrency).map(chunk =>
+          this.summarizeWithBudget(chunk, preserveTopics, requestBudget, Math.min(outputBudget, 2048))))
+        // Drain every in-flight request before exposing failure to the caller.
+        // Otherwise its retry can overlap the previous batch and exceed the bound.
+        for (const settled of parts) {
+          if (settled.status === 'rejected') throw settled.reason
+          const part = settled.value
+          if (!part.ok) return part
+          if (!part.text.trim()) throw new Error('Compaction returned an empty chunk summary; original history retained')
+          summaries.push(part.text)
+        }
       }
       const combined = summaries.join('\n\n--- Next chronological segment ---\n\n')
       if (this.tokenCounter.countTokens(combined) >= this.tokenCounter.countTokens(context)) {
         throw new Error('Compaction did not reduce chunk summaries; original history retained')
       }
-      return this.summarizeContextResult(combined, preserveTopics)
+      return this.summarizeWithBudget(combined, preserveTopics, requestBudget, outputBudget)
     }
-    const response = await this.completion({
-      prompt: buildCompactionPromptFromText({ context, targetLength: this.targetLength, preserveTopics }),
-      temperature: 0.3,
-      maxTokens: this.summaryMaxTokens,
-      stream: false,
-    })
+    let response: CompactionCompletion | string
+    try {
+      response = await this.completion({
+        prompt: buildCompactionPromptFromText({ context, targetLength: this.targetLength, preserveTopics }) + `\nKeep the complete summary within ${outputBudget} output tokens. Prioritize unfinished work, constraints and exact recovery references.`,
+        temperature: 0.3,
+        maxTokens: outputBudget,
+        stream: false,
+      })
+    } catch (error) {
+      // Keep completed chronological segments. Retrying the entire transcript
+      // after a late timeout repeatedly charges for work that already succeeded.
+      if (classifyError(error).kind === ErrorKind.TIMEOUT && requestBudget > 4096) {
+        return this.summarizeWithBudget(context, preserveTopics, Math.max(4096, Math.floor(requestBudget / 4)), outputBudget)
+      }
+      throw error
+    }
     const extracted = completionText(response)
     if (!extracted.ok) return extracted
     return { ok: true, text: stripCompactionAnalysis(extracted.text) }

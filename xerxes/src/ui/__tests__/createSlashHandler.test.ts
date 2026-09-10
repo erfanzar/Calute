@@ -6,7 +6,6 @@ import { createSlashHandler } from '../app/createSlashHandler.js'
 import { getOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { patchUiState, resetUiState } from '../app/uiStore.js'
 import type { Msg, SlashCatalog } from '../types.js'
-import { FEATURES_GUIDE } from '../../bridge/features.js'
 
 const flush = async () => {
   await Promise.resolve()
@@ -104,15 +103,14 @@ describe('createSlashHandler', () => {
   })
   it('opens the capabilities guide without a provider call or resetting the conversation', async () => {
     patchUiState({ sid: 's1' })
-    const request = vi.fn(async () => ({ output: FEATURES_GUIDE }))
+    const request = vi.fn()
     const { context, page, send } = makeContext(request)
     createSlashHandler(context)('/features')
     await flush()
-    expect(page.join('\n')).toContain('EXPLORE XERXES')
-    expect(page.join('\n')).toContain('/schedules')
-    expect(page.join('\n')).toContain('/machine')
+    expect(getOverlayState().capabilities).toBe(true)
+    expect(page).toEqual([])
     expect(send).toEqual([])
-    expect(request).toHaveBeenCalledWith('slash.exec', { command: 'features', session_id: 's1' })
+    expect(request).not.toHaveBeenCalled()
     expect(context.session.resetVisibleHistory).not.toHaveBeenCalled()
   })
   it('opens the machine picker without erasing history', async () => {

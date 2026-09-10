@@ -162,7 +162,7 @@ export const coreCommands: SlashCommand[] = [
     name: 'features',
     group: 'info',
     help: 'explore capabilities, entry points and current limitations',
-    run: (_arg, ctx) => runNativeSlash(ctx, 'features', 'Explore Xerxes')
+    run: () => patchOverlayState({ capabilities: true })
   },
   {
     help: 'list commands + hotkeys',

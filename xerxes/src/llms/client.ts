@@ -1147,6 +1147,8 @@ export class CompletionDeadlineError extends Error {
 
 /** Per-call controls for {@link completeLlm}. */
 export interface CompleteLlmOptions {
+  /** Collect a streamed response even when the adapter also supports buffered completion. */
+  readonly preferStream?: boolean
   /**
    * Overall deadline in milliseconds, overriding
    * {@link DEFAULT_COMPLETION_DEADLINE_MS}. A caller signal still aborts
@@ -1185,7 +1187,7 @@ export async function completeLlm(
 
   let onCombinedAbort: (() => void) | undefined
   try {
-    const work = typeof client.complete === 'function'
+    const work = !options.preferStream && typeof client.complete === 'function'
       ? client.complete(request, combined)
       : collectLlmCompletion(client.stream(request, combined))
     const result = await Promise.race([work, abortRejection(combined, listener => {

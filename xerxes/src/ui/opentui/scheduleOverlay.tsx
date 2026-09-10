@@ -15,6 +15,8 @@ import { DialogHeader, DialogFooter, DialogEmpty, DialogSection } from './dialog
 
 import { DeliveryPanel } from './deliveryPanel.js'
 import { RunOverlay } from './runOverlay.js'
+import { ScheduleTemplatePicker } from './scheduleTemplatePicker.js'
+import { scheduleDescription, type ScheduleTemplate } from '../lib/scheduleTemplates.js'
 import { ScheduleForm, type ScheduleDraft } from './scheduleForm.js'
 import { parseScheduleTokens, scheduleTokensLabel } from '../lib/scheduleTokens.js'
 
@@ -39,6 +41,8 @@ export function ScheduleOverlay({ t, followupsOnly = false }: { t: Theme; follow
   const terminal = useTerminalDimensions()
   const [deliveryId, setDeliveryId] = useState<string | null>(null)
   const [historyId, setHistoryId] = useState<string | null>(null)
+  const [templates, setTemplates] = useState(false)
+  const [template, setTemplate] = useState<ScheduleTemplate | undefined>()
   const [editing, setEditing] = useState<ScheduleDraft | 'new' | null>(null)
   const size = overlayPanelSize(terminal, { maxWidth: editing ? 132 : 124, maxHeight: 40, minWidth: 32, ...(editing ? { desiredHeight: 38 } : {}) })
   const [jobs, setJobs] = useState<Job[]>([])
@@ -79,12 +83,13 @@ export function ScheduleOverlay({ t, followupsOnly = false }: { t: Theme; follow
       .finally(() => { pending.current.delete(key) })
   }
   useKeyboard(key => {
-    if (key.eventType === 'release' || editing || historyId || deliveryId || !['d', 'h', 'n', 'e', 'escape', 'up', 'down', 'p', 'r', 'x', 'g', 'pageup', 'pagedown'].includes(key.name)) return
+    if (key.eventType === 'release' || editing || templates || historyId || deliveryId || !['b', 'd', 'h', 'n', 'e', 'escape', 'up', 'down', 'p', 'r', 'x', 'g', 'pageup', 'pagedown'].includes(key.name)) return
     key.preventDefault(); key.stopPropagation()
     if (key.name === 'escape') patchOverlayState({ schedules: false, loops: false })
     else if (key.name === 'd' && job) setDeliveryId(job.id)
     else if (key.name === 'h' && job) setHistoryId(job.id)
-    else if (key.name === 'n') setEditing('new')
+    else if (key.name === 'b') setTemplates(true)
+    else if (key.name === 'n') { setTemplate(undefined); setEditing('new') }
     else if (key.name === 'e' && job?.revision) setEditing({ ...job, revision: job.revision })
     else if (key.name === 'p' && job) action(job.paused ? 'resume' : 'pause')
     else if (key.name === 'x') action('cancel')
@@ -101,13 +106,14 @@ export function ScheduleOverlay({ t, followupsOnly = false }: { t: Theme; follow
   const start = Math.max(0, jobs.findIndex(row => row.id === selected) - count + 1)
   if (historyId) return <RunOverlay t={t} scheduleId={historyId} onClose={() => setHistoryId(null)} />
   return <box position="absolute" left={0} top={0} width="100%" height="100%" zIndex={150} backgroundColor="#000000cc" alignItems="center" justifyContent="center">
-    <Box width={!jobs.length && !editing && !deliveryId ? Math.min(88, size.width) : size.width} height={!jobs.length && !editing && !deliveryId ? Math.min(24, size.height) : size.height} flexDirection="column" paddingX={1} borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
-      {deliveryId ? <DeliveryPanel t={t} scheduleId={deliveryId} onClose={() => { setDeliveryId(null); setRefresh(value => value + 1) }} /> : editing ? <ScheduleForm t={t} followup={followupsOnly} initial={editing === 'new' ? undefined : editing} onClose={() => setEditing(null)} onSaved={id => { setEditing(null); setSelected(id); setRefresh(value => value + 1) }} /> : <>
+    <Box width={!jobs.length && !editing && !deliveryId && !templates ? Math.min(88, size.width) : size.width} height={!jobs.length && !editing && !deliveryId && !templates ? Math.min(24, size.height) : size.height} flexDirection="column" paddingX={1} borderStyle="round" borderColor={t.color.border} backgroundColor={t.color.statusBg}>
+      {templates ? <ScheduleTemplatePicker t={t} onClose={() => setTemplates(false)} onSelect={value => { setTemplate(value); setTemplates(false); setEditing('new') }} /> : deliveryId ? <DeliveryPanel t={t} scheduleId={deliveryId} onClose={() => { setDeliveryId(null); setRefresh(value => value + 1) }} /> : editing ? <ScheduleForm t={t} template={template} followup={followupsOnly} initial={editing === 'new' ? undefined : editing} onClose={() => setEditing(null)} onSaved={id => { setEditing(null); setSelected(id); setRefresh(value => value + 1) }} /> : <>
       <DialogHeader t={t} title={followupsOnly ? "Follow-ups · this conversation" : "Schedules · current workspace"} subtitle="Set a rhythm for your work. Review results when you return." />
+      <Box onMouseDown={() => setTemplates(true)}><Text color={t.color.accent}>B  Browse templates · briefings, reviews and test reports</Text></Box>
       {error ? <Text color={t.color.warn} wrap="wrap">{error}</Text> : null}
-      {!jobs.length ? <DialogEmpty t={t} title={followupsOnly ? "No conversation follow-ups." : "No workspace schedules."} description="Schedule a task and return to its results." action="+ N  Create schedule" onAction={() => setEditing('new')} symbol="◷" /> : (<Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0} gap={wide ? 2 : 0}>
+      {!jobs.length ? <DialogEmpty t={t} title={followupsOnly ? "No conversation follow-ups." : "No workspace schedules."} description="Schedule a task and return to its results." action="+ N  Create schedule" onAction={() => { setTemplate(undefined); setEditing('new') }} symbol="◷" /> : (<Box flexDirection={wide ? 'row' : 'column'} flexGrow={1} minHeight={0} gap={wide ? 2 : 0}>
         <Box width={wide ? '35%' : '100%'} flexDirection="column" paddingRight={1}>
-          {jobs.length ? jobs.slice(start, start + count).map(row => <Text key={row.id} color={row.id === selected ? t.color.accent : t.color.text} wrap="truncate-end">{row.id === selected ? '› ' : '  '}{row.paused ? 'Ⅱ ' : '● '}{row.prompt}</Text>) : <DialogEmpty t={t} title={followupsOnly ? "No conversation follow-ups." : "No workspace schedules."} description="Give a recurring task its own schedule." action="+ N  Create schedule" onAction={() => setEditing('new')} symbol="◷" />}
+          {jobs.length ? jobs.slice(start, start + count).map(row => <Text key={row.id} color={row.id === selected ? t.color.accent : t.color.text} wrap="truncate-end">{row.id === selected ? '› ' : '  '}{row.paused ? 'Ⅱ ' : '● '}{row.prompt}</Text>) : <DialogEmpty t={t} title={followupsOnly ? "No conversation follow-ups." : "No workspace schedules."} description="Give a recurring task its own schedule." action="+ N  Create schedule" onAction={() => { setTemplate(undefined); setEditing('new') }} symbol="◷" />}
         </Box>
         <scrollbox ref={scroll} style={{ flexGrow: 1, minHeight: 0 }} contentOptions={{ flexDirection: 'column' }}>
           {job ? <Box flexDirection="column" flexShrink={0}>
@@ -119,7 +125,7 @@ export function ScheduleOverlay({ t, followupsOnly = false }: { t: Theme; follow
             </> : null}
 <DialogSection t={t}>TASK</DialogSection><Text bold wrap="wrap">{job.prompt}</Text>
             <Text wrap="wrap">{job.paused ? 'Paused' : 'Enabled'} · {job.execution_state}</Text>
-            <DialogSection t={t}>TIMING</DialogSection><Text wrap="wrap">Schedule: {job.interval_seconds != null ? `Every ${job.interval_seconds}s` : job.schedule ? `${job.schedule} (${job.timezone ?? 'UTC'})` : 'One-shot'}</Text>
+            <DialogSection t={t}>TIMING</DialogSection><Text wrap="wrap">Schedule: {job.interval_seconds != null ? scheduleDescription('', '', job.interval_seconds) : job.schedule ? scheduleDescription(job.schedule, job.timezone ?? 'UTC') : 'One-shot'}</Text>
             <Text wrap="wrap">Next: {job.next_run_at || 'Not scheduled'}</Text>
             <Text wrap="wrap">Missed runs: {job.missed_run_policy ?? "coalesce"} · Allowance: {job.misfire_grace_seconds ?? 300}s · Overlap: forbidden</Text>
             {job.metadata?.last_missed_run ? <Text color={t.color.warn} wrap="wrap">An overdue occurrence was skipped. Review timing before resuming a one-shot.</Text> : null}

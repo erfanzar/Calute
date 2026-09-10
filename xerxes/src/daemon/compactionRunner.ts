@@ -20,6 +20,8 @@ import {
   type LlmClient,
 } from "../llms/client.js";
 import { classifyError, ErrorKind } from "../runtime/errorClassifier.js";
+import { catalogReasoningLevels, fallbackReasoningLevels } from "../llms/reasoningLevels.js";
+import { detectProvider } from "../llms/providerRegistry.js";
 
 /** Auto-compact once the estimated context usage reaches this fraction of the prompt budget. */
 export const DEFAULT_AUTO_COMPACT_THRESHOLD = 0.8;
@@ -98,6 +100,10 @@ export function compactionCompletionPort(
 ): CompactionCompletionPort {
   return async (request) => {
     throwIfCancelled(signal)
+    const provider = detectProvider(model);
+    const levels = catalogReasoningLevels(model, provider) ?? fallbackReasoningLevels(provider);
+    const thinking = levels.shape === 'effort' && levels.levels.some(level => level.effort === 'low')
+      ? { effort: 'low' } : undefined;
     const completionSignal = combinedCompletionSignal(timeoutMs, signal)
     const completion = isFiniteDeadline(timeoutMs)
       ? completeLlm(
@@ -107,9 +113,10 @@ export function compactionCompletionPort(
           messages: [{ role: "user", content: request.prompt }],
           maxTokens: request.maxTokens,
           temperature: request.temperature,
+          ...(thinking ? { thinking } : {}),
         },
         completionSignal,
-        { timeoutMs },
+        { timeoutMs, preferStream: true },
       )
       : completeLlm(
         client,
@@ -118,8 +125,10 @@ export function compactionCompletionPort(
           messages: [{ role: "user", content: request.prompt }],
           maxTokens: request.maxTokens,
           temperature: request.temperature,
+          ...(thinking ? { thinking } : {}),
         },
         completionSignal,
+        { preferStream: true },
       )
     let result: Awaited<typeof completion>;
     try {
@@ -137,6 +146,9 @@ export function compactionCompletionPort(
       throw error;
     }
     throwIfCancelled(signal)
+    if (result.finishReason && !['stop', 'completed', 'end_turn'].includes(result.finishReason)) {
+      throw new CompactionResponseShapeError(`summary did not finish (${result.finishReason}); original history retained`);
+    }
     return result.content;
   };
 }
@@ -335,8 +347,8 @@ export async function compactMessagesIfNeeded(
     return { compacted: false, reason: "below-threshold" };
   }
   let lastError: unknown;
-  let requestTokenLimit = DEFAULT_COMPACTION_REQUEST_TOKENS;
-  // One lever, shrinking: the summary's token budget. Compaction is atomic —
+  // Context-overflow retries shrink the summary budget; timeout recovery stays
+  // inside the agent's failed segment. Compaction is atomic —
   // the agent returns the original transcript on failure and the caller only
   // swaps on success — so each attempt starts from the same clean state.
   const summaryBudgets = request.summaryBudgets ?? COMPACTION_SUMMARY_BUDGETS;
@@ -348,19 +360,14 @@ export async function compactMessagesIfNeeded(
         completion: request.completion,
         model: request.model,
         summaryMaxTokens,
-        maxRequestTokens: requestTokenLimit,
+        maxRequestTokens: DEFAULT_COMPACTION_REQUEST_TOKENS,
         ...(request.maxContextTokens === undefined ? {} : { maxContextTokens: request.maxContextTokens }),
       }).summarizeMessages(original);
     } catch (error) {
       lastError = error;
-      // A smaller output budget does not fix a stalled large input request.
-      // Retry once with much smaller chronological chunks, even for the
-      // mid-turn caller that deliberately supplies only one summary budget.
-      if (classifyError(error).kind === ErrorKind.TIMEOUT && requestTokenLimit > 8_000) {
-        requestTokenLimit = 8_000;
-        attempt--;
-        continue;
-      }
+      // The agent already retried the failed segment with smaller inputs.
+      // Restarting here would replay every successfully summarized segment.
+      if (classifyError(error).kind === ErrorKind.TIMEOUT) break;
       if (!compactionAttemptIsRetryable(error)) break;
       continue;
     }

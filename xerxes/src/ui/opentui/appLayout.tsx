@@ -69,6 +69,7 @@ import { AgentPanel, AgentPanelHotkey, AgentPanelOverlay, collectAgentPanelRecor
 import { GoalOverlay } from './goalOverlay.js'
 import { ContextOverlay } from './contextOverlay.js'
 import { MonitorOverlay } from './monitorOverlay.js'
+import { CapabilitiesOverlay } from './capabilitiesOverlay.js'
 import { ScheduleOverlay } from './scheduleOverlay.js'
 import { LspSettingsOverlay } from './lspSettingsOverlay.js'
 import { McpSettingsOverlay } from './mcpSettingsOverlay.js'
@@ -1289,10 +1290,14 @@ export function Composer({ composer }: Pick<AppLayoutProps, 'composer'>) {
             <Text wrap="wrap">
               <Span color={modeIsDefault ? t.ds.secondary : t.color.accent}>{'◆ ' + modeLabel + ' mode'}</Span>
               <Span color={t.ds.separator}>{' · '}</Span>
-              <Span color={t.ds.meta}>{modelLabel}</Span>
+            </Text>
+            <Box onMouseDown={() => patchOverlayState({ modelPicker: true })}>
+              <Text color={t.ds.meta}>{modelLabel}</Text>
+            </Box>
               {ui.info?.reasoning_effort?.trim() ? (
-                <Span color={t.ds.meta}>{' · reasoning: ' + ui.info.reasoning_effort.trim()}</Span>
+                <Box onMouseDown={() => patchOverlayState({ reasoningPicker: true })}><Text color={t.ds.meta}>{' · reasoning: ' + ui.info.reasoning_effort.trim()}</Text></Box>
               ) : null}
+            <Text wrap="wrap">
               {narrow ? null : (
                 <Span color={yoloEnabled ? t.color.warn : t.ds.meta}>
                   {' · ' + writePolicyLabel(ui.info?.permission_mode)}
@@ -2079,6 +2084,7 @@ export function AppLayout({
       {overlay.activity ? <ActivityOverlay key={ui.sid} sessionId={ui.sid} t={t} /> : null}
       {overlay.monitors ? <MonitorOverlay t={t} /> : null}
       {overlay.loops ? <ScheduleOverlay t={t} followupsOnly /> : null}
+      {overlay.capabilities ? <CapabilitiesOverlay t={t} /> : null}
       {overlay.schedules ? <ScheduleOverlay t={t} /> : null}
       {overlay.lspSettings ? <LspSettingsOverlay t={t} /> : null}
       {overlay.mcpSettings ? <McpSettingsOverlay t={t} /> : null}

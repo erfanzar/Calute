@@ -1751,10 +1751,24 @@ their precedence. Project commands cannot replace built-in slash commands.
 ### Discovering capabilities
 
 The welcome screen includes a small `Explore capabilities · /features` hint.
-Type `/features` to open a read-only guide to agents, terminals, monitors,
-schedules, follow-ups, review tools and configuration. The guide gives entry
-commands and notes setup requirements for remote workspaces and local extensions. It does not start jobs or submit a model prompt. Close the
-guide to return to your conversation; `/help` remains the full command reference.
+Type `/features` to open the capabilities hub. Its Skills tab searches admitted
+skills by name, description and tags and previews instructions without activating
+them. Tools are grouped by purpose with exposure details. Counts reflect retained
+session history, not lifetime usage; compaction may reduce skill activation counts.
+Registration does not imply that a tool is connected or permitted to execute.
+Use Tab to switch categories, arrows to select, PgUp/PgDn to scroll details,
+Ctrl+S to sort by name or usage, and Ctrl+R to refresh. Esc restores the conversation.
+
+The Controls tab opens model/provider profiles, reasoning, MCP connections,
+schedules, custom agents and remote workspaces. The current model and reasoning
+labels below the composer are clickable; `/model` and `/reasoning` remain their
+keyboard entry points. Non-TUI `/features` callers still receive the text guide.
+
+In `/schedules`, press B to browse examples such as a morning briefing, weekly
+review, test report or documentation check. Enter copies a template into an
+editable, initially paused draft. Review the prompt, timing, timezone and delivery
+before saving. Common schedules show readable timing alongside cron and the
+daemon's next-run preview; complex expressions retain their exact cron text.
 
 ### Remote workspaces and extension controls
 
@@ -1815,6 +1829,14 @@ output capacity, and honors `auto_compact_threshold` (default `0.8`; `0` disable
 automatic checks). Large transcripts are summarized in bounded chronological
 segments, then combined, instead of sending the entire oversized history to a
 single request. The original transcript is archived before replacement.
+
+Compaction collects streamed responses and uses low reasoning effort where the
+model's reasoning controls support it. The prompt requests only the final summary,
+so generated scratchpad text does not consume the summary's output budget.
+Each provider call has a 180-second deadline. A timeout retries only its failed
+segment with smaller inputs, down to a 4096-token request budget, retaining
+earlier successful summaries. A truncated completion is rejected; failure leaves
+the original conversation in place rather than saving a partial summary.
 
 If automatic compaction cannot make room, the next model request is paused.
 After three consecutive failures, use `/compact` to retry explicitly; the
