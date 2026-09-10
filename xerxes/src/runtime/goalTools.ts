@@ -282,6 +282,14 @@ export function registerGoalTools(
       const lifecycleOnly = action === 'resume' || action === 'pause' || action === 'unlimited'
       const ignoredFields = lifecycleOnly ? Object.keys(inputs).filter(key => !['goal_id', 'revision', 'action'].includes(key)) : []
       if (lifecycleOnly) inputs = { goal_id: inputs.goal_id!, revision: inputs.revision!, action }
+      // Strict schemas require numeric placeholders even for milestone-only
+      // calls. These fields cannot change limits through this action.
+      if (action === 'milestone') {
+        inputs = { ...inputs }
+        for (const key of ['max_goal_rounds', 'max_duration_ms', 'max_total_tokens']) {
+          if (key in inputs) { ignoredFields.push(key); delete inputs[key] }
+        }
+      }
       const meaningful = (value: unknown) => value !== undefined && value !== null && value !== '' && !(Array.isArray(value) && value.length === 0)
       if (meaningful(inputs.current_milestone) && action !== 'edit' && action !== 'milestone') throw new ValidationError('current_milestone', 'is only accepted for action edit or milestone')
       if (action === 'milestone' && Object.keys(inputs).some(key => !['goal_id', 'revision', 'action', 'current_milestone'].includes(key) && meaningful(inputs[key]))) throw new ValidationError('action', 'milestone changes only current_milestone')

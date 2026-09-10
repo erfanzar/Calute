@@ -1488,3 +1488,26 @@ test('all delegation entry points forward allocation cancellation and close a la
   await expect(tools.execute('AgentTool', choice, { metadata: {} }, controller.signal)).rejects.toThrow('cancelled allocation')
   expect(allocations).toBe(5)
 })
+
+test('agent tool boundaries treat empty optional refs as omitted and reject malformed refs', async () => {
+  const seen: Array<{ ref: string | undefined; source: string | undefined }> = []
+  const manager: SpawnedAgentManagerPort = {
+    close: () => { throw new Error('unused') }, listHandles: () => [],
+    resume: () => { throw new Error('unused') }, sendInput: async () => { throw new Error('unused') },
+    spawn: async options => { seen.push({ ref: options?.worktreeRef, source: options?.worktreeSource }); return agentSnapshot('placeholder-' + seen.length) },
+    wait: async () => ({ completed: [], pending: [] }),
+  }
+  const tools = new ClaudeAgentTools({ manager })
+  for (const worktree_ref of ['', null]) {
+    const spec = { title: 'Review', prompt: 'read only', isolation: 'worktree', worktree_source: 'working-tree', worktree_ref, wait: false }
+    await tools.execute('AgentTool', spec, { metadata: {} })
+    await tools.execute('TaskCreateTool', spec, { metadata: {} })
+    await tools.execute('SpawnAgents', { agents: [spec], wait: false }, { metadata: {} })
+  }
+  expect(seen).toHaveLength(6)
+  expect(seen.every(value => value.ref === undefined && value.source === 'working-tree')).toBe(true)
+  for (const worktree_ref of [' ', '--help', 'HEAD\n', 123]) {
+    await expect(tools.execute('AgentTool', { title: 'Invalid', prompt: 'read', isolation: 'worktree', worktree_ref }, { metadata: {} })).rejects.toThrow('worktree_ref')
+  }
+  expect(seen).toHaveLength(6)
+})

@@ -475,7 +475,7 @@ export class ClaudeAgentTools {
     const model = optionalString(inputs, 'model')?.trim()
     const spec: ClaudeAgentSpec = {
       isolation,
-      worktreeRef: parseWorktreeRef(inputs.worktree_ref),
+      worktreeRef: parseWorktreeRef(inputs.worktree_ref === '' || inputs.worktree_ref === null ? undefined : inputs.worktree_ref),
       worktreeSource: parseWorktreeSource(inputs.worktree_source),
       providerProfile: optionalString(inputs, 'provider_profile'),
       reasoningEffort: optionalString(inputs, 'reasoning_effort'),
@@ -516,7 +516,7 @@ export class ClaudeAgentTools {
     const subagentType = optionalString(inputs, 'subagent_type')?.trim()
     const spec: ClaudeAgentSpec = {
       isolation: parseIsolation(inputs.isolation),
-      worktreeRef: parseWorktreeRef(inputs.worktree_ref),
+      worktreeRef: parseWorktreeRef(inputs.worktree_ref === '' || inputs.worktree_ref === null ? undefined : inputs.worktree_ref),
       worktreeSource: parseWorktreeSource(inputs.worktree_source),
       providerProfile: optionalString(inputs, 'provider_profile'),
       reasoningEffort: optionalString(inputs, 'reasoning_effort'),
@@ -1022,7 +1022,7 @@ function parseAgentSpecs(value: JsonValue | undefined): ClaudeAgentSpec[] {
     const model = optionalRecordString(item, 'model')
     specs.push({
       isolation: parseIsolation(item.isolation),
-      worktreeRef: parseWorktreeRef(item.worktree_ref),
+      worktreeRef: parseWorktreeRef(item.worktree_ref === '' || item.worktree_ref === null ? undefined : item.worktree_ref),
       worktreeSource: parseWorktreeSource(item.worktree_source),
       providerProfile: optionalRecordString(item, 'provider_profile'),
       reasoningEffort: optionalRecordString(item, 'reasoning_effort'),

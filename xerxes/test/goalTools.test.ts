@@ -348,5 +348,15 @@ test('milestone actions tolerate empty provider placeholders but reject meaningf
   await h.call('create_goal', { objective: 'ship', current_milestone: null })
   const result = await h.call('update_goal', { ...await h.ref(), action: 'milestone', current_milestone: 'test', objective: '', criteria: [], blocked_reason: '' })
   expect(result.goal.currentMilestone).toBe('test')
-  await expect(h.call('update_goal', { ...await h.ref(), action: 'milestone', current_milestone: null, max_total_tokens: 100 })).rejects.toThrow()
+  await expect(h.call('update_goal', { ...await h.ref(), action: 'milestone', current_milestone: null, objective: 'replacement' })).rejects.toThrow()
+})
+
+test('milestones ignore numeric provider fillers without changing goal budgets', async () => {
+  const h = harness()
+  const before = await h.call('create_goal', { objective: 'ship', max_goal_rounds: 10, max_duration_ms: 60000, max_total_tokens: 1000 })
+  h.enterRound()
+  const result = await h.call('update_goal', { ...await h.ref(), action: 'milestone', current_milestone: 'verify dashboard', objective: '', criteria: [], criterion_id: '', tool_call_id: '', evidence_summary: '', blocked_reason: '', max_goal_rounds: Number.MAX_SAFE_INTEGER, max_duration_ms: 1, max_total_tokens: 1 })
+  expect(result.goal.currentMilestone).toBe('verify dashboard')
+  for (const key of ['maxGoalRounds', 'maxDurationMs', 'maxTotalTokens']) expect(result.goal[key]).toBe(before.goal[key])
+  expect(result.ignored_fields).toEqual(['max_goal_rounds', 'max_duration_ms', 'max_total_tokens'])
 })

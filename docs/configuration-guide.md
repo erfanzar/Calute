@@ -57,6 +57,9 @@ turn creates or edits a goal. The goal's own current continuation round may use
 That action updates progress context without permission to rewrite the objective,
 raise budgets or supply completion evidence. Unrelated background work and
 subagents cannot update the milestone.
+Numeric budget fields supplied alongside a milestone are ignored and reported in
+`ignored_fields`; they never change the goal's limits. Use an authorized `edit`
+action to change limits.
 
 ## Goal token limits
 
@@ -1878,3 +1881,5 @@ a redundant tier does not override those choices. Provider/reasoning selectors
 still require an explicit model. For worktree delegation, `working-tree` plus
 `worktree_ref: HEAD` means capture the current working tree; a conflicting named
 branch remains invalid.
+Empty-string or null optional `worktree_ref` values from model tool calls are
+treated as omitted. Nonempty refs still undergo Git-ref validation.
